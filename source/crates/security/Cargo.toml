@@ -1,0 +1,15 @@
+[package]
+name = "plan9-security"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+plan9-common = { path = "../common" }
+
+[dev-dependencies]
+getrandom = "0.2"
+
+[features]
+default = []
+alloc = []
+std = ["alloc", "getrandom/std"]

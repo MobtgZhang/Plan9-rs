@@ -1,0 +1,10 @@
+[package]
+name = "plan9-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+plan9-common = { path = "../common", features = ["alloc"] }
+plan9-arch = { path = "../arch" }
+plan9-drivers = { path = "../drivers" }
+bitflags = "2.4"

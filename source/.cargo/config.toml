@@ -1,0 +1,8 @@
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

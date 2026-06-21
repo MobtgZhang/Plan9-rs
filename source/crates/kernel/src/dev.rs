@@ -1,0 +1,973 @@
+//! Device Driver Framework
+//!
+//! Implements the Plan 9 device driver framework including:
+//! - Dev trait for device operations
+//! - DevTable for device registration
+//! - Basic device implementations (console, null, etc.)
+//!
+//! ## Plan 9 Device Architecture
+//!
+//! In Plan 9, everything is a file and accessed through the VFS.
+//! Each device implements the Dev trait which provides:
+//! - attach(): Create a channel to the root of the device
+//! - walk(): Navigate the device namespace
+//! - open/create/close: File operations
+//! - read/write: Data transfer
+//! - stat/wstat: Metadata operations
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use crate::plan9_common::sync::{Spinlock, Mutex};
+
+// ============================================================================
+// Device Constants
+// ============================================================================
+
+/// Maximum number of devices
+pub const NDEV: usize = 32;
+
+/// Device types (device characters)
+pub mod devtype {
+    pub const NONE: usize = 0;
+    pub const CONS: usize = 1;      // 'c' - console
+    pub const ENV: usize = 2;      // 'e' - environment
+    pub const DRAW: usize = 3;     // 'd' - graphics
+    pub const IP: usize = 4;       // 'i' - IP/network
+    pub const BRIDGE: usize = 5;   // 'l' - bridge
+    pub const AUDIO: usize = 6;    // 'a' - audio
+    pub const MOUSE: usize = 7;    // 'm' - mouse
+    pub const KB: usize = 8;       // 'k' - keyboard
+    pub const PROC: usize = 9;     // 'p' - proc fs
+    pub const FS: usize = 10;      // 'f' - file system
+    pub const PIPE: usize = 11;    // '|' - pipe
+    pub const TLS: usize = 12;     // 'I' - TLS/SSL
+    pub const SD: usize = 13;     // 's' - storage/disk
+    pub const AOE: usize = 14;    // 'A' - AoE
+    pub const CAP: usize = 15;    // 'C' - capability
+    pub const SEC: usize = 16;    // 's' - security
+    pub const ROOT: usize = 17;   // '/' - root fs
+    pub const SRV: usize = 18;    // '#s' - service
+    pub const MNT: usize = 19;    // '#M' - mount
+    pub const DOS: usize = 20;    // '#d' - DOS
+    pub const VIRTIO: usize = 21; // virtio
+
+    /// User mountable devices start here
+    pub const USER: usize = 64;
+}
+
+// ============================================================================
+// Qid - File Identifier
+// ============================================================================
+
+/// Qid - unique file identifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qid {
+    /// Path (unique number)
+    pub path: u64,
+    /// Version
+    pub vers: u32,
+    /// Type (directory, file, etc.)
+    pub type_: u8,
+}
+
+impl Qid {
+    /// Create new Qid
+    pub fn new(path: u64, vers: u32, type_: u8) -> Self {
+        Self { path, vers, type_ }
+    }
+
+    /// Empty Qid
+    pub fn empty() -> Self {
+        Self { path: 0, vers: 0, type_: 0 }
+    }
+}
+
+/// Qid type flags
+pub mod qidtype {
+    pub const NONE: u8 = 0;
+    pub const EXEC: u8 = 0x80;    // executable
+    pub const EXCL: u8 = 0x40;   // exclusive use
+    pub const APPEND: u8 = 0x20;  // append-only
+    pub const MOUNT: u8 = 0x10;   // mounted channel
+    pub const AUTH: u8 = 0x08;    // authentication file
+    pub const TMP: u8 = 0x04;     // temporary file
+    pub const LINK: u8 = 0x02;    // symbolic link
+    pub const FILE: u8 = 0x00;    // regular file
+    pub const DIR: u8 = 0x80;    // directory
+}
+
+// ============================================================================
+// Channel - Open File/Device
+// ============================================================================
+
+/// Channel - represents an open file or device
+#[derive(Debug)]
+pub struct Chan {
+    /// Device type
+    pub dev: usize,
+    /// Qid for this channel
+    pub qid: Qid,
+    /// Mode (read/write)
+    pub mode: u8,
+    /// Channel flags
+    pub flag: u32,
+    /// Offset in file
+    pub offset: u64,
+    /// Device-specific data
+    pub aux: Option<Box<dyn Send + Sync>>,
+    /// Reference count
+    refcount: Mutex<u32>,
+}
+
+impl Chan {
+    /// Create new channel
+    pub fn new(dev: usize, qid: Qid, mode: u8) -> Self {
+        Self {
+            dev,
+            qid,
+            mode,
+            flag: 0,
+            offset: 0,
+            aux: None,
+            refcount: Spinlock::new(1),
+        }
+    }
+
+    /// Increment reference count
+    pub fn incref(&self) {
+        *self.refcount.lock() += 1;
+    }
+
+    /// Decrement reference count
+    pub fn decref(&self) -> u32 {
+        let mut count = self.refcount.lock();
+        *count = count.saturating_sub(1);
+        *count
+    }
+
+    /// Get reference count
+    pub fn refcount(&self) -> u32 {
+        *self.refcount.lock()
+    }
+}
+
+// ============================================================================
+// Directory Entry
+// ============================================================================
+
+/// Directory entry for readdir
+#[derive(Debug)]
+pub struct DirEntry {
+    /// Device number
+    pub dev: usize,
+    /// Qid
+    pub qid: Qid,
+    /// Mode (permissions + type)
+    pub mode: u32,
+    /// Last access time
+    pub atime: u32,
+    /// Last modification time
+    pub mtime: u32,
+    /// Length (for files)
+    pub length: u64,
+    /// Name
+    pub name: Vec<u8>,
+}
+
+/// Directory entry for Dirtab
+#[derive(Debug)]
+pub struct Dirtab {
+    /// Name
+    pub name: &'static str,
+    /// Qid
+    pub qid: Qid,
+    /// Length (0 for commands)
+    pub length: u64,
+    /// Permissions
+    pub perm: u32,
+}
+
+impl Dirtab {
+    /// Create new directory entry
+    pub fn new(name: &'static str, path: u64, vers: u32, type_: u8, 
+               length: u64, perm: u32) -> Self {
+        Self {
+            name,
+            qid: Qid::new(path, vers, type_),
+            length,
+            perm,
+        }
+    }
+}
+
+// ============================================================================
+// Walk Result
+// ============================================================================
+
+/// Walk result - returned by walk operations
+#[derive(Debug)]
+pub struct Walkqid {
+    /// Qids for walked path components
+    pub qids: Vec<Qid>,
+}
+
+impl Walkqid {
+    /// Create empty walk result
+    pub fn new() -> Self {
+        Self { qids: Vec::new() }
+    }
+
+    /// Create from array
+    pub fn from_slice(qids: &[Qid]) -> Self {
+        Self { qids: qids.to_vec() }
+    }
+}
+
+// ============================================================================
+// Device Operations Trait
+// ============================================================================
+
+/// Device operations trait - all Plan 9 devices implement this
+pub trait Dev: Send + Sync {
+    /// Reset device
+    fn reset(&mut self) {}
+    
+    /// Initialize device
+    fn init(&mut self) {}
+    
+    /// Attach to device tree
+    fn attach(&mut self, spec: Option<&str>) -> Result<Chan, Error>;
+    
+    /// Walk directory
+    fn walk(&mut self, ch: &mut Chan, name: &str) -> Result<Option<Qid>, Error>;
+    
+    /// Open file/device
+    fn open(&mut self, ch: &mut Chan, mode: u8) -> Result<(), Error>;
+    
+    /// Create file
+    fn create(&mut self, ch: &mut Chan, name: &str, mode: u8, perm: u32) -> Result<(), Error>;
+    
+    /// Close channel
+    fn close(&mut self, ch: &mut Chan) {}
+    
+    /// Read data
+    fn read(&mut self, ch: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error>;
+    
+    /// Write data
+    fn write(&mut self, ch: &mut Chan, buf: &[u8], offset: u64) -> Result<usize, Error>;
+    
+    /// Get file status
+    fn stat(&mut self, ch: &mut Chan) -> Result<DirEntry, Error>;
+    
+    /// Set file status
+    fn wstat(&mut self, ch: &mut Chan, dir: &DirEntry) -> Result<(), Error>;
+    
+    /// Remove file
+    fn remove(&mut self, ch: &mut Chan) -> Result<(), Error>;
+    
+    /// Get device character
+    fn dev_char(&self) -> char;
+    
+    /// Get device name
+    fn name(&self) -> &'static str;
+}
+
+/// Default implementations for devices
+impl dyn Dev {
+    /// Default read implementation that returns EOF
+    pub fn read_eof(_ch: &mut Chan, _buf: &mut [u8], _offset: u64) -> Result<usize, Error> {
+        Ok(0)
+    }
+    
+    /// Default write implementation that discards data
+    pub fn write_discard(_ch: &mut Chan, _buf: &[u8], _offset: u64) -> Result<usize, Error> {
+        Err(Error::Eio)
+    }
+}
+
+// ============================================================================
+// Errors
+// ============================================================================
+
+/// Device error
+#[derive(Debug)]
+pub enum Error {
+    /// Operation succeeded
+    Ok,
+    /// No such file or directory
+    Enoent,
+    /// Permission denied
+    Eperm,
+    /// Out of memory
+    Enomem,
+    /// Bad address
+    Ebadaddr,
+    /// Bad path
+    Ebadpath,
+    /// No space left
+    Enospace,
+    /// Already exists
+    Eexists,
+    /// Not a directory
+    Enotdir,
+    /// Is a directory
+    Eisdir,
+    /// Bad file descriptor
+    Ebadfd,
+    /// I/O error
+    Eio,
+    /// Invalid argument
+    Einval,
+    /// Operation not supported
+    Enotsup,
+    /// Closed
+    Eclosed,
+    /// Unknown error
+    Unknown,
+}
+
+impl Error {
+    pub fn to_isize(&self) -> isize {
+        match self {
+            Error::Ok => 0,
+            Error::Enoent => -12,
+            Error::Eperm => -6,
+            Error::Enomem => -2,
+            Error::Ebadaddr => -1,
+            Error::Ebadpath => -1,
+            Error::Enospace => -1,
+            Error::Eexists => -7,
+            Error::Enotdir => -8,
+            Error::Eisdir => -9,
+            Error::Ebadfd => -4,
+            Error::Eio => -3,
+            Error::Einval => -10,
+            Error::Enotsup => -1,
+            Error::Eclosed => -1,
+            Error::Unknown => -1,
+        }
+    }
+}
+
+// ============================================================================
+// Null Device
+// ============================================================================
+
+/// Null device - /dev/null equivalent
+pub struct NullDev {
+    name: &'static str,
+    dev_char: char,
+}
+
+impl NullDev {
+    pub fn new() -> Self {
+        Self {
+            name: "null",
+            dev_char: '#',
+        }
+    }
+}
+
+impl Dev for NullDev {
+    fn attach(&mut self, _spec: Option<&str>) -> Result<Chan, Error> {
+        Ok(Chan::new(devtype::NONE, Qid::empty(), 0))
+    }
+
+    fn open(&mut self, _ch: &mut Chan, _mode: u8) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn read(&mut self, _ch: &mut Chan, buf: &mut [u8], _offset: u64) -> Result<usize, Error> {
+        // Return EOF (0 bytes read)
+        Ok(0)
+    }
+
+    fn write(&mut self, _ch: &mut Chan, buf: &[u8], _offset: u64) -> Result<usize, Error> {
+        // Discard data
+        Ok(buf.len())
+    }
+
+    fn dev_char(&self) -> char {
+        self.dev_char
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+// ============================================================================
+// Zero Device
+// ============================================================================
+
+/// Zero device - /dev/zero equivalent
+pub struct ZeroDev {
+    name: &'static str,
+}
+
+impl ZeroDev {
+    pub fn new() -> Self {
+        Self { name: "zero" }
+    }
+}
+
+impl Dev for ZeroDev {
+    fn attach(&mut self, _spec: Option<&str>) -> Result<Chan, Error> {
+        Ok(Chan::new(devtype::NONE, Qid::empty(), 0))
+    }
+
+    fn open(&mut self, _ch: &mut Chan, _mode: u8) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn read(&mut self, _ch: &mut Chan, buf: &mut [u8], _offset: u64) -> Result<usize, Error> {
+        // Return zeros
+        buf.fill(0);
+        Ok(buf.len())
+    }
+
+    fn write(&mut self, _ch: &mut Chan, _buf: &[u8], _offset: u64) -> Result<usize, Error> {
+        Ok(0)
+    }
+
+    fn dev_char(&self) -> char {
+        'z'
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+// ============================================================================
+// Console Device
+// ============================================================================
+
+/// Console device - handles keyboard input and screen output
+/// This is the #c device that provides the main terminal interface
+pub struct ConsDev {
+    name: &'static str,
+    /// Console input buffer
+    input_buffer: Mutex<Vec<u8>>,
+    /// Console output state
+    output_lock: Spinlock,
+}
+
+impl ConsDev {
+    /// Create new console device
+    pub fn new() -> Self {
+        Self {
+            name: "cons",
+            input_buffer: Mutex::new(Vec::new()),
+            output_lock: Spinlock::new(),
+        }
+    }
+
+    /// Add characters to input buffer (from keyboard interrupt)
+    pub fn add_input(&self, data: &[u8]) {
+        let mut buf = self.input_buffer.lock();
+        buf.extend_from_slice(data);
+    }
+
+    /// Read a single character from input buffer
+    fn get_char(&self) -> Option<u8> {
+        let mut buf = self.input_buffer.lock();
+        if buf.is_empty() {
+            // Fall back to serial if no keyboard input
+            crate::cons::serial_getchar()
+        } else {
+            Some(buf.remove(0))
+        }
+    }
+
+    /// Write characters to output (screen/serial)
+    fn put_chars(&self, data: &[u8]) {
+        let _guard = self.output_lock.lock();
+        crate::cons::serial_puts(data);
+        // TODO: VGA output
+    }
+}
+
+impl Dev for ConsDev {
+    fn attach(&mut self, _spec: Option<&str>) -> Result<Chan, Error> {
+        // Return channel to console root
+        // Qid path 0 is the console root directory
+        Ok(Chan::new(devtype::CONS, Qid::new(0, 0, qidtype::DIR), 0))
+    }
+
+    fn walk(&mut self, ch: &mut Chan, name: &str) -> Result<Option<Qid>, Error> {
+        // Console is a flat namespace - only allow empty name for root
+        if name.is_empty() {
+            return Ok(Some(ch.qid));
+        }
+        Err(Error::Enoent)
+    }
+
+    fn open(&mut self, ch: &mut Chan, mode: u8) -> Result<(), Error> {
+        // Store mode in channel
+        ch.mode = mode;
+        Ok(())
+    }
+
+    fn read(&mut self, ch: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        let _ = offset; // Offset not used for console
+        let mut count = 0;
+
+        for byte in buf.iter_mut() {
+            if let Some(c) = self.get_char() {
+                *byte = c;
+                count += 1;
+
+                // Break on newline for line-based input
+                if c == b'\n' || c == b'\r' {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if count > 0 {
+            Ok(count)
+        } else {
+            // No input available
+            Ok(0)
+        }
+    }
+
+    fn write(&mut self, _ch: &mut Chan, buf: &[u8], _offset: u64) -> Result<usize, Error> {
+        self.put_chars(buf);
+        Ok(buf.len())
+    }
+
+    fn dev_char(&self) -> char {
+        'c'
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+// ============================================================================
+// Root Device
+// ============================================================================
+
+/// Root device - the root of the file system tree
+/// This is the '/' device that provides access to the entire namespace
+pub struct RootDev {
+    name: &'static str,
+    /// Root channel (initialized during boot)
+    root_chan: Spinlock<Option<Chan>>,
+}
+
+impl RootDev {
+    /// Create new root device
+    pub fn new() -> Self {
+        Self {
+            name: "root",
+            root_chan: Spinlock::new(None),
+        }
+    }
+
+    /// Set the root channel
+    pub fn set_root(&self, chan: Chan) {
+        *self.root_chan.lock() = Some(chan);
+    }
+
+    /// Get the root channel
+    pub fn get_root(&self) -> Option<Chan> {
+        self.root_chan.lock().as_ref().map(|c| c.dup())
+    }
+}
+
+impl Dev for RootDev {
+    fn attach(&mut self, _spec: Option<&str>) -> Result<Chan, Error> {
+        // Return the root channel
+        if let Some(ref root) = *self.root_chan.lock() {
+            Ok(root.dup())
+        } else {
+            // No root set yet - return an error or empty root
+            Err(Error::Enoent)
+        }
+    }
+
+    fn walk(&mut self, _ch: &mut Chan, _name: &str) -> Result<Option<Qid>, Error> {
+        // Walk is handled by the mounted file system
+        Err(Error::Enoent)
+    }
+
+    fn dev_char(&self) -> char {
+        '/'
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+// ============================================================================
+// RAM File System Device
+// ============================================================================
+
+/// RAM file system device - provides an in-memory file system
+/// Used for /dev, /tmp, and other volatile directories
+pub struct RamDev {
+    name: &'static str,
+    /// Root directory entries
+    entries: Mutex<Vec<DirEntry>>,
+    /// Next qid path to allocate
+    next_qid: Mutex<u64>,
+}
+
+impl RamDev {
+    /// Create new RAM device
+    pub fn new() -> Self {
+        let mut entries = Vec::new();
+
+        // Create standard directories
+        entries.push(DirEntry {
+            dev: devtype::SD,
+            qid: Qid::new(1, 0, qidtype::DIR),
+            mode: 0o755 | 0o40000, // Directory + rwxr-xr-x
+            atime: 0,
+            mtime: 0,
+            length: 0,
+            name: b"dev".to_vec(),
+        });
+
+        entries.push(DirEntry {
+            dev: devtype::SD,
+            qid: Qid::new(2, 0, qidtype::DIR),
+            mode: 0o755 | 0o40000,
+            atime: 0,
+            mtime: 0,
+            length: 0,
+            name: b"tmp".to_vec(),
+        });
+
+        Self {
+            name: "ram",
+            entries: Mutex::new(entries),
+            next_qid: Mutex::new(3),
+        }
+    }
+
+    /// Add an entry to the RAM device
+    pub fn add_entry(&self, name: &str, mode: u32, is_dir: bool) {
+        let mut entries = self.entries.lock();
+        let qid_path = {
+            let mut next = self.next_qid.lock();
+            let path = *next;
+            *next += 1;
+            path
+        };
+
+        entries.push(DirEntry {
+            dev: devtype::SD,
+            qid: Qid::new(qid_path, 0, if is_dir { qidtype::DIR } else { qidtype::FILE }),
+            mode,
+            atime: 0,
+            mtime: 0,
+            length: 0,
+            name: name.as_bytes().to_vec(),
+        });
+    }
+
+    /// Find an entry by name
+    fn find_entry(&self, name: &str) -> Option<DirEntry> {
+        let entries = self.entries.lock();
+        entries.iter().find(|e| e.name == name.as_bytes()).cloned()
+    }
+}
+
+impl Dev for RamDev {
+    fn attach(&mut self, _spec: Option<&str>) -> Result<Chan, Error> {
+        Ok(Chan::new(devtype::SD, Qid::new(0, 0, qidtype::DIR), 0))
+    }
+
+    fn walk(&mut self, ch: &mut Chan, name: &str) -> Result<Option<Qid>, Error> {
+        if let Some(entry) = self.find_entry(name) {
+            ch.qid = entry.qid;
+            Ok(Some(entry.qid))
+        } else {
+            Err(Error::Enoent)
+        }
+    }
+
+    fn open(&mut self, ch: &mut Chan, _mode: u8) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn read(&mut self, ch: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        if ch.qid.type_ == qidtype::DIR {
+            // Read directory entries
+            self.readdir(buf, offset)
+        } else {
+            Err(Error::Enoent)
+        }
+    }
+
+    fn write(&mut self, _ch: &mut Chan, _buf: &[u8], _offset: u64) -> Result<usize, Error> {
+        Err(Error::Eperm)
+    }
+
+    fn dev_char(&self) -> char {
+        's'
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+impl RamDev {
+    /// Read directory entries
+    fn readdir(&self, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        use core::mem::size_of;
+
+        let entries = self.entries.lock();
+        let entry_size = 64; // Plan 9 dir entry size
+        let start = (offset / entry_size as u64) as usize;
+
+        let mut pos = 0;
+        for (i, entry) in entries.iter().enumerate().skip(start) {
+            if pos + entry_size > buf.len() {
+                break;
+            }
+
+            // Pack directory entry (Plan 9 format)
+            // struct DirEntry {
+            //     u64 qid_path;
+            //     u32 qid_vers;
+            //     u8 qid_type;
+            //     u32 mode;
+            //     u32 atime;
+            //     u32 mtime;
+            //     u64 length;
+            //     char name[];
+            // }
+            let name_len = entry.name.len().min(28);
+            let total_len = 39 + name_len; // Fixed part + name
+
+            if pos + total_len > buf.len() {
+                break;
+            }
+
+            // Write qid
+            buf[pos..pos + 8].copy_from_slice(&entry.qid.path.to_le_bytes());
+            pos += 8;
+            buf[pos..pos + 4].copy_from_slice(&entry.qid.vers.to_le_bytes());
+            pos += 4;
+            buf[pos] = entry.qid.type_;
+            pos += 1;
+            // Skip padding
+            pos += 3;
+
+            // Write mode, times, length
+            buf[pos..pos + 4].copy_from_slice(&entry.mode.to_le_bytes());
+            pos += 4;
+            buf[pos..pos + 4].copy_from_slice(&entry.atime.to_le_bytes());
+            pos += 4;
+            buf[pos..pos + 4].copy_from_slice(&entry.mtime.to_le_bytes());
+            pos += 4;
+            buf[pos..pos + 8].copy_from_slice(&entry.length.to_le_bytes());
+            pos += 8;
+
+            // Write name length and name
+            buf[pos] = name_len as u8;
+            pos += 1;
+            buf[pos..pos + name_len].copy_from_slice(&entry.name[..name_len]);
+            pos += name_len;
+
+            // Skip remaining of 28-byte name field
+            pos += 28 - name_len;
+
+            if i == start {
+                // First entry is special
+            }
+        }
+
+        Ok(pos)
+    }
+}
+
+// ============================================================================
+// Device Table
+// ============================================================================
+
+/// Device table - manages all registered devices
+pub struct DevTable {
+    /// Array of devices
+    devices: [Option<Box<dyn Dev>>; NDEV],
+    /// Number of registered devices
+    count: usize,
+}
+
+impl DevTable {
+    /// Create new device table
+    pub fn new() -> Self {
+        Self {
+            devices: [const { None }; NDEV],
+            count: 0,
+        }
+    }
+
+    /// Register a device
+    pub fn register(&mut self, dev: Box<dyn Dev>) -> Option<usize> {
+        for (i, slot) in self.devices.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(dev);
+                self.count += 1;
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Get device by index
+    pub fn get(&self, index: usize) -> Option<&dyn Dev> {
+        self.devices.get(index).and_then(|d| d.as_ref().map(|b| b.as_ref()))
+    }
+
+    /// Get mutable device by index
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut dyn Dev> {
+        self.devices.get_mut(index).and_then(|d| d.as_mut().map(|b| b.as_mut()))
+    }
+
+    /// Find device by character
+    pub fn find_by_char(&self, c: char) -> Option<usize> {
+        for (i, dev) in self.devices.iter().enumerate() {
+            if let Some(d) = dev {
+                if d.dev_char() == c {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Find device by character, searching by name
+    pub fn find_by_name(&self, name: &str) -> Option<usize> {
+        for (i, dev) in self.devices.iter().enumerate() {
+            if let Some(d) = dev {
+                if d.name() == name {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Initialize with default devices
+    pub fn init_defaults(&mut self) {
+        // Register null device (#n)
+        self.register(Box::new(NullDev::new()));
+        // Register zero device (#z)
+        self.register(Box::new(ZeroDev::new()));
+        // Register console device (#c)
+        self.register(Box::new(ConsDev::new()));
+        // Register RAM device for /sd
+        self.register(Box::new(RamDev::new()));
+        // Register kmesg device (#K) - kernel message buffer
+        self.register(Box::new(crate::kmesg::KmesgDev::new()));
+        // Register pipe device (#|) - inter-process pipes
+        self.register(Box::new(crate::devpipe::PipeDev::new()));
+        // Register SD device (#s) - storage/disk
+        self.register(Box::new(crate::devsd::SdDev::new()));
+        // Register UART device (#U) - serial ports
+        self.register(Box::new(crate::devuart::UartDev::new()));
+        // Register mouse device (#m) - PS/2 mouse
+        self.register(Box::new(crate::devmouse::MouseDev::new()));
+        // Register keyboard device (#k) - PS/2 keyboard
+        self.register(Box::new(crate::devkb::KbdDev::new()));
+        // Register draw device (#d) - graphics
+        self.register(Box::new(crate::devdraw::DrawDev::new()));
+        // Register audio device (#a) - audio playback/recording
+        self.register(Box::new(crate::devaudio::AudioDev::new()));
+        // Register mnt device (#M) - mount driver
+        self.register(Box::new(crate::devmnt::MntDev::new()));
+        // Register TLS device (#I) - TLS/SSL
+        self.register(Box::new(crate::devtls::TlsDev::new()));
+        // Register bridge device (#l) - Ethernet bridge
+        self.register(Box::new(crate::devbridge::BridgeDev::new()));
+        // Register USB device (#u) - USB host
+        self.register(Box::new(crate::devusb::UsbDev::new()));
+    }
+}
+
+// ============================================================================
+// Global Device Table
+// ============================================================================
+
+use core::sync::atomic::{AtomicPtr, Ordering};
+
+static DEV_TABLE: AtomicPtr<DevTable> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Initialize device table
+pub fn init_devs() {
+    let table = Box::new(DevTable::new());
+    table.init_defaults();
+    DEV_TABLE.store(Box::into_raw(table), Ordering::SeqCst);
+}
+
+/// Get device table reference
+pub fn devs() -> &'static DevTable {
+    unsafe { &*DEV_TABLE.load(Ordering::SeqCst) }
+}
+
+/// Get mutable device table reference
+pub fn devs_mut() -> &'static mut DevTable {
+    unsafe { &mut *DEV_TABLE.load(Ordering::SeqCst) }
+}
+
+/// Register a device
+pub fn register_device(dev: Box<dyn Dev>) -> Option<usize> {
+    devs_mut().register(dev)
+}
+
+/// Set the root device's root channel
+pub fn set_root_device_chan(chan: Chan) {
+    // Find the root device and set its root
+    if let Some(root_idx) = devs().find_by_char('/') {
+        if let Some(root_dev) = devs_mut().get_mut(root_idx) {
+            // RootDev needs a method to set the root - use aux data
+            // For now, this is a placeholder
+        }
+    }
+}
+
+// ============================================================================
+// Device Helper Functions
+// ============================================================================
+
+/// Open a file on a specific device
+pub fn dev_open(dev_char: char, path: &str, mode: u8) -> Result<Chan, Error> {
+    let dev_idx = devs().find_by_char(dev_char)
+        .ok_or(Error::Enoent)?;
+
+    let dev = devs().get(dev_idx)
+        .ok_or(Error::Enoent)?;
+
+    let mut chan = dev.attach(Some(path))
+        .map_err(|_| Error::Eio)?;
+
+    if mode != 0 {
+        dev.open(&mut chan, mode).map_err(|_| Error::Eio)?;
+    }
+
+    Ok(chan)
+}
+
+/// Read from a device channel
+pub fn dev_read(chan: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+    let dev = devs().get(chan.dev).ok_or(Error::Enoent)?;
+    dev.read(chan, buf, offset)
+}
+
+/// Write to a device channel
+pub fn dev_write(chan: &mut Chan, buf: &[u8], offset: u64) -> Result<usize, Error> {
+    let dev = devs().get(chan.dev).ok_or(Error::Enoent)?;
+    dev.write(chan, buf, offset)
+}

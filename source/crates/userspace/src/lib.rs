@@ -1,0 +1,40 @@
+//! Userspace Programs
+//!
+//! Provides user-space programs for Plan 9.
+
+pub mod cat;
+pub mod ls;
+pub mod sh;
+pub mod cp;
+pub mod mv;
+pub mod rm;
+pub mod mkdir;
+pub mod chmod;
+pub mod chgrp;
+pub mod ln;
+pub mod pwd;
+pub mod echo;
+pub mod sleep;
+pub mod date;
+pub mod ps;
+pub mod kill;
+pub mod env;
+pub mod wc;
+pub mod head;
+pub mod tail;
+pub mod grep;
+pub mod sort;
+pub mod uniq;
+pub mod cut;
+pub mod tr;
+pub mod du;
+pub mod df;
+pub mod dd;
+pub mod ip;
+pub mod ping;
+pub mod netstat;
+pub mod nc;
+pub mod auth;
+pub mod diff;
+pub mod awk;
+pub mod sed;

@@ -1,0 +1,11 @@
+[package]
+name = "plan9-drivers"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+plan9-common = { path = "../common", features = ["alloc"] }
+plan9-arch = { path = "../arch" }
+
+[features]
+default = ["plan9-common/alloc"]

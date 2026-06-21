@@ -1,0 +1,11 @@
+[package]
+name = "plan9-arch"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+inline_asm = []
+
+[dependencies]
+plan9-common = { path = "../common" }

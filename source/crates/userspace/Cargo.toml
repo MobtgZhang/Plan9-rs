@@ -1,0 +1,179 @@
+[package]
+name = "plan9-userspace"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+regex-lite = "0.1"
+
+[[bin]]
+name = "ls"
+path = "src/ls.rs"
+
+[[bin]]
+name = "cat"
+path = "src/cat.rs"
+
+[[bin]]
+name = "rc"
+path = "src/sh.rs"
+
+[[bin]]
+name = "cp"
+path = "src/cp.rs"
+
+[[bin]]
+name = "mv"
+path = "src/mv.rs"
+
+[[bin]]
+name = "rm"
+path = "src/rm.rs"
+
+[[bin]]
+name = "mkdir"
+path = "src/mkdir.rs"
+
+[[bin]]
+name = "chmod"
+path = "src/chmod.rs"
+
+[[bin]]
+name = "chgrp"
+path = "src/chgrp.rs"
+
+[[bin]]
+name = "ln"
+path = "src/ln.rs"
+
+[[bin]]
+name = "pwd"
+path = "src/pwd.rs"
+
+[[bin]]
+name = "echo"
+path = "src/echo.rs"
+
+[[bin]]
+name = "sleep"
+path = "src/sleep.rs"
+
+[[bin]]
+name = "date"
+path = "src/date.rs"
+
+[[bin]]
+name = "ps"
+path = "src/ps.rs"
+
+[[bin]]
+name = "kill"
+path = "src/kill.rs"
+
+[[bin]]
+name = "env"
+path = "src/env.rs"
+
+[[bin]]
+name = "wc"
+path = "src/wc.rs"
+
+[[bin]]
+name = "head"
+path = "src/head.rs"
+
+[[bin]]
+name = "tail"
+path = "src/tail.rs"
+
+[[bin]]
+name = "grep"
+path = "src/grep.rs"
+
+[[bin]]
+name = "sort"
+path = "src/sort.rs"
+
+[[bin]]
+name = "uniq"
+path = "src/uniq.rs"
+
+[[bin]]
+name = "cut"
+path = "src/cut.rs"
+
+[[bin]]
+name = "tr"
+path = "src/tr.rs"
+
+[[bin]]
+name = "du"
+path = "src/du.rs"
+
+[[bin]]
+name = "df"
+path = "src/df.rs"
+
+[[bin]]
+name = "dd"
+path = "src/dd.rs"
+
+[[bin]]
+name = "ip"
+path = "src/ip.rs"
+
+[[bin]]
+name = "ping"
+path = "src/ping.rs"
+
+[[bin]]
+name = "netstat"
+path = "src/netstat.rs"
+
+[[bin]]
+name = "nc"
+path = "src/nc.rs"
+
+[[bin]]
+name = "factotum"
+path = "src/auth/factotum.rs"
+
+[[bin]]
+name = "authsrv"
+path = "src/auth/authsrv.rs"
+
+[[bin]]
+name = "login"
+path = "src/auth/login.rs"
+
+[[bin]]
+name = "passwd"
+path = "src/auth/passwd.rs"
+
+[[bin]]
+name = "keyfs"
+path = "src/auth/keyfs.rs"
+
+[[bin]]
+name = "secstore"
+path = "src/auth/secstore.rs"
+
+[[bin]]
+name = "rsagen"
+path = "src/auth/rsagen.rs"
+
+[[bin]]
+name = "convkeys"
+path = "src/auth/convkeys.rs"
+
+[[bin]]
+name = "diff"
+path = "src/diff.rs"
+
+[[bin]]
+name = "awk"
+path = "src/awk.rs"
+
+[[bin]]
+name = "sed"
+path = "src/sed.rs"
