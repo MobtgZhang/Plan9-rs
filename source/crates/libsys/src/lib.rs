@@ -7,64 +7,64 @@
 pub mod io;
 pub mod memory;
 
-pub use io::*;
-pub use memory::*;
+// Re-export memory functions at crate level
+pub use memory::{malloc, free, realloc, calloc};
 
 // ============================================================================
 // System Call Numbers (Plan 9)
 // ============================================================================
 
 /// System call numbers
-pub const SYS_rfork: u32 = 0;
-pub const SYS_exits: u32 = 1;
-pub const SYS_wait: u32 = 2;
-pub const SYS_open: u32 = 3;
-pub const SYS_create: u32 = 4;
-pub const SYS_close: u32 = 5;
-pub const SYS_read: u32 = 6;
-pub const SYS_write: u32 = 7;
-pub const SYS_seek: u32 = 8;
-pub const SYS_dup: u32 = 9;
-pub const SYS_pipe: u32 = 10;
-pub const SYS_exec: u32 = 11;
-pub const SYS_existing: u32 = 12;
-pub const SYS_brk: u32 = 13;
-pub const SYS_remove: u32 = 14;
-pub const SYS_rename: u32 = 15;
-pub const SYS_note: u32 = 16;
-pub const SYS_seekdir: u32 = 17;
-pub const SYS_chdir: u32 = 18;
-pub const SYS_clone: u32 = 19;
-pub const SYS_yield: u32 = 63;
-pub const SYS_getpid: u32 = 47;
-pub const SYS_getppid: u32 = 49;
-pub const SYS_getuid: u32 = 50;
-pub const SYS_geteuid: u32 = 51;
-pub const SYS_getgid: u32 = 52;
-pub const SYS_getegid: u32 = 53;
-pub const SYS_gettid: u32 = 54;
-pub const SYS_nsec: u32 = 43;
-pub const SYS_dup2: u32 = 55;
-pub const SYS_pread: u32 = 56;
-pub const SYS_pwrite: u32 = 57;
-pub const SYS_create9p: u32 = 70;
-pub const SYS_bind: u32 = 20;
-pub const SYS_mount: u32 = 21;
-pub const SYS_unmount: u32 = 22;
-pub const SYS_sleep: u32 = 23;
-pub const SYS_alarm: u32 = 24;
-pub const SYS_await: u32 = 25;
-pub const SYS_semacquire: u32 = 26;
-pub const SYS_semrelease: u32 = 27;
-pub const SYS_rendezvous: u32 = 28;
-pub const SYS_stat: u32 = 29;
-pub const SYS_fstat: u32 = 30;
-pub const SYS_wstat: u32 = 31;
-pub const SYS_fwstat: u32 = 32;
-pub const SYS_segattach: u32 = 33;
-pub const SYS_segdetach: u32 = 34;
-pub const SYS_segfree: u32 = 35;
-pub const SYS_segflush: u32 = 36;
+pub const SYS_RFOK: u32 = 0;
+pub const SYS_EXITS: u32 = 1;
+pub const SYS_WAIT: u32 = 2;
+pub const SYS_OPEN: u32 = 3;
+pub const SYS_CREATE: u32 = 4;
+pub const SYS_CLOSE: u32 = 5;
+pub const SYS_READ: u32 = 6;
+pub const SYS_WRITE: u32 = 7;
+pub const SYS_SEEK: u32 = 8;
+pub const SYS_DUP: u32 = 9;
+pub const SYS_PIPE: u32 = 10;
+pub const SYS_EXEC: u32 = 11;
+pub const SYS_EXISTING: u32 = 12;
+pub const SYS_BRK: u32 = 13;
+pub const SYS_REMOVE: u32 = 14;
+pub const SYS_RENAME: u32 = 15;
+pub const SYS_NOTE: u32 = 16;
+pub const SYS_SEEKDIR: u32 = 17;
+pub const SYS_CHDIR: u32 = 18;
+pub const SYS_CLONE: u32 = 19;
+pub const SYS_YIELD: u32 = 63;
+pub const SYS_GETPID: u32 = 47;
+pub const SYS_GETPPID: u32 = 49;
+pub const SYS_GETUID: u32 = 50;
+pub const SYS_GETEUID: u32 = 51;
+pub const SYS_GETGID: u32 = 52;
+pub const SYS_GETEGID: u32 = 53;
+pub const SYS_GETTID: u32 = 54;
+pub const SYS_NSEC: u32 = 43;
+pub const SYS_DUP2: u32 = 55;
+pub const SYS_PREAD: u32 = 56;
+pub const SYS_PWRITE: u32 = 57;
+pub const SYS_CREATE9P: u32 = 70;
+pub const SYS_BIND: u32 = 20;
+pub const SYS_MOUNT: u32 = 21;
+pub const SYS_UNMOUNT: u32 = 22;
+pub const SYS_SLEEP: u32 = 23;
+pub const SYS_ALARM: u32 = 24;
+pub const SYS_AWAIT: u32 = 25;
+pub const SYS_SEMACQUIRE: u32 = 26;
+pub const SYS_SEMRELEASE: u32 = 27;
+pub const SYS_RENDEZVOUS: u32 = 28;
+pub const SYS_STAT: u32 = 29;
+pub const SYS_FSTAT: u32 = 30;
+pub const SYS_WSTAT: u32 = 31;
+pub const SYS_FWSTAT: u32 = 32;
+pub const SYS_SEGATTACH: u32 = 33;
+pub const SYS_SEGDETACH: u32 = 34;
+pub const SYS_SEGFREE: u32 = 35;
+pub const SYS_SEGFLUSH: u32 = 36;
 
 // ============================================================================
 // System Call Wrapper (x86_64)
@@ -234,7 +234,7 @@ pub const RFNOTEG: u32 = 0x0800;
 
 /// Create a new process
 pub unsafe fn rfork(flags: u32) -> i32 {
-    let ret = syscall1(SYS_rfork, flags as u64);
+    let ret = syscall1(SYS_RFOK, flags as u64);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -244,21 +244,21 @@ pub unsafe fn rfork(flags: u32) -> i32 {
 
 /// Terminate the current process
 pub unsafe fn exits(status: *const u8) -> ! {
-    syscall1(SYS_exits, status as u64);
+    syscall1(SYS_EXITS, status as u64);
     loop {} // Never returns
 }
 
 /// Terminate with status
-pub unsafe fn exits_str(status: i32) -> ! {
+pub unsafe fn exits_str(_status: i32) -> ! {
     // In Plan 9, exits takes a string pointer
     // For simple use, pass nil for default "normal"
-    syscall1(SYS_exits, 0);
+    syscall1(SYS_EXITS, 0);
     loop {}
 }
 
 /// Wait for a child process
 pub unsafe fn wait() -> i32 {
-    let ret = syscall0(SYS_wait);
+    let ret = syscall0(SYS_WAIT);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -268,59 +268,73 @@ pub unsafe fn wait() -> i32 {
 
 /// Get current process ID
 pub unsafe fn getpid() -> u32 {
-    syscall0(SYS_getpid) as u32
+    syscall0(SYS_GETPID) as u32
 }
 
 /// Get parent process ID
 pub unsafe fn getppid() -> u32 {
-    syscall0(SYS_getppid) as u32
+    syscall0(SYS_GETPPID) as u32
 }
 
 /// Get current user ID
 pub unsafe fn getuid() -> u32 {
-    syscall0(SYS_getuid) as u32
+    syscall0(SYS_GETUID) as u32
 }
 
 /// Get effective user ID
 pub unsafe fn geteuid() -> u32 {
-    syscall0(SYS_geteuid) as u32
+    syscall0(SYS_GETEUID) as u32
 }
 
 /// Get current group ID
 pub unsafe fn getgid() -> u32 {
-    syscall0(SYS_getgid) as u32
+    syscall0(SYS_GETGID) as u32
 }
 
 /// Get effective group ID
 pub unsafe fn getegid() -> u32 {
-    syscall0(SYS_getegid) as u32
+    syscall0(SYS_GETEGID) as u32
 }
 
 /// Get thread ID
 pub unsafe fn gettid() -> u32 {
-    syscall0(SYS_gettid) as u32
+    syscall0(SYS_GETTID) as u32
 }
 
 /// Yield the processor
 pub unsafe fn yield_() {
-    let _ = syscall0(SYS_yield);
+    let _ = syscall0(SYS_YIELD);
+}
+
+/// Execute a program
+///
+/// # Safety
+/// This function will replace the current process with a new program.
+/// It should only be called from a child process after fork.
+pub unsafe fn exec(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32 {
+    let ret = syscall3(SYS_EXEC, path as u64, argv as u64, envp as u64);
+    if ret > 0xFFFFFFFF {
+        -1
+    } else {
+        ret as i32
+    }
 }
 
 /// Sleep for specified milliseconds
 pub unsafe fn sleep(ms: u32) -> i32 {
-    let ret = syscall1(SYS_sleep, ms as u64);
+    let ret = syscall1(SYS_SLEEP, ms as u64);
     ret as i32
 }
 
 /// Alarm in milliseconds
 pub unsafe fn alarm(ms: u32) -> i32 {
-    let ret = syscall1(SYS_alarm, ms as u64);
+    let ret = syscall1(SYS_ALARM, ms as u64);
     ret as i32
 }
 
 /// Rendezvous synchronization
 pub unsafe fn rendezvous(tag: u64, val: u64) -> u64 {
-    syscall2(SYS_rendezvous, tag, val)
+    syscall2(SYS_RENDEZVOUS, tag, val)
 }
 
 // ============================================================================
@@ -354,7 +368,7 @@ impl Fd {
 
 /// Open a file
 pub unsafe fn open(path: *const u8, mode: i32) -> i32 {
-    let ret = syscall2(SYS_open, path as u64, mode as u64);
+    let ret = syscall2(SYS_OPEN, path as u64, mode as u64);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -364,7 +378,7 @@ pub unsafe fn open(path: *const u8, mode: i32) -> i32 {
 
 /// Create a file
 pub unsafe fn create(path: *const u8, mode: i32, perm: u32) -> i32 {
-    let ret = syscall3(SYS_create, path as u64, mode as u64, perm as u64);
+    let ret = syscall3(SYS_CREATE, path as u64, mode as u64, perm as u64);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -374,7 +388,7 @@ pub unsafe fn create(path: *const u8, mode: i32, perm: u32) -> i32 {
 
 /// Close a file descriptor
 pub unsafe fn close(fd: i32) -> i32 {
-    let ret = syscall1(SYS_close, fd as u64);
+    let ret = syscall1(SYS_CLOSE, fd as u64);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -384,7 +398,7 @@ pub unsafe fn close(fd: i32) -> i32 {
 
 /// Read from a file descriptor
 pub unsafe fn read(fd: i32, buf: *mut u8, n: usize) -> i32 {
-    let ret = syscall3(SYS_read, fd as u64, buf as u64, n as u64);
+    let ret = syscall3(SYS_READ, fd as u64, buf as u64, n as u64);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -394,7 +408,7 @@ pub unsafe fn read(fd: i32, buf: *mut u8, n: usize) -> i32 {
 
 /// Write to a file descriptor
 pub unsafe fn write(fd: i32, buf: *const u8, n: usize) -> i32 {
-    let ret = syscall3(SYS_write, fd as u64, buf as u64, n as u64);
+    let ret = syscall3(SYS_WRITE, fd as u64, buf as u64, n as u64);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -404,7 +418,7 @@ pub unsafe fn write(fd: i32, buf: *const u8, n: usize) -> i32 {
 
 /// Change file offset
 pub unsafe fn seek(fd: i32, offset: i64, whence: i32) -> i64 {
-    syscall3(SYS_seek, fd as u64, offset as u64, whence as u64) as i64
+    syscall3(SYS_SEEK, fd as u64, offset as u64, whence as u64) as i64
 }
 
 /// Seek from start
@@ -416,7 +430,7 @@ pub const SEEK_END: i32 = 2;
 
 /// Duplicate a file descriptor
 pub unsafe fn dup(fd: i32) -> i32 {
-    let ret = syscall1(SYS_dup, fd as u64);
+    let ret = syscall1(SYS_DUP, fd as u64);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -426,7 +440,7 @@ pub unsafe fn dup(fd: i32) -> i32 {
 
 /// Duplicate to specific fd
 pub unsafe fn dup2(oldfd: i32, newfd: i32) -> i32 {
-    let ret = syscall2(SYS_dup2, oldfd as u64, newfd as u64);
+    let ret = syscall2(SYS_DUP2, oldfd as u64, newfd as u64);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -436,7 +450,7 @@ pub unsafe fn dup2(oldfd: i32, newfd: i32) -> i32 {
 
 /// Create a pipe
 pub unsafe fn pipe(fds: *mut i32) -> i32 {
-    let ret = syscall1(SYS_pipe, fds as u64);
+    let ret = syscall1(SYS_PIPE, fds as u64);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -446,7 +460,7 @@ pub unsafe fn pipe(fds: *mut i32) -> i32 {
 
 /// Read at offset
 pub unsafe fn pread(fd: i32, buf: *mut u8, n: usize, offset: u64) -> i32 {
-    let ret = syscall4(SYS_pread, fd as u64, buf as u64, n as u64, offset);
+    let ret = syscall4(SYS_PREAD, fd as u64, buf as u64, n as u64, offset);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -456,7 +470,7 @@ pub unsafe fn pread(fd: i32, buf: *mut u8, n: usize, offset: u64) -> i32 {
 
 /// Write at offset
 pub unsafe fn pwrite(fd: i32, buf: *const u8, n: usize, offset: u64) -> i32 {
-    let ret = syscall4(SYS_pwrite, fd as u64, buf as u64, n as u64, offset);
+    let ret = syscall4(SYS_PWRITE, fd as u64, buf as u64, n as u64, offset);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -470,25 +484,25 @@ pub unsafe fn pwrite(fd: i32, buf: *const u8, n: usize, offset: u64) -> i32 {
 
 /// Bind a name to a channel
 pub unsafe fn bind(src: *const u8, target: *const u8, flags: i32) -> i32 {
-    let ret = syscall3(SYS_bind, src as u64, target as u64, flags as u64);
+    let ret = syscall3(SYS_BIND, src as u64, target as u64, flags as u64);
     ret as i32
 }
 
 /// Mount a file system
 pub unsafe fn mount(src: *const u8, target: *const u8, flags: i32, spec: *const u8) -> i32 {
-    let ret = syscall4(SYS_mount, src as u64, target as u64, flags as u64, spec as u64);
+    let ret = syscall4(SYS_MOUNT, src as u64, target as u64, flags as u64, spec as u64);
     ret as i32
 }
 
 /// Unmount a file system
 pub unsafe fn unmount(spec: *const u8, target: *const u8) -> i32 {
-    let ret = syscall2(SYS_unmount, spec as u64, target as u64);
+    let ret = syscall2(SYS_UNMOUNT, spec as u64, target as u64);
     ret as i32
 }
 
 /// Change current directory
 pub unsafe fn chdir(path: *const u8) -> i32 {
-    let ret = syscall1(SYS_chdir, path as u64);
+    let ret = syscall1(SYS_CHDIR, path as u64);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -498,7 +512,7 @@ pub unsafe fn chdir(path: *const u8) -> i32 {
 
 /// Remove a file
 pub unsafe fn remove(path: *const u8) -> i32 {
-    let ret = syscall1(SYS_remove, path as u64);
+    let ret = syscall1(SYS_REMOVE, path as u64);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -508,7 +522,7 @@ pub unsafe fn remove(path: *const u8) -> i32 {
 
 /// Rename a file
 pub unsafe fn rename(old: *const u8, new: *const u8) -> i32 {
-    let ret = syscall2(SYS_rename, old as u64, new as u64);
+    let ret = syscall2(SYS_RENAME, old as u64, new as u64);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -522,7 +536,7 @@ pub unsafe fn rename(old: *const u8, new: *const u8) -> i32 {
 
 /// Change program break (sbrk)
 pub unsafe fn brk(addr: *mut u8) -> i32 {
-    let ret = syscall1(SYS_brk, addr as u64);
+    let ret = syscall1(SYS_BRK, addr as u64);
     if ret > 0xFFFFFFFF {
         -1
     } else {
@@ -530,33 +544,83 @@ pub unsafe fn brk(addr: *mut u8) -> i32 {
     }
 }
 
+/// Internal brk syscall wrapper
+///
+/// Returns 0 on success, negative on error.
+pub fn brk_internal(addr: isize) -> isize {
+    // If addr is 0, just return current break
+    // If addr is positive, set break to that address
+    // If addr is negative, treat as offset from current break
+    let target = if addr == 0 {
+        // Get current break - we'll need to track this
+        // For now, return -1 to indicate we need to track
+        return -1;
+    } else if addr > 0 {
+        addr as u64
+    } else {
+        // Offset from current break not supported
+        return -1;
+    };
+
+    let ret = unsafe { syscall1(SYS_BRK, target) };
+    if ret > 0xFFFFFFFF as u64 {
+        -1
+    } else {
+        ret as isize
+    }
+}
+
 /// Get current program break
+///
+/// Tracks the break pointer in a private `static mut` cell so the rest
+/// of the crate can observe it without referencing a non-existent C
+/// symbol. The pointer is updated by the heap allocation routines in
+/// `memory.rs` via `set_sbrk_current` whenever the program break moves.
 pub fn sbrk() -> *mut u8 {
-    // Not directly available, need to track ourselves
-    core::ptr::null_mut() // TODO
+    static mut SBRK_CURRENT: *mut u8 = core::ptr::null_mut();
+    unsafe { SBRK_CURRENT }
+}
+
+/// Update the cached break pointer. Called from the allocator when the
+/// kernel-side break is moved by `brk(2)`.
+pub unsafe fn set_sbrk_current(ptr: *mut u8) {
+    static mut SBRK_CURRENT: *mut u8 = core::ptr::null_mut();
+    SBRK_CURRENT = ptr;
+}
+
+/// Implementation of the Plan 9 `brk`/`sbrk` pair (libc-compatible
+/// signature). The wrapper is the canonical caller of `brk_internal`,
+/// which issues the actual `SYS_BRK` syscall.
+pub fn sbrk_set(addr: *mut u8) -> i32 {
+    let result = brk_internal(addr as isize);
+    if result < 0 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// Attach shared memory segment
 pub unsafe fn segattach(seg: u32, addr: *mut u8, len: usize) -> *mut u8 {
-    let ret = syscall3(SYS_segattach, seg as u64, addr as u64, len as u64);
+    let ret = syscall3(SYS_SEGATTACH, seg as u64, addr as u64, len as u64);
     ret as *mut u8
 }
 
 /// Detach shared memory segment
 pub unsafe fn segdetach(addr: *mut u8) -> i32 {
-    let ret = syscall1(SYS_segdetach, addr as u64);
+    let ret = syscall1(SYS_SEGDETACH, addr as u64);
     ret as i32
 }
 
 /// Free shared memory segment
 pub unsafe fn segfree(addr: *mut u8, len: usize) -> i32 {
-    let ret = syscall2(SYS_segfree, addr as u64, len as u64);
+    let ret = syscall2(SYS_SEGFREE, addr as u64, len as u64);
     ret as i32
 }
 
 /// Flush instruction cache for segment
 pub unsafe fn segflush(addr: *mut u8, len: usize) -> i32 {
-    let ret = syscall2(SYS_segflush, addr as u64, len as u64);
+    let ret = syscall2(SYS_SEGFLUSH, addr as u64, len as u64);
     ret as i32
 }
 
@@ -566,7 +630,7 @@ pub unsafe fn segflush(addr: *mut u8, len: usize) -> i32 {
 
 /// Get nanoseconds since epoch
 pub unsafe fn nsec() -> u64 {
-    syscall0(SYS_nsec)
+    syscall0(SYS_NSEC)
 }
 
 /// Get current time as seconds since epoch
