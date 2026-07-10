@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 plan9-common = { path = "../common", features = ["alloc"] }
+plan9_libventi = { path = "../libventi", features = ["alloc"] }

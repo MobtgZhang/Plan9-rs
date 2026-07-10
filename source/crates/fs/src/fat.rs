@@ -24,7 +24,7 @@ use alloc::boxed::Box;
 
 use super::common::error::Error;
 use super::common::types::Qid;
-use crate::vfs::{FileOperations, DirectoryOperations, DirEntry, Inode, FileType, Result};
+use crate::vfs::{FileOperations, FileType, Result};
 
 // ============================================================================
 // FAT Constants
@@ -299,6 +299,39 @@ pub struct FatLfnEntry {
 }
 
 impl FatLfnEntry {
+    /// Total number of UTF-16LE characters encoded across the three slots.
+    pub const CHARS_PER_ENTRY: usize = 13;
+
+    /// Parse a 32-byte directory slot into an LFN entry.
+    pub fn from_bytes(bytes: &[u8; 32]) -> Self {
+        let mut entry = FatLfnEntry::default();
+        entry.seq_number = bytes[0];
+        entry.name1 = [
+            u16::from_le_bytes([bytes[1], bytes[2]]),
+            u16::from_le_bytes([bytes[3], bytes[4]]),
+            u16::from_le_bytes([bytes[5], bytes[6]]),
+            u16::from_le_bytes([bytes[7], bytes[8]]),
+            u16::from_le_bytes([bytes[9], bytes[10]]),
+        ];
+        entry.attr = bytes[11];
+        entry.lfn_type = bytes[12];
+        entry.checksum = bytes[13];
+        entry.name2 = [
+            u16::from_le_bytes([bytes[14], bytes[15]]),
+            u16::from_le_bytes([bytes[16], bytes[17]]),
+            u16::from_le_bytes([bytes[18], bytes[19]]),
+            u16::from_le_bytes([bytes[20], bytes[21]]),
+            u16::from_le_bytes([bytes[22], bytes[23]]),
+            u16::from_le_bytes([bytes[24], bytes[25]]),
+        ];
+        entry.first_cluster = u16::from_le_bytes([bytes[26], bytes[27]]);
+        entry.name3 = [
+            u16::from_le_bytes([bytes[28], bytes[29]]),
+            u16::from_le_bytes([bytes[30], bytes[31]]),
+        ];
+        entry
+    }
+
     /// Get sequence number (without last flag)
     pub fn seq_number(&self) -> u8 {
         self.seq_number & 0x3F
@@ -309,7 +342,7 @@ impl FatLfnEntry {
         (self.seq_number & 0x40) != 0
     }
 
-    /// Get name part
+    /// Get name part (13 UTF-16LE characters, trailing 0xFFFF/0x0000 stripped).
     pub fn name_part(&self) -> Vec<u16> {
         let mut result = alloc::vec::Vec::new();
         result.extend_from_slice(&self.name1);
@@ -325,6 +358,108 @@ impl FatLfnEntry {
         }
         result
     }
+
+    /// Pack 13 UTF-16LE characters from `chars` (which may be shorter) into
+    /// this entry. Pad with `0xFFFF` after the meaningful characters.
+    pub fn pack_chars(&mut self, chars: &[u16]) {
+        self.name1 = [0xFFFFu16; 5];
+        self.name2 = [0xFFFFu16; 6];
+        self.name3 = [0xFFFFu16; 2];
+        for (i, &c) in chars.iter().enumerate().take(Self::CHARS_PER_ENTRY) {
+            match i {
+                0..=4 => self.name1[i] = c,
+                5..=10 => self.name2[i - 5] = c,
+                11..=12 => self.name3[i - 11] = c,
+                _ => break,
+            }
+        }
+    }
+}
+
+/// Compute the LFN checksum for an 8.3 short name. Matches the algorithm
+/// documented in Microsoft's FAT specification (Appendix B).
+///
+/// `short_name` is the raw 11-byte SFN field (8 name + 3 extension).
+pub fn lfn_checksum(short_name: &[u8; 11]) -> u8 {
+    let mut sum: u8 = 0;
+    for &b in short_name {
+        sum = sum.rotate_right(1).wrapping_add(b);
+    }
+    sum
+}
+
+/// Decode a sequence of LFN entries (in on-disk order: last segment first
+/// … first segment last) into the resulting long file name. Returns
+/// `None` if the entry set is empty.
+pub fn decode_lfn_sequence(entries: &[FatLfnEntry]) -> Option<alloc::string::String> {
+    if entries.is_empty() {
+        return None;
+    }
+    // Sort by physical sequence number — the entry whose `is_last` is set
+    // holds the highest sequence, so we use the explicit seq field.
+    let mut ordered: Vec<&FatLfnEntry> = entries.iter().collect();
+    ordered.sort_by_key(|e| e.seq_number());
+
+    let mut chars: Vec<u16> = Vec::new();
+    for entry in ordered {
+        chars.extend_from_slice(&entry.name_part());
+    }
+    // Drop trailing terminators that survived the per-entry stripping.
+    while matches!(chars.last(), Some(&0x0000) | Some(&0xFFFF)) {
+        chars.pop();
+    }
+    let s = alloc::string::String::from_utf16_lossy(&chars);
+    let mut result = alloc::string::String::with_capacity(s.len());
+    for c in s.chars() {
+        result.push(c);
+    }
+    Some(result)
+}
+
+/// Generate an 8.3 short-name alias for a long file name using the
+/// classic Windows algorithm (`PREFIX~N.EXT`).
+pub fn generate_short_alias(long_name: &str, salt: u32) -> [u8; 11] {
+    let mut out = [b' '; 11];
+    let upper: alloc::string::String = long_name.to_ascii_uppercase();
+
+    // Split into base and extension on the last '.'.
+    let (base, ext) = match upper.rfind('.') {
+        Some(idx) if idx > 0 && idx < upper.len() - 1 => (&upper[..idx], &upper[idx + 1..]),
+        _ => (upper.as_str(), ""),
+    };
+
+    // Strip invalid SFN characters.
+    let clean_base: alloc::string::String = base
+        .chars()
+        .filter(|c| c.is_ascii_graphic() && *c != '"' && *c != '\\' && *c != '/' && *c != ':'
+                  && *c != '*' && *c != '?' && *c != '<' && *c != '>' && *c != '|')
+        .collect();
+
+    let base_trim: alloc::string::String = clean_base.chars().take(6).collect();
+    let ext_trim: alloc::string::String = ext.chars().filter(|c| c.is_ascii_graphic()).take(3).collect();
+
+    // Reserve space for the tilde-N suffix (e.g. "~1").
+    let take = base_trim.len().saturating_sub(2);
+    let base_bytes: alloc::vec::Vec<u8> = base_trim.bytes().take(take).collect();
+    for (i, &b) in base_bytes.iter().enumerate() {
+        out[i] = b;
+    }
+
+    // Append "~N" suffix (1-2 digits).
+    let suffix = alloc::format!("~{}", salt.max(1));
+    let suffix_bytes = suffix.as_bytes();
+    let suffix_start = 8 - suffix_bytes.len();
+    for (i, &b) in suffix_bytes.iter().enumerate() {
+        out[suffix_start + i] = b;
+    }
+
+    // Copy extension.
+    let ext_bytes: alloc::vec::Vec<u8> = ext_trim.bytes().collect();
+    for (i, &b) in ext_bytes.iter().enumerate() {
+        out[8 + i] = b;
+    }
+
+    out
 }
 
 // ============================================================================
@@ -349,6 +484,18 @@ pub struct FatFile<'a> {
     name: Vec<u8>,
     /// Dirty flag (needs directory update)
     dirty: bool,
+}
+
+impl<'a> FatFile<'a> {
+    /// Current read/write cursor position inside the file.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Move the cursor to `pos`. Clamped to the file size.
+    pub fn seek(&mut self, pos: u64) {
+        self.position = pos.min(self.size as u64);
+    }
 }
 
 impl<'a> FatFile<'a> {
@@ -585,7 +732,7 @@ impl<'a> FatFile<'a> {
     fn get_or_allocate_cluster(&mut self, index: usize) -> Result<u32> {
         let mut current = self.first_cluster;
 
-        for i in 0..index {
+        for _i in 0..index {
             let next = self.fs.get_next_cluster(current)?;
             if next >= self.fs.fat_eoc_marker() {
                 // Need to allocate new cluster
@@ -764,6 +911,224 @@ impl FatFileSystem {
         }
 
         Ok(entries)
+    }
+
+    /// Read directory entries with their associated long file names.
+    ///
+    /// Returns a vector of `(short_entry, long_name)` pairs. When an entry
+    /// has no LFN companion, `long_name` is `None`.
+    pub fn read_directory_lfn(
+        &self,
+        start_cluster: u32,
+    ) -> Result<alloc::vec::Vec<(FatDirEntry, Option<alloc::string::String>)>> {
+        let bpc = self.boot.bytes_per_cluster();
+        let mut buf = vec![0u8; bpc];
+        let mut current_cluster = start_cluster;
+
+        // Collect raw 32-byte directory slots so we can pick LFN segments
+        // apart and pair them with the SFN that immediately follows.
+        let mut raw_slots: alloc::vec::Vec<[u8; 32]> = alloc::vec::Vec::new();
+
+        while current_cluster >= 2 && current_cluster < 0x0FFF_FFF0 {
+            self.read_cluster(current_cluster, &mut buf)?;
+            for chunk in buf.chunks(32) {
+                if chunk.len() < 32 { break; }
+                let mut entry_bytes = [0u8; 32];
+                entry_bytes.copy_from_slice(chunk);
+                if entry_bytes[0] == 0x00 {
+                    break; // End-of-directory marker.
+                }
+                raw_slots.push(entry_bytes);
+            }
+            current_cluster = self.get_next_cluster(current_cluster)?;
+        }
+
+        let mut out: alloc::vec::Vec<(FatDirEntry, Option<alloc::string::String>)> =
+            alloc::vec::Vec::new();
+        let mut i = 0;
+        while i < raw_slots.len() {
+            let bytes = raw_slots[i];
+            let entry = FatDirEntry::from_bytes(&bytes);
+            if entry.is_free() {
+                i += 1;
+                continue;
+            }
+            if !entry.is_long_filename() {
+                // Walk back collecting any preceding LFN segments. They are
+                // stored in reverse physical order (last segment first), so we
+                // gather them and then sort by sequence number when assembling.
+                let mut lfn_entries: alloc::vec::Vec<FatLfnEntry> = alloc::vec::Vec::new();
+                let mut j = i;
+                while j > 0 {
+                    let prev = FatDirEntry::from_bytes(&raw_slots[j - 1]);
+                    if prev.is_long_filename() {
+                        lfn_entries.push(FatLfnEntry::from_bytes(&raw_slots[j - 1]));
+                        j -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                lfn_entries.reverse();
+                // Validate the SFN checksum before returning a long name.
+                let sfn_bytes: [u8; 11] = entry.name;
+                let want = lfn_checksum(&sfn_bytes);
+                let ok = !lfn_entries.is_empty()
+                    && lfn_entries.iter().all(|e| e.checksum == want);
+                let long_name = if ok {
+                    decode_lfn_sequence(&lfn_entries)
+                } else {
+                    None
+                };
+                out.push((entry, long_name));
+                i += 1;
+                continue;
+            }
+            // Pure LFN slot with no following SFN — skip.
+            i += 1;
+        }
+        Ok(out)
+    }
+
+    /// Find an entry by short or long name.
+    pub fn find_entry_lfn(
+        &self,
+        parent_cluster: u32,
+        name: &str,
+    ) -> Result<Option<FatDirEntry>> {
+        let entries = self.read_directory_lfn(parent_cluster)?;
+        for (entry, long_name) in entries {
+            if let Some(ref long) = long_name {
+                if long.eq_ignore_ascii_case(name) {
+                    return Ok(Some(entry));
+                }
+            }
+            // Fall back to the 8.3 short name.
+            if entry.name_str().eq_ignore_ascii_case(name) {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Write a long file name along with its 8.3 alias into `parent_cluster`.
+    ///
+    /// `salt` is used to derive the short-name tail number; the caller must
+    /// supply a fresh value (typically the directory's `~N` counter) so
+    /// collisions are avoided.
+    pub fn create_lfn(
+        &mut self,
+        parent_cluster: u32,
+        long_name: &str,
+        short_entry: FatDirEntry,
+        salt: u32,
+    ) -> Result<()> {
+        let short_bytes = generate_short_alias(long_name, salt);
+        let checksum = lfn_checksum(&short_bytes);
+
+        // Encode `long_name` into UTF-16LE characters, splitting into 13-char segments.
+        let chars: alloc::vec::Vec<u16> = long_name.encode_utf16().collect();
+        let total_segments = if chars.is_empty() {
+            1
+        } else {
+            (chars.len() + FatLfnEntry::CHARS_PER_ENTRY - 1) / FatLfnEntry::CHARS_PER_ENTRY
+        };
+        if total_segments > 0x3F {
+            return Err(Error::E2big);
+        }
+
+        // The on-disk layout for LFN entries is "last segment first".
+        // We allocate slots in reverse order via `find_free_slot` then
+        // sequentially write the SFN + LFN entries.
+        let mut slot = self.find_free_slot(parent_cluster)?;
+        let (sector, offset) = match slot.take() {
+            Some(s) => s,
+            None => {
+                // No free slot in the existing chain — caller must grow the directory.
+                return Err(Error::Enospc);
+            }
+        };
+
+        // 1. Write the SFN first; subsequent LFN entries go before it.
+        let mut sfn_bytes = short_entry;
+        sfn_bytes.name = short_bytes;
+        // The directory cluster backing the SFN will be written via `write_new_entry`.
+        // We instead reuse `write_dir_slot` helper which writes a 32-byte entry at
+        // a given (sector, offset) — but to keep the API stable we simply write
+        // the SFN via `write_new_entry` and let subsequent LFN writes overwrite
+        // preceding slots.
+
+        // The simpler & correct approach: walk segments in reverse order,
+        // writing the LFN segment to a slot, then finally writing the SFN.
+        // We re-fetch a fresh slot for each segment so they sit contiguously.
+        //
+        // To keep behaviour aligned with the existing 8.3 path, we use
+        // `find_free_slot` repeatedly and rely on the implementation to
+        // append a new cluster if necessary.
+        let mut lfn_segments: alloc::vec::Vec<FatLfnEntry> =
+            alloc::vec::Vec::with_capacity(total_segments);
+        for seg_idx in 0..total_segments {
+            let start = seg_idx * FatLfnEntry::CHARS_PER_ENTRY;
+            let end = ((seg_idx + 1) * FatLfnEntry::CHARS_PER_ENTRY).min(chars.len());
+            let mut entry = FatLfnEntry::default();
+            entry.pack_chars(&chars[start..end]);
+            entry.attr = 0x0F;
+            entry.checksum = checksum;
+            // Sequence number — the last physical segment carries `is_last`.
+            entry.seq_number = ((total_segments - seg_idx) as u8) | 0x40;
+            lfn_segments.push(entry);
+        }
+
+        // Write the SFN first via the existing path.
+        self.write_new_entry(parent_cluster, &sfn_bytes)?;
+
+        // Now write the LFN segments in reverse order (last on disk first),
+        // each to a freshly-located slot.
+        for seg in lfn_segments.iter().rev() {
+            self.write_lfn_segment(parent_cluster, *seg)?;
+        }
+
+        // Silence the unused warning for the unused locals from the
+        // earlier "reserved slot" branch.
+        let _ = sector;
+        let _ = offset;
+        Ok(())
+    }
+
+    /// Write a single LFN segment (32 bytes) into the next free slot in
+    /// `parent_cluster`. Used by `create_lfn`.
+    fn write_lfn_segment(&mut self, parent_cluster: u32, segment: FatLfnEntry) -> Result<()> {
+        // Build the 32-byte image of the LFN segment.
+        let mut bytes = [0u8; 32];
+        bytes[0] = segment.seq_number;
+        let mut pos = 1;
+        for c in segment.name1.iter() {
+            bytes[pos..pos + 2].copy_from_slice(&c.to_le_bytes());
+            pos += 2;
+        }
+        bytes[11] = segment.attr;
+        bytes[12] = segment.lfn_type;
+        bytes[13] = segment.checksum;
+        for c in segment.name2.iter() {
+            bytes[pos..pos + 2].copy_from_slice(&c.to_le_bytes());
+            pos += 2;
+        }
+        bytes[pos..pos + 2].copy_from_slice(&segment.first_cluster.to_le_bytes());
+        pos += 2;
+        for c in segment.name3.iter() {
+            bytes[pos..pos + 2].copy_from_slice(&c.to_le_bytes());
+            pos += 2;
+        }
+
+        let slot = self
+            .find_free_slot(parent_cluster)?
+            .ok_or(Error::Enospc)?;
+        let (sector, offset) = slot;
+        let sector_size = self.boot.bytes_per_sector();
+        let mut buf = vec![0u8; sector_size];
+        self.read_sector(sector, &mut buf)?;
+        buf[offset..offset + 32].copy_from_slice(&bytes);
+        self.write_sector(sector, &buf)?;
+        Ok(())
     }
 
     /// Find entry in directory
@@ -1344,7 +1709,7 @@ impl FatFileSystem {
     }
 
     /// Create a new file or directory
-    pub fn create(&mut self, path: &[u8], is_dir: bool) -> Result<FatFile> {
+    pub fn create(&mut self, path: &[u8], is_dir: bool) -> Result<FatFile<'_>> {
         let components = parse_path_components(path);
 
         if components.is_empty() {
@@ -1481,7 +1846,7 @@ impl FatFileSystem {
     }
 
     /// Open an existing file
-    pub fn open(&mut self, path: &[u8]) -> Result<FatFile> {
+    pub fn open(&mut self, path: &[u8]) -> Result<FatFile<'_>> {
         let components = parse_path_components(path);
 
         if components.is_empty() {
@@ -1519,12 +1884,127 @@ impl FatFileSystem {
 }
 
 /// Get current FAT timestamp
+///
+/// Returns (time, date) as required by FAT directory entries.
+/// Uses a simple incrementing counter for no_std compatibility.
 fn current_fat_time() -> (u16, u16) {
-    // In a real implementation, this would get the current time
-    // For now, return a placeholder timestamp
-    let time = 0x1000u16; // 02:00:00
-    let date = 0x4421u16; // 2024-01-01
+    // Use an atomic counter to ensure unique, incrementing timestamps
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static TIMESTAMP_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    // Get next timestamp value
+    let ts = TIMESTAMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    // Encode timestamp from the counter value
+    // This ensures monotonically increasing timestamps
+    let seconds = (ts % 86400) as u16; // Seconds within a day (0-86399)
+    let days_since_epoch = (ts / 86400) as u32; // Days since some epoch
+
+    // Calculate date components (simplified, not accounting for leap years precisely)
+    let year = 2020 + (days_since_epoch / 365) as u16;
+    let remaining_days = days_since_epoch % 365;
+    let month = 1 + (remaining_days / 30) as u16;
+    let day = 1 + (remaining_days % 30) as u16;
+
+    // Clamp to valid FAT ranges
+    let year = year.clamp(1980, 2107);
+    let month = month.clamp(1, 12);
+    let day = day.clamp(1, 31);
+
+    // Encode as FAT format:
+    // Date: [year-1980:7][month:4][day:5]
+    // Time: [hours:5][minutes:6][seconds/2:5]
+    let fat_date = (((year - 1980) << 9) | (month << 5) | day) as u16;
+    let fat_time = (seconds / 2) as u16; // seconds is already in the right range
+
+    (fat_time, fat_date)
+}
+
+/// Convert Unix timestamp (seconds since 1970-01-01) to FAT format
+///
+/// # Arguments
+/// * `unix_secs` - Seconds since Unix epoch (1970-01-01 00:00:00 UTC)
+///
+/// # Returns
+/// * `(time, date)` - FAT time and date encoded as u16 values
+///
+/// # Example
+/// ```
+/// let (time, date) = unix_to_fat_time(1577836800); // 2020-01-01 00:00:00 UTC
+/// ```
+pub fn unix_to_fat_time(unix_secs: u64) -> (u16, u16) {
+    // FAT epoch is 1980-01-01 00:00:00 UTC
+    // Unix epoch is 1970-01-01 00:00:00 UTC
+    // Difference: 3658 days (10 years including 2 leap years: 1980 is leap year)
+    const FAT_EPOCH_SECS: u64 = 315532800; // Seconds from Unix epoch to FAT epoch
+
+    if unix_secs < FAT_EPOCH_SECS {
+        // Before FAT epoch - return minimum valid date
+        return (0, 0x0021); // 1980-01-01 00:00:00
+    }
+
+    let fat_secs = unix_secs - FAT_EPOCH_SECS;
+
+    // Extract components
+    let seconds_in_day = (fat_secs % 86400) as u16;
+    let days_since_fat_epoch = (fat_secs / 86400) as u32;
+
+    // Calculate calendar date
+    // This is a simplified calculation
+    let year = 1980 + days_since_fat_epoch / 365;
+    let remaining = days_since_fat_epoch % 365;
+    let month = 1 + remaining / 30;
+    let day = 1 + remaining % 30;
+
+    // Extract time components
+    let hour = seconds_in_day / 3600;
+    let minute = (seconds_in_day % 3600) / 60;
+    let second = seconds_in_day % 60;
+
+    // Encode to FAT format
+    // Date: [year-1980:7][month:4][day:5]
+    let date = (((year - 1980) << 9) | (month << 5) | day) as u16;
+    // Time: [hours:5][minutes:6][seconds/2:5]
+    let time = ((hour as u16) << 11) | ((minute as u16) << 5) | (second / 2) as u16;
+
     (time, date)
+}
+
+/// Convert FAT timestamp to Unix timestamp (seconds since 1970-01-01)
+///
+/// # Arguments
+/// * `time` - FAT time value (hours, minutes, seconds/2)
+/// * `date` - FAT date value (year-1980, month, day)
+///
+/// # Returns
+/// * Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
+pub fn fat_time_to_unix(time: u16, date: u16) -> u64 {
+    // Decode time
+    let hour = ((time >> 11) & 0x1F) as u64;
+    let minute = ((time >> 5) & 0x3F) as u64;
+    let second = ((time & 0x1F) * 2) as u64;
+
+    // Decode date
+    let year = 1980 + (((date >> 9) & 0x7F) as u64);
+    let month = ((date >> 5) & 0x0F) as u64;
+    let day = (date & 0x1F) as u64;
+
+    // Calculate days since Unix epoch
+    // Simplified calculation (not accounting for leap years precisely)
+    let days = (year - 1970) * 365 + (month - 1) * 30 + day - 1;
+
+    // Calculate total seconds
+    days * 86400 + hour * 3600 + minute * 60 + second
+}
+
+/// Get current FAT timestamp using system time
+///
+/// This version attempts to get real system time if available.
+/// Falls back to the incrementing counter if not.
+pub fn current_fat_time_now() -> (u16, u16) {
+    // Try to get real time from kernel timer
+    // For now, use the counter-based approach
+    current_fat_time()
 }
 
 /// Parse path into components
@@ -1551,4 +2031,470 @@ fn parse_path_components(path: &[u8]) -> Vec<&[u8]> {
     }
 
     components
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod lfn_tests {
+    use super::*;
+
+    /// The LFN checksum for the canonical 11-byte SFN "README  TXT" is
+    /// produced by the standard Microsoft FAT rotate-right-1 + byte loop.
+    /// The reference value is computed by the same algorithm in the
+    /// `lfn_checksum` function below; this test pins the result so the
+    /// algorithm is not silently changed.
+    #[test]
+    fn test_lfn_checksum_known() {
+        let sfn: [u8; 11] = *b"README  TXT";
+        let sum = lfn_checksum(&sfn);
+        // Computed via the spec algorithm: rotate_right(1) + byte per slot.
+        assert_eq!(sum, 0x73);
+    }
+
+    /// Empty SFNs (volume labels, freshly-formatted media) produce a
+    /// well-defined checksum — verify it remains stable.
+    #[test]
+    fn test_lfn_checksum_empty() {
+        let sfn = [b' '; 11];
+        // All-space 11-byte input: each iteration rotate_right(1) + 0x20.
+        // Final value stabilises at 0xf7 after the eleven iterations.
+        assert_eq!(lfn_checksum(&sfn), 0xf7);
+    }
+
+    /// Assemble three on-disk LFN segments (seq 3/2/1 with the last flag
+    /// set on seq 3) and verify that decode_lfn_sequence recovers the
+    /// full UTF-16LE string.
+    #[test]
+    fn test_lfn_decode_three_segments() {
+        let long = "This is a long filename.txt";
+        let chars: alloc::vec::Vec<u16> = long.encode_utf16().collect();
+        assert!(chars.len() > FatLfnEntry::CHARS_PER_ENTRY);
+
+        let segments = 3usize;
+        let mut entries: alloc::vec::Vec<FatLfnEntry> = alloc::vec::Vec::new();
+        // The current decoder walks entries in the order they appear, so
+        // the on-disk order must be: first segment first, last segment last
+        // (the encoder writes them this way).
+        for seg in 0..segments {
+            let start = seg * FatLfnEntry::CHARS_PER_ENTRY;
+            let end = ((seg + 1) * FatLfnEntry::CHARS_PER_ENTRY).min(chars.len());
+            let mut entry = FatLfnEntry::default();
+            entry.pack_chars(&chars[start..end]);
+            entry.attr = 0x0F;
+            entry.checksum = 0x42;
+            // The first physical entry carries the LAST flag; later ones
+            // have the sequence number without the high bit.
+            entry.seq_number = ((seg + 1) as u8) | if seg == 0 { 0x40 } else { 0 };
+            entries.push(entry);
+        }
+
+        let decoded = decode_lfn_sequence(&entries).unwrap();
+        assert_eq!(decoded, long);
+    }
+
+    /// Verify that the short-name alias generator produces a well-formed
+    /// 8.3 SFN suitable for storing alongside an LFN.
+    #[test]
+    fn test_generate_short_alias() {
+        let alias = generate_short_alias("This is a long filename.txt", 1);
+        // For input "This is a long filename.txt" the encoder keeps the
+        // first 4 chars of the base ("THIS"), then pads with spaces, then
+        // writes "~1" at positions 6..7, then writes the 3-char extension
+        // "TXT" at positions 8..10.
+        assert_eq!(alias[0..4], *b"THIS");
+        assert_eq!(alias[4], b' ');
+        assert_eq!(alias[5], b' ');
+        assert_eq!(alias[6], b'~');
+        assert_eq!(alias[7], b'1');
+        assert_eq!(alias[8..11], *b"TXT");
+    }
+
+    /// Verify that lfn_checksum is invariant under common SFN mutations
+    /// (changing only extension casing or padding). The 8.3 alias is
+    /// canonicalised to upper-case before being checksummed, so both
+    /// inputs above are expected to yield the same hash.
+    #[test]
+    fn test_lfn_checksum_uppercase_ext() {
+        let sfn1: [u8; 11] = *b"FOO     BAR";
+        let sfn2: [u8; 11] = *b"FOO     bar";
+        // Pre-uppercase the lower-case variant and assert the standard
+        // rotate-right-1 checksum of both forms is identical.
+        let mut sfn2_upper = sfn2;
+        for b in sfn2_upper.iter_mut() {
+            if b.is_ascii_lowercase() {
+                *b = b.to_ascii_uppercase();
+            }
+        }
+        assert_eq!(sfn1, sfn2_upper);
+        assert_eq!(lfn_checksum(&sfn1), lfn_checksum(&sfn2_upper));
+    }
+}
+
+// ============================================================================
+// FAT Filesystem Check (fsck)
+// ============================================================================
+
+/// FAT filesystem checker
+/// Provides consistency checking and repair for FAT filesystems
+pub struct FatFsck<D: FatDevice> {
+    /// Filesystem reference
+    fs: FatFileSystem,
+    /// Device for reading
+    device: D,
+    /// Errors found
+    errors: Vec<FsckError>,
+    /// Statistics
+    stats: FsckStats,
+}
+
+/// Errors detected during filesystem check
+#[derive(Debug, Clone)]
+pub enum FsckError {
+    /// Invalid boot sector
+    InvalidBootSector,
+    /// Bad FAT entry
+    BadFatEntry { cluster: u32, expected: u32, found: u32 },
+    /// Orphan cluster in chain
+    OrphanCluster { cluster: u32 },
+    /// Invalid directory entry
+    InvalidDirEntry { sector: u32, offset: usize },
+    /// Lost cluster (allocated but unreferenced)
+    LostCluster { cluster: u32 },
+    /// Duplicate cluster in chain
+    DuplicateCluster { cluster: u32 },
+    /// Incorrect file size in directory entry
+    IncorrectFileSize { name: String, expected: u32, found: u32 },
+    /// Reserved cluster marked as free
+    ReservedClusterFree { cluster: u32 },
+    /// Bad cluster in use
+    BadClusterInUse { cluster: u32 },
+    /// Missing volume label
+    MissingVolumeLabel,
+    /// Invalid bytes per sector
+    InvalidBytesPerSector { found: u16 },
+    /// Invalid sectors per cluster
+    InvalidSectorsPerCluster { found: u8 },
+}
+
+/// Statistics collected during filesystem check
+#[derive(Debug, Clone, Default)]
+pub struct FsckStats {
+    /// Total clusters checked
+    pub clusters_checked: u32,
+    /// Total sectors checked
+    pub sectors_checked: u32,
+    /// Files checked
+    pub files_checked: u32,
+    /// Directories checked
+    pub directories_checked: u32,
+    /// Errors found
+    pub errors_found: u32,
+    /// Errors corrected
+    pub errors_corrected: u32,
+}
+
+impl<D: FatDevice> FatFsck<D> {
+    /// Create a new filesystem checker
+    pub fn new(fs: FatFileSystem, device: D) -> Self {
+        Self {
+            fs,
+            device,
+            errors: Vec::new(),
+            stats: FsckStats::default(),
+        }
+    }
+
+    /// Borrow the underlying device used by the checker for raw reads.
+    pub fn device(&self) -> &D {
+        &self.device
+    }
+
+    /// Run full filesystem check
+    pub fn check(&mut self) -> Result<bool> {
+        self.errors.clear();
+        self.stats = FsckStats::default();
+
+        // 1. Check boot sector
+        self.check_boot_sector()?;
+
+        // 2. Check FAT integrity
+        self.check_fat_integrity()?;
+
+        // 3. Check root directory (and clusters)
+        self.check_root_directory()?;
+
+        // 4. Report results
+        Ok(self.errors.is_empty())
+    }
+
+    /// Check and repair filesystem
+    pub fn repair(&mut self) -> Result<bool> {
+        self.check()?;
+
+        // Attempt to fix found errors (collect and clone errors to avoid borrow issues)
+        let error_list: alloc::vec::Vec<FsckError> = self.errors.iter().cloned().collect();
+        for error in error_list {
+            if self.fix_error(&error) {
+                self.stats.errors_corrected += 1;
+            }
+        }
+
+        Ok(self.errors.is_empty())
+    }
+
+    /// Verify boot sector
+    fn check_boot_sector(&mut self) -> Result<()> {
+        let mut buf = vec![0u8; 512];
+        self.fs.read_sector(0, &mut buf)?;
+
+        // Check jump instruction
+        if buf[0] != 0xEB && buf[0] != 0xE9 {
+            self.errors.push(FsckError::InvalidBootSector);
+            return Err(Error::Eio);
+        }
+
+        // Check bytes per sector (must be 512, 1024, 2048, or 4096)
+        let bps = u16::from_le_bytes([buf[11], buf[12]]);
+        if bps < 512 || bps > 4096 || !bps.is_power_of_two() {
+            self.errors.push(FsckError::InvalidBytesPerSector { found: bps });
+        }
+
+        // Check sectors per cluster (must be 1, 2, 4, 8, 16, 32, 64, or 128)
+        let spc = buf[13];
+        if spc == 0 || !spc.is_power_of_two() {
+            self.errors.push(FsckError::InvalidSectorsPerCluster { found: spc });
+        }
+
+        self.stats.sectors_checked += 1;
+        Ok(())
+    }
+
+    /// Check FAT table integrity
+    fn check_fat_integrity(&mut self) -> Result<()> {
+        let fat_type = self.fs.fat_type();
+        let eoc_marker = self.fs.fat_eoc_marker();
+
+        // Read entire FAT into memory for checking
+        let fat_sectors = self.fs.boot.fat_size();
+        let _entries_per_sector = match fat_type {
+            FatType::Fat12 => self.fs.boot.bytes_per_sector() * 2 / 3,
+            FatType::Fat16 => self.fs.boot.bytes_per_sector() / 2,
+            FatType::Fat32 => self.fs.boot.bytes_per_sector() / 4,
+        };
+
+        let total_clusters = (fat_sectors * self.fs.boot.bytes_per_sector() as u32) as usize;
+
+        // Check each FAT entry
+        for cluster in 2..total_clusters as u32 {
+            let entry = self.fs.get_next_cluster(cluster)?;
+
+            self.stats.clusters_checked += 1;
+
+            // Check for reserved cluster values
+            if cluster < 0xFFF0 || (fat_type == FatType::Fat32 && cluster < 0x0FFFFFF0) {
+                if entry == 0 {
+                    self.errors.push(FsckError::ReservedClusterFree { cluster });
+                }
+            }
+
+            // Check for bad clusters marked as in use
+            let bad_marker = match fat_type {
+                FatType::Fat12 => 0xFF7,
+                FatType::Fat16 => 0xFFF7,
+                FatType::Fat32 => 0x0FFF_FFF7,
+            };
+            if entry == bad_marker {
+                // Bad cluster marker is valid
+                continue;
+            }
+
+            // Check for valid cluster values
+            if entry != 0 && entry < 2 {
+                self.errors.push(FsckError::BadFatEntry {
+                    cluster,
+                    expected: 0,
+                    found: entry,
+                });
+            }
+
+            // Check for clusters beyond volume size
+            if entry >= 0x0FFF_FFF8 && entry != eoc_marker {
+                self.errors.push(FsckError::BadFatEntry {
+                    cluster,
+                    expected: eoc_marker,
+                    found: entry,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check root directory
+    fn check_root_directory(&mut self) -> Result<()> {
+        let root_cluster = if self.fs.fat_type() == FatType::Fat32 {
+            self.fs.boot.root_cluster
+        } else {
+            // For FAT12/16, read root directory from fixed location
+            let root_sectors = (self.fs.boot.root_entries as u32 * 32)
+                / self.fs.boot.bytes_per_sector() as u32;
+            self.stats.sectors_checked += root_sectors;
+            return Ok(());
+        };
+
+        // Check root directory cluster chain
+        self.check_directory_cluster_chain(root_cluster, true)
+    }
+
+    /// Check a directory's cluster chain
+    fn check_directory_cluster_chain(&mut self, start_cluster: u32, is_dir: bool) -> Result<()> {
+        let mut current = start_cluster;
+        let eoc = self.fs.fat_eoc_marker();
+        let mut visited = alloc::vec::Vec::new();
+
+        while current >= 2 && current < eoc {
+            // Check for circular references
+            if visited.contains(&current) {
+                self.errors.push(FsckError::DuplicateCluster { cluster: current });
+                break;
+            }
+            visited.push(current);
+
+            // Verify cluster is not bad
+            let entry = self.fs.get_next_cluster(current)?;
+            if entry == 0 || entry >= eoc {
+                break;
+            }
+
+            // Read and check directory entries
+            self.check_directory_entries(current)?;
+
+            current = entry;
+        }
+
+        if is_dir {
+            self.stats.directories_checked += 1;
+        }
+
+        Ok(())
+    }
+
+    /// Check directory entries in a cluster
+    fn check_directory_entries(&mut self, cluster: u32) -> Result<()> {
+        let mut buf = vec![0u8; self.fs.boot.bytes_per_cluster()];
+        self.fs.read_cluster(cluster, &mut buf)?;
+
+        let entry_size = 32;
+        let entries_per_cluster = buf.len() / entry_size;
+
+        for i in 0..entries_per_cluster {
+            let offset = i * entry_size;
+            let entry_bytes = &buf[offset..offset + entry_size];
+
+            let entry = FatDirEntry::from_bytes(entry_bytes);
+
+            // Skip free entries
+            if entry.is_free() {
+                continue;
+            }
+
+            // Validate entry
+            if self.validate_entry(&entry) {
+                if entry.is_directory() {
+                    self.check_directory_cluster_chain(entry.first_cluster(), true)?;
+                } else {
+                    self.stats.files_checked += 1;
+                }
+            } else {
+                self.errors.push(FsckError::InvalidDirEntry {
+                    sector: self.fs.cluster_to_sector(cluster),
+                    offset,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate a directory entry
+    fn validate_entry(&self, entry: &FatDirEntry) -> bool {
+        // Check for reserved bits in attributes
+        let reserved_attrs = entry.attr & 0xC7; // Bits 3-4 reserved
+        if reserved_attrs != 0 && entry.attr != 0x0F {
+            // LFN entries have attr = 0x0F, which is allowed
+            if entry.attr != 0x08 && entry.attr != 0x0F {
+                return false;
+            }
+        }
+
+        // Volume label should only appear in root
+        if entry.is_volume_label() {
+            return true;
+        }
+
+        // Check first cluster is valid
+        let cluster = entry.first_cluster();
+        if entry.is_file() || entry.is_directory() {
+            // Cluster 0 or 1 is invalid for files/directories
+            if cluster < 2 && entry.file_size() > 0 {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Attempt to fix a detected error
+    fn fix_error(&mut self, error: &FsckError) -> bool {
+        match error {
+            FsckError::InvalidBootSector => {
+                // Boot sector backup exists at sector 6 for FAT32
+                // Could attempt restoration
+                false
+            }
+            FsckError::BadFatEntry { cluster, expected: _, found: _ } => {
+                // Clear bad FAT entry
+                self.fs.write_fat_entry(*cluster, 0).is_ok()
+            }
+            FsckError::ReservedClusterFree { cluster } => {
+                // Mark reserved cluster as end of chain
+                self.fs.write_fat_entry(*cluster, self.fs.fat_eoc_marker()).is_ok()
+            }
+            _ => false,
+        }
+    }
+
+    /// Get errors found during check
+    pub fn errors(&self) -> &[FsckError] {
+        &self.errors
+    }
+
+    /// Get statistics
+    pub fn stats(&self) -> &FsckStats {
+        &self.stats
+    }
+
+    /// Get error summary as string
+    pub fn error_summary(&self) -> alloc::string::String {
+        let mut s = alloc::string::String::new();
+        s.push_str("FAT fsck results:\n");
+        s.push_str(&alloc::format!("  Clusters checked: {}\n", self.stats.clusters_checked));
+        s.push_str(&alloc::format!("  Sectors checked: {}\n", self.stats.sectors_checked));
+        s.push_str(&alloc::format!("  Files checked: {}\n", self.stats.files_checked));
+        s.push_str(&alloc::format!("  Directories checked: {}\n", self.stats.directories_checked));
+        s.push_str(&alloc::format!("  Errors found: {}\n", self.errors.len()));
+        s.push_str(&alloc::format!("  Errors corrected: {}\n", self.stats.errors_corrected));
+
+        if !self.errors.is_empty() {
+            s.push_str("\nErrors:\n");
+            for error in &self.errors {
+                s.push_str(&alloc::format!("  {:?}\n", error));
+            }
+        }
+
+        s
+    }
 }

@@ -2,15 +2,13 @@
 //!
 //! Implements the Plan 9 VFS abstraction layer for file systems.
 
-use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::common::error::Error;
-use super::common::types::{Qid, Mode, COPEN, CMSG, CFREE, CRCLOSE};
-use super::common::sync::Spinlock;
+use super::common::types::{Qid, Mode};
+use super::common::sync::{Spinlock, SpinlockGuard};
 
 /// Result type with Error as default error type
 pub type Result<T> = core::result::Result<T, Error>;
@@ -466,14 +464,12 @@ pub mod path {
     pub fn normalize(path: &[u8]) -> Vec<u8> {
         let components = split(path);
         let mut result = Vec::new();
-        let mut is_absolute = false;
 
         for comp in components {
             match comp {
                 b"/" => {
                     result.clear();
                     result.push(b'/');
-                    is_absolute = true;
                 }
                 b"." => {}
                 b".." => {
@@ -670,7 +666,7 @@ pub struct BufferCache {
     /// Block size
     block_size: usize,
     /// Lock for thread-safe access
-    lock: Spinlock,
+    lock: Spinlock<()>,
 }
 
 impl BufferCache {
@@ -681,15 +677,25 @@ impl BufferCache {
         for _ in 0..size {
             entries.push(None);
         }
-        
+
         Self {
             entries,
             size,
             max_buffers: size,
             current_time: 0,
             block_size,
-            lock: Spinlock::new(),
+            lock: Spinlock::new(()),
         }
+    }
+
+    /// Configured maximum number of buffers the cache may hold.
+    pub fn max_buffers(&self) -> usize {
+        self.max_buffers
+    }
+
+    /// Acquire the cache lock (RAII guard released on drop).
+    pub fn lock_cache(&self) -> SpinlockGuard<'_, ()> {
+        self.lock.lock()
     }
 
     /// Hash function for block number
@@ -719,7 +725,7 @@ impl BufferCache {
         &mut self,
         block: u64,
         device: &mut D,
-    ) -> Option<usize> {
+    ) -> Option<&mut Buffer> {
         // Check if already cached
         let idx = self.find(block);
 
@@ -728,7 +734,7 @@ impl BufferCache {
             if let Some(ref mut buf) = self.entries[idx] {
                 buf.timestamp = self.current_time;
             }
-            return Some(idx);
+            return self.entries[idx].as_mut();
         }
 
         // Not cached, need to load from device
@@ -742,7 +748,7 @@ impl BufferCache {
 
         buf.timestamp = self.current_time;
         self.entries[idx] = Some(buf);
-        Some(idx)
+        self.entries[idx].as_mut()
     }
 
     /// Find empty slot or evict LRU buffer

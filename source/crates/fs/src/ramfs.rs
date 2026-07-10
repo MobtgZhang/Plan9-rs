@@ -2,15 +2,12 @@
 //!
 //! An in-memory file system for temporary storage.
 
-use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
-use alloc::boxed::Box;
 
 use super::common::error::Error;
 use super::common::types::Qid;
 use crate::vfs::{
-    FileOperations, DirectoryOperations, DirEntry, Inode, FileType, Result,
+    FileOperations, FileType, Result,
 };
 
 // ============================================================================
@@ -60,8 +57,6 @@ impl RamfsNode {
 pub struct RamfsFile {
     /// File data
     data: Vec<u8>,
-    /// Current offset
-    offset: u64,
 }
 
 impl RamfsFile {
@@ -72,7 +67,7 @@ impl RamfsFile {
 
     /// Create file with initial data
     pub fn with_data(data: Vec<u8>) -> Self {
-        Self { data, offset: 0 }
+        Self { data }
     }
 
     /// Get file size
@@ -339,6 +334,8 @@ pub struct RamFileSystem {
     root: RamfsDir,
     /// Current working directory
     cwd: Vec<u8>,
+    /// Root entry (created lazily)
+    root_entry: Option<RamfsEntry>,
 }
 
 impl RamFileSystem {
@@ -355,20 +352,59 @@ impl RamFileSystem {
         Self {
             root,
             cwd: b"/".to_vec(),
+            root_entry: None,
         }
     }
 
+    /// Current working directory (absolute path inside this RAMFS).
+    pub fn cwd(&self) -> &[u8] {
+        &self.cwd
+    }
+
+    /// Set the current working directory to `path`. The path is stored
+    /// verbatim; resolution is left to higher layers.
+    pub fn set_cwd(&mut self, path: &[u8]) {
+        self.cwd = path.to_vec();
+    }
+
+    /// Get root directory
+    ///
+    /// Returns a reference to the root RamfsDir.
+    pub fn root(&self) -> &RamfsDir {
+        &self.root
+    }
+
     /// Get root entry
-    pub fn root(&self) -> &RamfsEntry {
-        // Return a reference to root as a virtual entry
-        // In practice, we need a different approach
-        unimplemented!("Use lookup for root")
+    ///
+    /// Returns a reference to the virtual root entry.
+    /// This creates the root entry lazily if it doesn't exist.
+    pub fn root_entry(&mut self) -> &RamfsEntry {
+        if self.root_entry.is_none() {
+            // Create a virtual root entry that wraps the root directory
+            // We use an empty name since root has no name
+            self.root_entry = Some(RamfsEntry::directory(b""));
+        }
+        self.root_entry.as_ref().unwrap()
+    }
+
+    /// Get root entry (immutable version)
+    ///
+    /// Returns the root entry if it has been created.
+    /// Use root_entry() instead if you need guaranteed access.
+    pub fn get_root_entry(&self) -> Option<&RamfsEntry> {
+        self.root_entry.as_ref()
     }
 
     /// Look up path
+    ///
+    /// Returns the entry at the given path, or None if not found.
+    /// For "/" returns the root entry.
     pub fn lookup(&self, path: &[u8]) -> Option<&RamfsEntry> {
         if path.is_empty() || path == b"/" {
-            return None; // Root is virtual
+            // Root is handled specially - we can't return a reference to
+            // the root entry from an immutable reference
+            // Callers should use root_entry() method instead
+            return None;
         }
 
         let components: Vec<&[u8]> = if path[0] == b'/' {
@@ -413,6 +449,16 @@ impl RamFileSystem {
 
         // Return last found entry
         None
+    }
+
+    /// Look up path including root
+    ///
+    /// This version handles the root path "/" by requiring &mut self.
+    pub fn lookup_including_root(&mut self, path: &[u8]) -> Option<&RamfsEntry> {
+        if path.is_empty() || path == b"/" {
+            return Some(self.root_entry());
+        }
+        self.lookup(path)
     }
 
     /// Look up path (mutable)
