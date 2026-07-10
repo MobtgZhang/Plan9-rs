@@ -1,0 +1,12 @@
+[package]
+name = "plan9_libventi"
+version = "0.1.0"
+edition = "2021"
+description = "Plan 9 Venti storage library"
+
+[features]
+default = []
+alloc = []
+
+[dependencies]
+plan9-common = { path = "../common", features = ["alloc"] }
