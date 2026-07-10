@@ -2,14 +2,15 @@
 //!
 //! Implements the Plan 9 9P protocol for file system communication.
 
-#![no_std]
 
 extern crate alloc;
 
-use crate::common::{Qid, Result};
+use crate::common::Qid;
 use alloc::string::{String, ToString};
-use alloc::vec;
 use alloc::vec::Vec;
+
+/// Result type for P9 protocol operations
+pub type Result<T, E = P9Error> = core::result::Result<T, E>;
 
 // ============================================================================
 // 9P Constants
@@ -1565,7 +1566,7 @@ impl P9Decoder {
             tag,
             fid,
             name: name.to_string(),
-            mode,
+            mode: mode as u32,
             perm,
         })
     }

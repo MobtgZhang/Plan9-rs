@@ -30,12 +30,11 @@
 //! }
  //! ```
  
- #![no_std]
 
  extern crate alloc;
 
  use crate::common::sync::Spinlock;
- use alloc::vec;
+ 
  use alloc::vec::Vec;
 
  /// ICMPv4 constants
@@ -436,7 +435,6 @@ impl IcmpPacket {
 // ============================================================================
 
 /// ICMP statistics
-#[derive(Debug, Clone, Default)]
 pub struct IcmpStats {
     /// Messages received
     pub in_msgs: u64,
@@ -451,6 +449,44 @@ pub struct IcmpStats {
     /// Messages by type
     pub in_by_type: [u64; 256],
     pub out_by_type: [u64; 256],
+}
+
+impl Default for IcmpStats {
+    fn default() -> Self {
+        Self {
+            in_msgs: 0,
+            out_msgs: 0,
+            in_errors: 0,
+            csum_errors: 0,
+            len_errors: 0,
+            in_by_type: [0; 256],
+            out_by_type: [0; 256],
+        }
+    }
+}
+
+impl core::fmt::Debug for IcmpStats {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IcmpStats")
+            .field("in_msgs", &self.in_msgs)
+            .field("out_msgs", &self.out_msgs)
+            .field("in_errors", &self.in_errors)
+            .finish()
+    }
+}
+
+impl Clone for IcmpStats {
+    fn clone(&self) -> Self {
+        Self {
+            in_msgs: self.in_msgs,
+            out_msgs: self.out_msgs,
+            in_errors: self.in_errors,
+            csum_errors: self.csum_errors,
+            len_errors: self.len_errors,
+            in_by_type: self.in_by_type,
+            out_by_type: self.out_by_type,
+        }
+    }
 }
 
 impl IcmpStats {
@@ -528,7 +564,7 @@ impl IcmpSocket {
     }
 
     /// Receive an ICMP packet
-    pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IcmpError> {
+    pub fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IcmpError> {
         let _guard = self.lock.lock();
 
         // In a real implementation, this would block waiting for data
@@ -620,7 +656,12 @@ impl IcmpPortTable {
 
     /// Get socket by identifier
     pub fn get(&self, identifier: u16) -> Option<&IcmpSocket> {
-        self.sockets[identifier as usize].as_ref()
+        self.sockets[identifier as usize].as_ref().map(|b| b.as_ref())
+    }
+    
+    /// Get mutable socket by identifier
+    pub fn get_mut(&mut self, identifier: u16) -> Option<&mut IcmpSocket> {
+        self.sockets[identifier as usize].as_mut().map(|b| b.as_mut())
     }
 
     /// Release identifier
@@ -845,7 +886,7 @@ impl IcmpHandler {
         match packet.icmp_type() {
             Some(IcmpType::EchoRequest) => {
                 // Find matching socket or generate auto-reply
-                if let Some(socket) = self.port_table.get(packet.header.identifier()) {
+                if let Some(socket) = self.port_table.get_mut(packet.header.identifier()) {
                     socket.handle_packet(&packet)
                 } else {
                     // Generate reply for unbound socket (ping response)
@@ -866,7 +907,7 @@ impl IcmpHandler {
     }
 
     /// Send an ICMP error message
-    pub fn send_error(&mut self, dest: u32, packet: &IcmpPacket) -> Result<usize, IcmpError> {
+    pub fn send_error(&mut self, _dest: u32, packet: &IcmpPacket) -> Result<usize, IcmpError> {
         let _guard = self.lock.lock();
 
         self.stats.inc_out(packet.header.icmp_type);
@@ -874,14 +915,14 @@ impl IcmpHandler {
     }
 
     /// Send ICMP echo request
-    pub fn send_echo_request(&mut self, dest: u32, id: u16, seq: u16, data: Vec<u8>) -> IcmpPacket {
+    pub fn send_echo_request(&mut self, _dest: u32, id: u16, seq: u16, data: Vec<u8>) -> IcmpPacket {
         let packet = IcmpPacket::echo_request(id, seq, data);
         self.stats.inc_out(IcmpType::EchoRequest as u8);
         packet
     }
 
     /// Notify upper layer protocol about ICMP error
-    fn notify_upper_protocol(&mut self, packet: &IcmpPacket) {
+    fn notify_upper_protocol(&self, packet: &IcmpPacket) {
         // In a full implementation, this would look up the corresponding
         // TCP or UDP socket and notify it about the error
         match IcmpType::from_u8(packet.header.icmp_type) {

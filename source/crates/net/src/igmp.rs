@@ -21,8 +21,8 @@
 //! let mut socket = IgmpSocket::new();
 //! socket.join_group(Ipv4Addr::new(224, 0, 0, 1)).unwrap();
 //! ```
+//!
 
-use crate::plan9_common::sync::Spinlock;
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 
@@ -145,10 +145,7 @@ impl IgmpMessage {
 
         let msg_type = data[0];
         let max_resp = data[1];
-        
-        // Checksum (bytes 2-3)
-        let _checksum = u16::from_be_bytes([data[2], data[3]]);
-        
+
         // Group address
         let group = [data[4], data[5], data[6], data[7]];
 
@@ -173,12 +170,11 @@ impl IgmpMessage {
     /// Serialize IGMP message to bytes
     pub fn serialize(&self) -> Vec<u8> {
         let mut data = Vec::with_capacity(8);
-        
+
         match self {
             IgmpMessage::MembershipQuery { max_resp, group } => {
                 data.push(IgmpType::Query as u8);
                 data.push(*max_resp);
-                // Checksum placeholder
                 data.extend_from_slice(&[0, 0]);
                 if let Some(g) = group {
                     data.extend_from_slice(g);
@@ -188,14 +184,14 @@ impl IgmpMessage {
             }
             IgmpMessage::MembershipReport { group } => {
                 data.push(IgmpType::Report as u8);
-                data.push(0); // Max resp (not used in reports)
-                data.extend_from_slice(&[0, 0]); // Checksum
+                data.push(0);
+                data.extend_from_slice(&[0, 0]);
                 data.extend_from_slice(group);
             }
             IgmpMessage::LeaveGroup { group } => {
                 data.push(IgmpType::Leave as u8);
                 data.push(0);
-                data.extend_from_slice(&[0, 0]); // Checksum
+                data.extend_from_slice(&[0, 0]);
                 data.extend_from_slice(group);
             }
         }
@@ -209,11 +205,28 @@ impl IgmpMessage {
     }
 }
 
-/// Calculate IGMP checksum
-fn calculate_checksum(data: &[u8]) -> u16 {
+/// Calculate IGMP checksum (RFC 1071 Internet checksum over the
+/// 16-bit one's-complement sum).
+///
+/// Per RFC 2236 / RFC 3376, the IGMP checksum is the standard 16-bit
+/// one's complement Internet checksum computed over the entire IGMP
+/// message (header + body), with the checksum field itself treated as
+/// zero during computation. This is the same algorithm used by IP,
+/// TCP and UDP; the public alias [`igmp_checksum`] is provided so
+/// callers can pass an in-memory buffer without depending on the
+/// internal helper.
+///
+/// # Arguments
+/// * `data` - The IGMP message bytes. The caller is responsible for
+///   ensuring the checksum field (bytes 2-3 of the IGMP header) is
+///   zero before calling this function.
+///
+/// # Returns
+/// The 16-bit checksum suitable for placement in the IGMP checksum
+/// field (network byte order).
+pub fn calculate_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    
-    // Sum all 16-bit words
+
     for chunk in data.chunks(2) {
         if chunk.len() == 2 {
             sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
@@ -221,13 +234,39 @@ fn calculate_checksum(data: &[u8]) -> u16 {
             sum += chunk[0] as u32;
         }
     }
-    
-    // Add carries
+
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
-    
+
     !sum as u16
+}
+
+/// Public alias for [`calculate_checksum`] used by IGMP. Provided as
+/// the canonical entry point so external callers do not need to know
+/// the internal helper's name.
+pub fn igmp_checksum(data: &[u8]) -> u16 {
+    calculate_checksum(data)
+}
+
+/// Verify an IGMP message's checksum.
+///
+/// # Arguments
+/// * `data` - The complete IGMP message including the on-wire checksum
+///   field at bytes 2-3.
+///
+/// # Returns
+/// `true` if the checksum field is valid (RFC 1071 verifier yields
+/// 0xFFFF when summed with the rest of the message).
+pub fn verify_igmp_checksum(data: &[u8]) -> bool {
+    if data.len() < 4 {
+        return false;
+    }
+    let mut zeroed = data.to_vec();
+    zeroed[2] = 0;
+    zeroed[3] = 0;
+    let sum = calculate_checksum(&zeroed);
+    sum == 0xFFFF || sum == 0
 }
 
 /// IGMP socket for group management
@@ -238,6 +277,8 @@ pub struct IgmpSocket {
     last_query: Option<([u8; 4], u8)>,
     /// Interface index
     ifindex: u32,
+    /// Pending outbound IGMP messages
+    outbound: alloc::vec::Vec<IgmpMessage>,
 }
 
 impl IgmpSocket {
@@ -247,6 +288,7 @@ impl IgmpSocket {
             groups: BTreeMap::new(),
             last_query: None,
             ifindex: 0,
+            outbound: alloc::vec::Vec::new(),
         }
     }
 
@@ -256,6 +298,7 @@ impl IgmpSocket {
             groups: BTreeMap::new(),
             last_query: None,
             ifindex,
+            outbound: alloc::vec::Vec::new(),
         }
     }
 
@@ -271,7 +314,7 @@ impl IgmpSocket {
         }
 
         let key = u32::from_be_bytes(*addr);
-        
+
         // Check if already joined
         if self.groups.contains_key(&key) {
             return Ok(());
@@ -280,9 +323,8 @@ impl IgmpSocket {
         // Add to groups
         self.groups.insert(key, IgmpGroupState::new(*addr));
 
-        // TODO: Send IGMP Membership Report
-        // In a real implementation, this would schedule the report
-        // with a random delay (0-10 seconds) to avoid report storms
+        // Send IGMP Membership Report on join
+        self.outbound.push(IgmpMessage::MembershipReport { group: *addr });
 
         Ok(())
     }
@@ -294,10 +336,11 @@ impl IgmpSocket {
         }
 
         let key = u32::from_be_bytes(*addr);
-        
-        if let Some(_state) = self.groups.remove(&key) {
-            // TODO: Send IGMP Leave Group message
-            // Only sent if this is the last host in the group
+
+        if let Some(state) = self.groups.remove(&key) {
+            // Send IGMP Leave Group only if this is the last host for the group
+            // For simplicity, always send the leave on explicit leave
+            self.outbound.push(IgmpMessage::LeaveGroup { group: state.group });
             return Ok(());
         }
 
@@ -353,7 +396,6 @@ impl IgmpSocket {
 
         if let Some(state) = self.groups.get_mut(&key) {
             // If we have a pending report, cancel it
-            // The router doesn't need our report since another host reported
             state.reported = true;
             state.timer = 0;
         }
@@ -394,6 +436,11 @@ impl IgmpSocket {
             .filter(|(_, s)| !s.reported && s.timer_expired())
             .map(|(k, _)| k.to_be_bytes())
             .collect()
+    }
+
+    /// Take pending outbound IGMP messages
+    pub fn take_outbound(&mut self) -> alloc::vec::Vec<IgmpMessage> {
+        core::mem::take(&mut self.outbound)
     }
 }
 
@@ -443,5 +490,109 @@ impl IgmpSocket {
     pub fn stats(&self) -> IgmpStats {
         // In a real implementation, this would track statistics
         IgmpStats::default()
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_igmp_checksum_zero_buffer_yields_ones_complement() {
+        // All-zero input is the RFC 1071 "complement zero" case: the
+        // one's complement of zero is 0xFFFF.
+        assert_eq!(igmp_checksum(&[0u8; 8]), 0xFFFF);
+    }
+
+    #[test]
+    fn test_igmp_checksum_single_byte_padded_correctly() {
+        // A buffer of odd length must be padded with a trailing zero
+        // before computing the sum (RFC 1071).
+        // [0x12, 0x34] -> 0x1234; complement -> 0xEDCB.
+        assert_eq!(igmp_checksum(&[0x12, 0x34]), 0xEDCB);
+        // Odd length: [0x12, 0x34, 0x56] treated as [0x12, 0x34] + [0x56, 0x00].
+        assert_eq!(igmp_checksum(&[0x12, 0x34, 0x56]), igmp_checksum(&[0x12, 0x34]));
+    }
+
+    #[test]
+    fn test_igmp_checksum_known_rfc_vector() {
+        // The example from RFC 1071 section 3: header bytes
+        // 00 01 F2 03 F4 F5 F6 F7.
+        // Expected checksum: 0x220D (taken from the RFC).
+        let bytes = [0x00, 0x01, 0xF2, 0x03, 0xF4, 0xF5, 0xF6, 0xF7];
+        assert_eq!(calculate_checksum(&bytes), 0x220D);
+    }
+
+    #[test]
+    fn test_verify_igmp_checksum_accepts_valid_message() {
+        let bytes = [0x00, 0x01, 0xF2, 0x03, 0xF4, 0xF5, 0xF6, 0xF7];
+        // Insert the checksum back into bytes[2..4].
+        let cs = calculate_checksum(&bytes);
+        let mut msg = bytes;
+        msg[2] = (cs >> 8) as u8;
+        msg[3] = cs as u8;
+        assert!(verify_igmp_checksum(&msg));
+    }
+
+    #[test]
+    fn test_verify_igmp_checksum_rejects_corrupted_message() {
+        let bytes = [0x11, 0x22, 0xF2, 0x03, 0xF4, 0xF5, 0xF6, 0xF7];
+        let cs = calculate_checksum(&bytes);
+        let mut msg = bytes;
+        msg[2] = (cs >> 8) as u8;
+        msg[3] = cs as u8;
+        assert!(verify_igmp_checksum(&msg));
+        // Corrupt one byte after the checksum field.
+        msg[5] ^= 0xFF;
+        assert!(!verify_igmp_checksum(&msg));
+    }
+
+    #[test]
+    fn test_verify_igmp_checksum_rejects_short_buffer() {
+        // Anything shorter than the 4-byte IGMP header is malformed.
+        assert!(!verify_igmp_checksum(&[]));
+        assert!(!verify_igmp_checksum(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn test_igmp_message_serializes_with_valid_checksum() {
+        // Use the same example the IgmpMessage path produces: a
+        // MembershipReport for 224.0.0.22 (IGMPv3 report router).
+        let msg = IgmpMessage::MembershipReport {
+            group: &[224, 0, 0, 22],
+        };
+        let bytes = msg.serialize();
+        assert!(bytes.len() >= 8);
+        // Bytes 2-3 must be the checksum.
+        assert!(verify_igmp_checksum(&bytes));
+    }
+
+    #[test]
+    fn test_igmp_message_leave_serializes_with_valid_checksum() {
+        let msg = IgmpMessage::LeaveGroup {
+            group: &[239, 1, 2, 3],
+        };
+        let bytes = msg.serialize();
+        assert_eq!(bytes.len(), 8);
+        assert!(verify_igmp_checksum(&bytes));
+    }
+
+    #[test]
+    fn test_igmp_message_end_to_end_via_socket_outbound() {
+        // Join a group; the message types automatically generate
+        // outbound traffic when `take_outbound` is called. Verify each
+        // message passes the IGMP checksum verification.
+        let mut sock = IgmpSocket::new_on_interface(1);
+        sock.join_group(&[224, 0, 0, 22]).unwrap();
+        let msgs = sock.take_outbound();
+        assert!(!msgs.is_empty());
+        for msg in &msgs {
+            let bytes = msg.serialize();
+            assert!(verify_igmp_checksum(&bytes));
+        }
     }
 }

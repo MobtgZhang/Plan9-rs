@@ -39,14 +39,10 @@
 //! }
 //! ```
 
-#![no_std]
 
 extern crate alloc;
 
-use alloc::vec;
 use alloc::vec::Vec;
-use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::collections::BTreeMap;
 
 use crate::common::sync::Spinlock;
@@ -625,6 +621,35 @@ pub struct FragmentKey {
     pub next_header: u8,
 }
 
+impl Ord for FragmentKey {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        // Compare byte arrays lexicographically
+        for i in 0..IPV6_ADDR_LEN {
+            match self.src[i].cmp(&other.src[i]) {
+                core::cmp::Ordering::Equal => continue,
+                o => return o,
+            }
+        }
+        for i in 0..IPV6_ADDR_LEN {
+            match self.dst[i].cmp(&other.dst[i]) {
+                core::cmp::Ordering::Equal => continue,
+                o => return o,
+            }
+        }
+        match self.identification.cmp(&other.identification) {
+            core::cmp::Ordering::Equal => {}
+            o => return o,
+        }
+        self.next_header.cmp(&other.next_header)
+    }
+}
+
+impl PartialOrd for FragmentKey {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl FragmentKey {
     /// Create a new fragment key
     pub fn new(
@@ -682,6 +707,9 @@ impl FragmentEntry {
 
     /// Add a fragment
     pub fn add_fragment(&mut self, offset: usize, more: bool, data: Vec<u8>) {
+        // Save length before moving data
+        let data_len = data.len();
+        
         // Check if we already have this fragment
         for frag in &mut self.fragments {
             if frag.offset == offset {
@@ -693,7 +721,7 @@ impl FragmentEntry {
 
         // Update total length from last fragment
         if !more {
-            let last_offset = offset + data.len();
+            let last_offset = offset + data_len;
             if self.total_len.is_none() || self.total_len.unwrap() < last_offset {
                 self.total_len = Some(last_offset);
             }
@@ -761,6 +789,11 @@ impl FragmentCache {
             timeout_secs,
             lock: Spinlock::new(()),
         }
+    }
+
+    /// Configured maximum number of fragment reassembly entries.
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
     }
 
     /// Process an incoming fragment
@@ -1044,7 +1077,7 @@ impl Ipv6Packet {
                 }
                 ExtensionHeader::DestinationOptions(opts) => {
                     bytes.push(proto::DESTOPTS);
-                    let opt_bytes = Self::serialize_options(opts);
+                    let opt_bytes = opts.serialize();
                     bytes.push((opt_bytes.len() / 8 - 1) as u8);
                     bytes.extend_from_slice(&opt_bytes);
                 }
@@ -1075,11 +1108,11 @@ impl Ipv6Packet {
         bytes
     }
 
-    /// Serialize options
-    fn serialize_options(opts: &HopByHopOptions) -> Vec<u8> {
+    /// Serialize options (generic helper)
+    fn serialize_options_generic(options: &Vec<OptionTlv>) -> Vec<u8> {
         let mut bytes = Vec::new();
 
-        for opt in &opts.options {
+        for opt in options {
             if opt.option_type == 0 && opt.length == 0 {
                 bytes.push(0); // Pad1
             } else {
@@ -1099,6 +1132,18 @@ impl Ipv6Packet {
         }
 
         bytes
+    }
+
+    /// Serialize options
+    fn serialize_options(opts: &HopByHopOptions) -> Vec<u8> {
+        Self::serialize_options_generic(&opts.options)
+    }
+}
+
+impl DestOptions {
+    /// Serialize destination options
+    pub fn serialize(&self) -> Vec<u8> {
+        Ipv6Packet::serialize_options_generic(&self.options)
     }
 }
 

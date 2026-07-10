@@ -2,7 +2,6 @@
 //!
 //! Implements Ethernet frame parsing and construction.
 
-#![no_std]
 
 extern crate alloc;
 

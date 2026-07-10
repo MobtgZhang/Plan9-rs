@@ -2,13 +2,11 @@
 //!
 //! Implements IPv4 packet handling, routing, and checksum calculation.
 
-#![no_std]
 
 extern crate alloc;
 
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::string::String;
 
 // ============================================================================
 // IPv4 Constants
@@ -623,7 +621,7 @@ use crate::common::sync::Spinlock;
 use alloc::collections::BTreeMap;
 
 /// Fragment cache key
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
 pub struct FragmentKey {
     /// Source address
     pub src: u32,
@@ -798,7 +796,7 @@ impl FragmentCache {
         if offset == 0 && !more {
             // Not fragmented, return the data as-is
             let mut header_bytes = vec![0u8; header.header_len()];
-            header.to_bytes(&mut header_bytes).ok()?;
+            header.to_bytes(&mut header_bytes)?;
             header_bytes.extend_from_slice(data);
             return Some(header_bytes);
         }
@@ -812,7 +810,7 @@ impl FragmentCache {
             let mut hdr_copy = *header;
             // Clear fragment-related fields for first fragment
             hdr_copy.set_fragment(0, false, false);
-            hdr_copy.to_bytes(&mut header_bytes).ok();
+            hdr_copy.to_bytes(&mut header_bytes);
             FragmentEntry::new(key.clone(), &header_bytes, now)
         });
 
@@ -833,8 +831,10 @@ impl FragmentCache {
 
         // Cleanup if too many entries
         if self.entries.len() > self.max_entries {
-            if let Some((oldest_key, _)) = self.entries.iter().next().cloned() {
-                self.entries.remove(&oldest_key);
+            // Get the first key to remove
+            let oldest_key_to_remove = self.entries.keys().next().cloned();
+            if let Some(key) = oldest_key_to_remove {
+                self.entries.remove(&key);
             }
         }
 
@@ -885,7 +885,7 @@ impl Fragmenter {
     /// Fragment a packet
     /// Returns a list of fragments, or None if fragmentation is not allowed (DF set)
     pub fn fragment(&self, packet: &[u8], ident: Option<u16>) -> Option<Vec<Vec<u8>>> {
-        let mut header = Ipv4Hdr::from_bytes(packet)?;
+        let header = Ipv4Hdr::from_bytes(packet)?;
 
         // Check if DF is set
         if header.dont_fragment() {
@@ -940,7 +940,7 @@ impl Fragmenter {
 
             // Build fragment
             let mut frag = vec![0u8; frag_total_len];
-            frag_header.to_bytes(&mut frag).ok()?;
+            frag_header.to_bytes(&mut frag)?;
             frag[header_len..]
                 .copy_from_slice(&packet[header_len + offset..header_len + offset + frag_data_len]);
 
@@ -1041,7 +1041,7 @@ impl IpOption {
                     }
                     let opt_len = header[offset + 1];
 
-                    if opt_len < 2 || offset + opt_len > header_len {
+                    if opt_len < 2 || offset + opt_len as usize > header_len {
                         break;
                     }
 
@@ -1075,8 +1075,8 @@ impl IpOption {
     /// Returns modified header and any additional actions needed
     pub fn process_options(
         options: &[IpOption],
-        header: &mut Ipv4Hdr,
-        our_ip: u32,
+        _header: &mut Ipv4Hdr,
+        _our_ip: u32,
     ) -> IpOptionAction {
         let mut action = IpOptionAction::Continue;
 

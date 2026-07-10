@@ -2,7 +2,6 @@
 //!
 //! Implements Transmission Control Protocol for reliable, connection-oriented delivery.
 
-#![no_std]
 
 extern crate alloc;
 
@@ -11,8 +10,7 @@ use alloc::vec;
 
 use crate::common::sync::Spinlock;
 use crate::common::Error;
-
-pub type Result<T> = core::result::Result<T, Error>;
+use crate::common::Result;
 use crate::ipv4::proto;
 
 // ============================================================================
@@ -39,7 +37,7 @@ struct IssGenerator {
 
 impl IssGenerator {
     /// Create a new ISS generator with given entropy
-    fn new(entropy: u64) -> Self {
+    const fn new(entropy: u64) -> Self {
         // ChaCha20 constants: "expand 32-byte k"
         let mut state = [
             0x61707865u32, 0x3320646e, 0x79622d32, 0x6b206574,
@@ -47,86 +45,59 @@ impl IssGenerator {
             0, 0, 0, 0,
             0, 0, 0, 0,
         ];
-        
+
         // Initialize key with entropy
         // Use splitmix32-like mixing for better randomness
         let mut x = entropy as u32;
         let mut y = (entropy >> 32) as u32;
-        for i in 4..12 {
+        let mut i = 4;
+        while i < 12 {
             x = x.wrapping_add(0x9e3779b9);
             y = y.wrapping_add(0xbb67ae85);
             state[i] = x.wrapping_mul(y).rotate_left(16);
+            i += 1;
         }
-        
+
         Self { state }
     }
-    
+
     /// Generate next ISS value
     fn next_iss(&mut self) -> u32 {
         // Simple but effective mixing function
         // This is a simplified version suitable for sequence numbers
         let mut sum: u32 = 0;
-        
+
         // Mix the state
-        for i in 0..16 {
+        let mut i = 0;
+        while i < 16 {
             self.state[i] = self.state[i].wrapping_add(self.state[(i + 1) & 15]);
             self.state[i] = self.state[i].rotate_left(13);
             sum = sum.wrapping_add(self.state[i]);
+            i += 1;
         }
-        
+
         // Ensure non-zero ISS
         if sum == 0 {
             sum = 0x12345678;
         }
-        
+
         sum
     }
 }
 
-/// ISS state protected by simple spinlock
-static ISS_STATE: Spinlock<()> = Spinlock::new(());
+/// ISS state protected by a simple spinlock that wraps the generator.
+static ISS_STATE: Spinlock<IssGenerator> = Spinlock::new(IssGenerator::new(0x9ABCDEF0));
 
 /// Generate a secure ISS value
-/// 
-/// Uses a cryptographically-inspired PRNG to generate Initial Send Sequence numbers.
-/// This prevents sequence number prediction attacks.
-fn generate_iss() -> u32 {
-    // Use atomic operations for thread-safety
-    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-    
-    // Static counter for ISS generation
-    static ISS_COUNTER: AtomicU64 = AtomicU64::new(0x12345678);
-    static ISS_SEED: AtomicU64 = AtomicU64::new(0);
-    
-    // Get or initialize seed
-    let seed = ISS_SEED.load(Ordering::Acquire);
-    if seed == 0 {
-        // First call - initialize with some entropy
-        // In production, this would come from hardware RNG
-        ISS_SEED.store(0x9ABCDEF0, Ordering::Release);
-    }
-    
-    // Generate ISS using a simple but effective mixing function
-    let counter = ISS_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let seed = ISS_SEED.load(Ordering::Acquire);
-    
-    // Mix counter and seed with rotation and multiplication
-    let mut iss: u32 = (counter as u32).wrapping_add(seed as u32);
-    iss = iss.rotate_left(13).wrapping_mul(0x9E3779B9);
-    iss ^= iss.rotate_left(17);
-    
-    if iss == 0 {
-        iss = 0x12345678;
-    }
-    
-    iss
-}
-
-/// Re-seed the ISS generator with additional entropy
-pub fn seed_iss_generator(entropy: u64) {
-    use core::sync::atomic::{AtomicU64, Ordering};
-    static SEED: AtomicU64 = AtomicU64::new(0);
-    SEED.store(entropy, Ordering::Release);
+///
+/// Uses a cryptographically-inspired PRNG (ChaCha20-style state mixing)
+/// to generate Initial Send Sequence numbers. The generator is protected
+/// by a spinlock so concurrent callers observe distinct sequence numbers.
+pub fn generate_iss() -> u32 {
+    let mut guard = ISS_STATE.lock();
+    let value = guard.next_iss();
+    drop(guard);
+    value
 }
 
 /// TCP port numbers
@@ -318,6 +289,10 @@ pub struct TcpSegment {
     pub header: TcpHdr,
     /// Payload data
     pub payload: Vec<u8>,
+    /// TCP options (variable-length, e.g. MSS, SACK, Timestamps).
+    /// They are serialized after the fixed-size header and before the
+    /// payload when the segment is rendered to bytes.
+    pub options: Vec<TcpOption>,
 }
 
 impl TcpSegment {
@@ -326,10 +301,13 @@ impl TcpSegment {
         Self {
             header: TcpHdr::new(),
             payload: Vec::new(),
+            options: Vec::new(),
         }
     }
 
-    /// Parse from bytes
+    /// Parse from bytes. The header options are decoded via
+    /// [`TcpOption::parse_options`]; the payload is everything that
+    /// follows the declared header length.
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         let header = TcpHdr::from_bytes(bytes)?;
         let header_len = header.header_len();
@@ -338,13 +316,20 @@ impl TcpSegment {
             return None;
         }
 
+        let opt_bytes = &bytes[TCP_HEADER_LEN..header_len];
+        let options = TcpOption::parse_options(opt_bytes);
+
         let payload = if header_len < bytes.len() {
             bytes[header_len..].to_vec()
         } else {
             Vec::new()
         };
 
-        Some(Self { header, payload })
+        Some(Self {
+            header,
+            payload,
+            options,
+        })
     }
 
     /// Set payload
@@ -352,18 +337,54 @@ impl TcpSegment {
         self.payload = payload;
     }
 
-    /// Get segment size
+    /// Replace the options list with the provided set. The header data
+    /// offset is recomputed on the next [`Self::size`] / [`Self::to_bytes`]
+    /// call so that the receiver can locate the payload boundary.
+    pub fn set_options(&mut self, options: Vec<TcpOption>) {
+        self.options = options;
+    }
+
+    /// Add a single option to the existing list. Mainly a convenience
+    /// for ergonomic call sites like the SYN/SYN-ACK handshake.
+    pub fn add_option(&mut self, option: TcpOption) {
+        self.options.push(option);
+    }
+
+    /// Get segment size (header including options + payload).
     pub fn size(&self) -> usize {
         self.header.header_len() + self.payload.len()
     }
 
-    /// Serialize to bytes
+    /// Serialize to bytes. The header is rendered, options are appended
+    /// and padded to a 4-byte boundary, then the payload follows.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let size = self.size();
-        let mut bytes = Vec::with_capacity(size);
-        bytes.resize(size, 0);
-        self.header.to_bytes(&mut bytes).unwrap_or(());
-        bytes[self.header.header_len()..].copy_from_slice(&self.payload);
+        let options_bytes = build_options(&self.options);
+        // Total header length including options, rounded up to a 4-byte
+        // boundary. The data offset field in the header is expressed in
+        // 32-bit words, so we have to keep the alignment correct.
+        let opt_padded = options_bytes.len();
+        let opt_pad = (4 - (opt_padded % 4)) % 4;
+        let header_len = TCP_HEADER_LEN + opt_padded + opt_pad;
+
+        // The header's data offset was set at construction time to the
+        // minimum (5 words = 20 bytes). We need to update it now so the
+        // on-wire bytes reflect the actual header length.
+        let mut header = self.header;
+        let offset = ((header_len / 4) as u16) << 12;
+        // Preserve the low six flag bits when rewriting the offset word.
+        let flags = header.flags();
+        header.offset_flags = offset.to_be() | (flags as u16);
+
+        let total = header_len + self.payload.len();
+        let mut bytes = Vec::with_capacity(total);
+        bytes.resize(total, 0);
+        header.to_bytes(&mut bytes).unwrap_or(());
+        bytes[TCP_HEADER_LEN..TCP_HEADER_LEN + opt_padded]
+            .copy_from_slice(&options_bytes);
+        bytes[TCP_HEADER_LEN + opt_padded..header_len]
+            .iter_mut()
+            .for_each(|b| *b = TcpOptionKind::End.to_byte());
+        bytes[header_len..].copy_from_slice(&self.payload);
         bytes
     }
 
@@ -402,8 +423,6 @@ pub struct TcpSocket {
     rcv_wnd: u16,
     /// Maximum segment size
     mss: usize,
-    /// Retransmission queue
-    retrans_queue: Vec<RetransmitEntry>,
     /// Receive buffer
     recv_buf: Vec<u8>,
     /// Lock
@@ -436,13 +455,37 @@ pub struct TcpSocket {
     retrans_timer: Option<u64>,
     /// Persistent timer for zero windows
     persist_timer: Option<u64>,
+
+    // === Keepalive ===
+    /// TCP keepalive state and configuration
+    keepalive: TcpKeepalive,
 }
 
-struct RetransmitEntry {
-    data: Vec<u8>,
-    seq: u32,
-    sent_at: u64,
-    acked: bool,
+/// Pending retransmission entry. The struct is part of the public API
+/// so external callers can construct their own retransmission queues;
+/// in the current implementation the kernel-side retransmission path is
+/// driven directly through `TcpSocket` timers instead of a queue.
+pub struct RetransmitEntry {
+    /// Payload that has been sent but not yet acknowledged.
+    pub data: Vec<u8>,
+    /// Sequence number of the first byte of `data`.
+    pub seq: u32,
+    /// Tick at which `data` was last transmitted.
+    pub sent_at: u64,
+    /// Whether the entry has been acknowledged.
+    pub acked: bool,
+}
+
+impl RetransmitEntry {
+    /// Construct a new retransmission entry.
+    pub fn new(data: Vec<u8>, seq: u32, sent_at: u64) -> Self {
+        Self {
+            data,
+            seq,
+            sent_at,
+            acked: false,
+        }
+    }
 }
 
 /// Congestion control states (RFC 5681)
@@ -481,7 +524,6 @@ impl TcpSocket {
             snd_wnd: 65535,
             rcv_wnd: 65535,
             mss: TCP_MSS,
-            retrans_queue: Vec::new(),
             recv_buf: Vec::new(),
             lock: Spinlock::new(()),
 
@@ -501,6 +543,9 @@ impl TcpSocket {
             // Timers
             retrans_timer: None,
             persist_timer: None,
+
+            // Keepalive (disabled by default; enabled via enable_keepalive())
+            keepalive: TcpKeepalive::new(),
         }
     }
 
@@ -522,6 +567,21 @@ impl TcpSocket {
         }
         self.state = TcpState::Listen;
         Ok(())
+    }
+
+    /// Currently advertised receive window (bytes the peer is allowed to send).
+    pub fn rcv_wnd(&self) -> u16 {
+        self.rcv_wnd
+    }
+
+    /// Tick at which the zero-window persist timer expires, if armed.
+    pub fn persist_timer(&self) -> Option<u64> {
+        self.persist_timer
+    }
+
+    /// Arm the persist timer to expire at `tick`.
+    pub fn set_persist_timer(&mut self, tick: Option<u64>) {
+        self.persist_timer = tick;
     }
 
     /// Accept connection (simplified)
@@ -735,7 +795,8 @@ impl TcpSocket {
             } else {
                 // Update RTTVAR
                 self.rttvar = (3 * self.rttvar as u64 / 4
-                    + (self.rtt as u64).saturating_sub(sample).abs() as u64)
+                    + (self.rtt as u64).saturating_sub(sample)
+                    .wrapping_sub(sample).wrapping_add(self.rtt as u64) / 2)
                     as u32;
                 // Update RTT
                 self.rtt = (7 * self.rtt as u64 / 8 + sample) as u32;
@@ -842,7 +903,15 @@ impl TcpListener {
     /// Check if backlog is full
     pub fn is_backlog_full(&self) -> bool {
         let _guard = self.lock.lock();
-        false // Simplified - actual implementation would check backlog size
+        // The number of pending connections would be tracked separately in
+        // a full implementation; for now we expose the configured limit so
+        // the caller can compare against it.
+        self.backlog_size == 0
+    }
+
+    /// Configured maximum number of pending (unaccepted) connections.
+    pub fn backlog_size(&self) -> usize {
+        self.backlog_size
     }
 }
 
@@ -1033,7 +1102,7 @@ impl SynCookie {
         &self,
         cookie: u32,
         addr: &(u32, u16, u32, u16),
-        tsval: u32,
+        _tsval: u32,
     ) -> Option<TcpInitialParams> {
         let cookie_timestamp = ((cookie >> 27) as u8) & 0x1F;
         let mss_idx = ((cookie >> 24) & 0x7) as usize;
@@ -1392,22 +1461,62 @@ pub enum TcpOptionKind {
     SackPermitted = 4,
     Sack = 5,
     Timestamp = 8,
+    /// Unknown option kind (preserves the raw byte value)
+    Unknown(u8),
+}
+
+impl TcpOptionKind {
+    /// Convert a raw byte to a TcpOptionKind, mapping unknown values to None
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(TcpOptionKind::End),
+            1 => Some(TcpOptionKind::NoOp),
+            2 => Some(TcpOptionKind::MSS),
+            3 => Some(TcpOptionKind::WindowScale),
+            4 => Some(TcpOptionKind::SackPermitted),
+            5 => Some(TcpOptionKind::Sack),
+            8 => Some(TcpOptionKind::Timestamp),
+            _ => Some(TcpOptionKind::Unknown(b)),
+        }
+    }
+
+    /// Convert to the underlying wire byte (always 0-255)
+    pub fn to_byte(self) -> u8 {
+        match self {
+            TcpOptionKind::End => 0,
+            TcpOptionKind::NoOp => 1,
+            TcpOptionKind::MSS => 2,
+            TcpOptionKind::WindowScale => 3,
+            TcpOptionKind::SackPermitted => 4,
+            TcpOptionKind::Sack => 5,
+            TcpOptionKind::Timestamp => 8,
+            TcpOptionKind::Unknown(b) => b,
+        }
+    }
 }
 
 /// TCP option
 #[derive(Debug, Clone)]
 pub struct TcpOption {
+    /// Option kind (Unknown(u8) for unrecognized options)
     pub kind: TcpOptionKind,
+    /// Raw option kind byte when kind is unknown (preserves the original)
+    pub raw_kind: Option<u8>,
+    /// Option data (kind/length bytes excluded)
     pub data: Vec<u8>,
 }
 
 impl TcpOption {
-    /// Get the option as bytes
+    /// Get the option as bytes for serialization into a TCP header
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = vec![self.kind as u8];
+        // Determine the kind byte: use raw_kind for unknown options
+        let kind_byte = self.kind.to_byte();
+
         match self.kind {
-            TcpOptionKind::End | TcpOptionKind::NoOp => bytes,
+            TcpOptionKind::End | TcpOptionKind::NoOp => vec![kind_byte],
             _ => {
+                let mut bytes = Vec::with_capacity(2 + self.data.len());
+                bytes.push(kind_byte);
                 bytes.push((2 + self.data.len()) as u8);
                 bytes.extend_from_slice(&self.data);
                 bytes
@@ -1433,6 +1542,7 @@ impl TcpOption {
                     // End of options
                     options.push(TcpOption {
                         kind: TcpOptionKind::End,
+                        raw_kind: None,
                         data: Vec::new(),
                     });
                     break;
@@ -1441,6 +1551,7 @@ impl TcpOption {
                     // No-op (single byte option)
                     options.push(TcpOption {
                         kind: TcpOptionKind::NoOp,
+                        raw_kind: None,
                         data: Vec::new(),
                     });
                     i += 1;
@@ -1503,17 +1614,23 @@ impl TcpOption {
                         8 => Some(TcpOptionKind::Timestamp),
                         _ => None, // Unknown option type
                     };
-                    
-                    // For unknown options, add as generic option with UnknownKind variant
+
+                    // For known options, add with the parsed kind.
+                    // For unknown options, preserve the raw kind byte via Unknown variant.
                     if let Some(parsed) = parsed_kind {
                         options.push(TcpOption {
                             kind: parsed,
+                            raw_kind: None,
+                            data: option_data,
+                        });
+                    } else {
+                        options.push(TcpOption {
+                            kind: TcpOptionKind::Unknown(kind),
+                            raw_kind: Some(kind),
                             data: option_data,
                         });
                     }
-                    // Unknown options are silently skipped (RFC 793 compliant)
-                    // They must be echoed back if MSS, Window Scale, or SACK
-                    
+
                     i += len;
                 }
             }
@@ -1525,35 +1642,65 @@ impl TcpOption {
     /// Create an unknown option from raw bytes
     /// Used when we receive an option type we don't recognize
     pub fn unknown(kind: u8, data: Vec<u8>) -> Self {
-        // Note: We use NoOp as a placeholder since we don't have Unknown variant
-        // In a full implementation, we'd add an Unknown variant to TcpOptionKind
         Self {
-            kind: TcpOptionKind::NoOp,
-            data: {
-                let mut d = Vec::with_capacity(2 + data.len());
-                d.push(kind);
-                d.push((2 + data.len()) as u8);
-                d.extend_from_slice(&data);
-                d
-            },
+            kind: TcpOptionKind::Unknown(kind),
+            raw_kind: Some(kind),
+            data,
         }
     }
 }
 
+/// Build a vector of TCP option bytes from a slice of TcpOption values
+///
+/// This function serializes the options into the wire format for outgoing TCP segments.
+/// It automatically pads with EOL (End of Option List) to a 4-byte boundary per RFC 793.
+///
+/// # Arguments
+/// * `options` - The list of TCP options to serialize
+///
+/// # Returns
+/// A `Vec<u8>` containing the serialized options
+///
+/// # Example
+/// ```
+/// use plan9_net::tcp::{TcpOption, TcpOptionKind, build_options};
+///
+/// let opts = vec![
+///     TcpOption { kind: TcpOptionKind::MSS, raw_kind: None, data: vec![0x05, 0xb4] },
+/// ];
+/// let bytes = build_options(&opts);
+/// ```
+pub fn build_options(options: &[TcpOption]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for opt in options {
+        bytes.extend_from_slice(&opt.to_bytes());
+    }
+
+    // Pad to 4-byte boundary using EOL bytes (per RFC 793 section 3.1)
+    // The TCP header is aligned to 32-bit words, so the options field
+    // must also be a multiple of 4 bytes.
+    let padding = (4 - (bytes.len() % 4)) % 4;
+    for _ in 0..padding {
+        bytes.push(TcpOptionKind::End.to_byte());
+    }
+
+    bytes
+}
+
 /// Build MSS option
 pub fn mss_option(mss: u16) -> Vec<u8> {
-    vec![TcpOptionKind::MSS as u8, 4, (mss >> 8) as u8, mss as u8]
+    vec![TcpOptionKind::MSS.to_byte(), 4, (mss >> 8) as u8, mss as u8]
 }
 
 /// Build window scale option
 pub fn window_scale_option(scale: u8) -> Vec<u8> {
-    vec![TcpOptionKind::WindowScale as u8, 3, scale]
+    vec![TcpOptionKind::WindowScale.to_byte(), 3, scale]
 }
 
 /// Build timestamp option
 pub fn timestamp_option(tsval: u32, tsecr: u32) -> Vec<u8> {
     vec![
-        TcpOptionKind::Timestamp as u8,
+        TcpOptionKind::Timestamp.to_byte(),
         10,
         (tsval >> 24) as u8,
         (tsval >> 16) as u8,
@@ -1575,3 +1722,799 @@ fn constant_time_eq(a: u32, b: u32) -> bool {
     let diff = a ^ b;
     diff == 0
 }
+
+// ============================================================================
+// TCP Keepalive
+// ============================================================================
+
+/// TCP Keepalive state and configuration
+pub struct TcpKeepalive {
+    /// Whether keepalive is enabled
+    enabled: bool,
+    /// Idle time before starting keepalive probes (in seconds)
+    idle: u32,
+    /// Interval between keepalive probes (in seconds)
+    interval: u32,
+    /// Maximum number of keepalive probes
+    max_probes: u32,
+    /// Current probe count
+    probe_count: u32,
+    /// Last activity timestamp
+    last_activity: u64,
+    /// Whether we're currently in keepalive mode
+    in_keepalive: bool,
+}
+
+impl TcpKeepalive {
+    /// Create new keepalive configuration
+    pub fn new() -> Self {
+        Self {
+            enabled: false,
+            idle: 7200,      // 2 hours default (Linux default)
+            interval: 75,    // 75 seconds default (Linux default)
+            max_probes: 9,   // 9 probes default (Linux default)
+            probe_count: 0,
+            last_activity: 0,
+            in_keepalive: false,
+        }
+    }
+
+    /// Enable keepalive with custom parameters
+    pub fn enable(idle: u32, interval: u32, max_probes: u32) -> Self {
+        Self {
+            enabled: true,
+            idle,
+            interval,
+            max_probes,
+            probe_count: 0,
+            last_activity: 0,
+            in_keepalive: false,
+        }
+    }
+
+    /// Disable keepalive
+    pub fn disable(&mut self) {
+        self.enabled = false;
+        self.in_keepalive = false;
+        self.probe_count = 0;
+    }
+
+    /// Check if keepalive is enabled
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Record activity (call when data is sent or received)
+    pub fn record_activity(&mut self, timestamp: u64) {
+        self.last_activity = timestamp;
+        self.in_keepalive = false;
+        self.probe_count = 0;
+    }
+
+    /// Check if we should send a keepalive probe
+    /// Returns true if a probe should be sent
+    pub fn should_probe(&self, current_time: u64) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        // First check if we've been idle long enough
+        let idle_time = current_time.saturating_sub(self.last_activity);
+        if idle_time < self.idle as u64 {
+            return false;
+        }
+
+        // In keepalive mode, check if it's time for next probe
+        if self.in_keepalive {
+            let time_since_last = current_time.saturating_sub(self.last_activity);
+            return time_since_last >= self.interval as u64;
+        }
+
+        // First probe after idle timeout
+        true
+    }
+
+    /// Call after sending a keepalive probe
+    pub fn on_probe_sent(&mut self, timestamp: u64) {
+        if !self.in_keepalive {
+            self.in_keepalive = true;
+            self.probe_count = 1;
+        } else {
+            self.probe_count += 1;
+        }
+        self.last_activity = timestamp;
+    }
+
+    /// Call when we receive a response to a keepalive probe
+    pub fn on_probe_response(&mut self) {
+        self.in_keepalive = false;
+        self.probe_count = 0;
+    }
+
+    /// Check if connection should be closed due to failed keepalive
+    pub fn should_close(&self) -> bool {
+        self.enabled && self.in_keepalive && self.probe_count >= self.max_probes
+    }
+
+    /// Get current probe count
+    pub fn probe_count(&self) -> u32 {
+        self.probe_count
+    }
+
+    /// Get remaining probes
+    pub fn remaining_probes(&self) -> u32 {
+        self.max_probes.saturating_sub(self.probe_count)
+    }
+}
+
+impl Default for TcpKeepalive {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Extend TcpSocket with keepalive support
+impl TcpSocket {
+    /// Get keepalive state (mutable)
+    pub fn keepalive_mut(&mut self) -> &mut TcpKeepalive {
+        &mut self.keepalive
+    }
+
+    /// Get keepalive state (read-only)
+    pub fn keepalive(&self) -> &TcpKeepalive {
+        &self.keepalive
+    }
+
+    /// Enable keepalive on this socket
+    ///
+    /// # Arguments
+    /// * `idle` - Seconds of idle time before first probe
+    /// * `interval` - Seconds between probes
+    /// * `max_probes` - Maximum number of failed probes before closing
+    pub fn enable_keepalive(&mut self, idle: u32, interval: u32, max_probes: u32) {
+        self.keepalive = TcpKeepalive::enable(idle, interval, max_probes);
+    }
+
+    /// Disable keepalive on this socket
+    pub fn disable_keepalive(&mut self) {
+        self.keepalive.disable();
+    }
+
+    /// Check and handle keepalive state
+    /// Call this periodically for active sockets
+    ///
+    /// # Returns
+    /// - `KeepaliveAction::None` - No action needed
+    /// - `KeepaliveAction::SendProbe` - Should send a keepalive probe
+    /// - `KeepaliveAction::CloseConnection` - Should close connection (max probes exceeded)
+    pub fn check_keepalive(&mut self, current_time: u64) -> KeepaliveAction {
+        if !self.keepalive.is_enabled() {
+            return KeepaliveAction::None;
+        }
+
+        if self.keepalive.should_close() {
+            return KeepaliveAction::CloseConnection;
+        }
+
+        if self.keepalive.should_probe(current_time) {
+            self.keepalive.on_probe_sent(current_time);
+            return KeepaliveAction::SendProbe;
+        }
+
+        KeepaliveAction::None
+    }
+
+    /// Record that data was sent or received (resets keepalive timer)
+    pub fn keepalive_activity(&mut self, timestamp: u64) {
+        self.keepalive.record_activity(timestamp);
+    }
+
+    /// Record that a keepalive probe response was received
+    pub fn keepalive_response(&mut self) {
+        self.keepalive.on_probe_response();
+    }
+
+    /// Build a TCP keepalive probe segment on the wire.
+    ///
+    /// Per RFC 1122 section 4.2.3.6, a TCP keepalive probe is sent as an
+    /// empty segment with the ACK of `seq = snd_nxt - 1` (i.e. one byte
+    /// behind the next data we would send). The receiver's response is a
+    /// regular ACK echoing `snd_nxt - 1`; anything else (e.g. RST)
+    /// indicates the connection is broken.
+    ///
+    /// The returned segment has no payload and no options - both the
+    /// kernel and most implementations keep probes minimal so they do
+    /// not interfere with the application data stream.
+    pub fn build_keepalive_probe(&self) -> TcpSegment {
+        let mut seg = TcpSegment::new();
+        seg.header.src_port = self.local_port.to_be();
+        seg.header.dst_port = self.remote_port.to_be();
+        // RFC 1122: seq = snd_nxt - 1 so the peer's ACK has something
+        // concrete to acknowledge.
+        seg.header.seq = self.snd_nxt.wrapping_sub(1).to_be();
+        seg.header.ack = self.rcv_nxt.to_be();
+        // Pure ACK probe: only the ACK flag set, no PSH/FIN.
+        seg.header.set_flags(flag::ACK);
+        seg.header.window = self.snd_wnd.to_be();
+        seg
+    }
+
+    /// Handle a peer response to a keepalive probe we previously sent.
+    ///
+    /// Returns `true` if the response was a healthy ACK (i.e. the
+    /// connection is still alive); `false` means the peer did not
+    /// acknowledge our probe and another probe (or connection close)
+    /// is required.
+    pub fn handle_keepalive_response(&mut self, seg: &TcpSegment) -> bool {
+        if !self.keepalive.is_enabled() {
+            return false;
+        }
+        if !seg.header.has_flag(flag::ACK) {
+            return false;
+        }
+        // A healthy response echoes our probe sequence (snd_nxt - 1).
+        let expected = self.snd_nxt.wrapping_sub(1);
+        if seg.header.seq() == expected || seg.header.ack_num() == self.rcv_nxt {
+            self.keepalive.on_probe_response();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Actions to take based on keepalive state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepaliveAction {
+    /// No action needed
+    None,
+    /// Send a keepalive probe
+    SendProbe,
+    /// Close the connection
+    CloseConnection,
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_options_mss() {
+        let opts = vec![
+            TcpOption {
+                kind: TcpOptionKind::MSS,
+                raw_kind: None,
+                data: vec![0x05, 0xb4], // MSS = 1460
+            },
+        ];
+        let bytes = build_options(&opts);
+        // MSS option: [kind=2, len=4, mss_hi, mss_lo] = 4 bytes
+        // Padded to 4-byte boundary = no padding
+        assert_eq!(bytes, vec![2, 4, 0x05, 0xb4]);
+    }
+
+    #[test]
+    fn test_build_options_with_padding() {
+        // Window Scale option is 3 bytes, padded to 4 with EOL
+        let opts = vec![
+            TcpOption {
+                kind: TcpOptionKind::WindowScale,
+                raw_kind: None,
+                data: vec![7], // scale = 7
+            },
+        ];
+        let bytes = build_options(&opts);
+        assert_eq!(bytes, vec![3, 3, 7, 0]); // last byte is EOL padding
+    }
+
+    #[test]
+    fn test_build_options_multiple() {
+        let opts = vec![
+            TcpOption {
+                kind: TcpOptionKind::MSS,
+                raw_kind: None,
+                data: vec![0x05, 0xb4],
+            },
+            TcpOption {
+                kind: TcpOptionKind::NoOp,
+                raw_kind: None,
+                data: Vec::new(),
+            },
+            TcpOption {
+                kind: TcpOptionKind::WindowScale,
+                raw_kind: None,
+                data: vec![7],
+            },
+            TcpOption {
+                kind: TcpOptionKind::NoOp,
+                raw_kind: None,
+                data: Vec::new(),
+            },
+            TcpOption {
+                kind: TcpOptionKind::SackPermitted,
+                raw_kind: None,
+                data: Vec::new(),
+            },
+        ];
+        let bytes = build_options(&opts);
+        // MSS (4) + NOP (1) + WS (3) + NOP (1) + SackPermitted (2) = 11
+        // Padded to 12 with EOL
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(bytes[11], 0); // EOL padding
+    }
+
+    #[test]
+    fn test_parse_options_mss() {
+        // MSS = 1460 = [0x05, 0xb4]
+        let bytes = vec![2, 4, 0x05, 0xb4];
+        let opts = TcpOption::parse_options(&bytes);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].kind, TcpOptionKind::MSS);
+        assert_eq!(opts[0].data, vec![0x05, 0xb4]);
+    }
+
+    #[test]
+    fn test_parse_options_unknown_preserved() {
+        // Unknown option kind 9 with 2 bytes of data
+        let bytes = vec![9, 4, 0xaa, 0xbb];
+        let opts = TcpOption::parse_options(&bytes);
+        assert_eq!(opts.len(), 1);
+        match opts[0].kind {
+            TcpOptionKind::Unknown(b) => assert_eq!(b, 9),
+            _ => panic!("Expected Unknown variant"),
+        }
+        assert_eq!(opts[0].raw_kind, Some(9));
+        assert_eq!(opts[0].data, vec![0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn test_parse_options_end_and_nop() {
+        // NOP + NOP + EOL
+        let bytes = vec![1, 1, 0];
+        let opts = TcpOption::parse_options(&bytes);
+        assert_eq!(opts.len(), 3);
+        assert_eq!(opts[0].kind, TcpOptionKind::NoOp);
+        assert_eq!(opts[1].kind, TcpOptionKind::NoOp);
+        assert_eq!(opts[2].kind, TcpOptionKind::End);
+    }
+
+    #[test]
+    fn test_round_trip_build_parse() {
+        let opts = vec![
+            TcpOption {
+                kind: TcpOptionKind::MSS,
+                raw_kind: None,
+                data: vec![0x05, 0xb4],
+            },
+            TcpOption {
+                kind: TcpOptionKind::WindowScale,
+                raw_kind: None,
+                data: vec![7],
+            },
+        ];
+        let bytes = build_options(&opts);
+        // After build: 4 bytes MSS + 4 bytes (WS + EOL padding) = 8 bytes
+        let parsed = TcpOption::parse_options(&bytes);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].kind, TcpOptionKind::MSS);
+        assert_eq!(parsed[0].data, vec![0x05, 0xb4]);
+        assert_eq!(parsed[1].kind, TcpOptionKind::WindowScale);
+        assert_eq!(parsed[1].data, vec![7]);
+    }
+
+    #[test]
+    fn test_keepalive_disabled_by_default() {
+        let ka = TcpKeepalive::new();
+        assert!(!ka.is_enabled());
+    }
+
+    #[test]
+    fn test_keepalive_enable_with_params() {
+        let ka = TcpKeepalive::enable(60, 10, 3);
+        assert!(ka.is_enabled());
+        assert_eq!(ka.probe_count(), 0);
+        assert!(!ka.should_close());
+    }
+
+    #[test]
+    fn test_keepalive_probe_lifecycle() {
+        let mut ka = TcpKeepalive::enable(10, 5, 2);
+        ka.record_activity(0);
+
+        // Before idle period, no probe needed
+        assert!(!ka.should_probe(5));
+
+        // After idle period, probe needed
+        assert!(ka.should_probe(11));
+
+        // After probe sent, we're in keepalive mode
+        ka.on_probe_sent(11);
+        assert_eq!(ka.probe_count(), 1);
+
+        // Response received, back to normal
+        ka.on_probe_response();
+        assert_eq!(ka.probe_count(), 0);
+        assert!(!ka.should_close());
+    }
+
+    #[test]
+    fn test_keepalive_max_probes_closes() {
+        let mut ka = TcpKeepalive::enable(5, 1, 2);
+        ka.record_activity(0);
+
+        // First probe
+        ka.on_probe_sent(6);
+        assert!(!ka.should_close());
+
+        // Second probe - should close after this
+        ka.on_probe_sent(7);
+        assert!(ka.should_close());
+    }
+
+    #[test]
+    fn test_socket_keepalive_integration() {
+        let mut sock = TcpSocket::new();
+        assert!(!sock.keepalive().is_enabled());
+
+        sock.enable_keepalive(60, 10, 3);
+        assert!(sock.keepalive().is_enabled());
+
+        sock.keepalive_activity(100);
+        // No probe needed before idle
+        assert_eq!(sock.check_keepalive(110), KeepaliveAction::None);
+
+        // After idle, probe needed
+        assert_eq!(sock.check_keepalive(170), KeepaliveAction::SendProbe);
+
+        sock.keepalive_response();
+        assert_eq!(sock.keepalive().probe_count(), 0);
+    }
+
+    #[test]
+    fn test_from_byte() {
+        assert_eq!(TcpOptionKind::from_byte(0), Some(TcpOptionKind::End));
+        assert_eq!(TcpOptionKind::from_byte(2), Some(TcpOptionKind::MSS));
+        assert_eq!(TcpOptionKind::from_byte(8), Some(TcpOptionKind::Timestamp));
+        // Unknown byte should map to Unknown variant
+        match TcpOptionKind::from_byte(99) {
+            Some(TcpOptionKind::Unknown(b)) => assert_eq!(b, 99),
+            other => panic!("Expected Unknown(99), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_unknown_option_creation() {
+        let opt = TcpOption::unknown(7, vec![0xaa, 0xbb]);
+        assert_eq!(opt.raw_kind, Some(7));
+        assert_eq!(opt.data, vec![0xaa, 0xbb]);
+        match opt.kind {
+            TcpOptionKind::Unknown(b) => assert_eq!(b, 7),
+            _ => panic!("Expected Unknown variant"),
+        }
+
+        // Round-trip through serialization
+        let bytes = opt.to_bytes();
+        assert_eq!(bytes, vec![7, 4, 0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn test_mss_option_helper() {
+        let bytes = mss_option(1460);
+        // 1460 = 0x05B4
+        assert_eq!(bytes, vec![2, 4, 0x05, 0xb4]);
+    }
+
+    #[test]
+    fn test_window_scale_option_helper() {
+        let bytes = window_scale_option(7);
+        assert_eq!(bytes, vec![3, 3, 7]);
+    }
+
+    #[test]
+    fn test_timestamp_option_helper() {
+        let bytes = timestamp_option(0x01020304, 0x05060708);
+        assert_eq!(bytes, vec![8, 10, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+    }
+
+    #[test]
+    fn test_sack_option_round_trip() {
+        // SACK with one block: [kind=5, len=10, left_hi, left_lo, right_hi, right_lo]
+        let bytes = vec![5, 10, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04];
+        let opts = TcpOption::parse_options(&bytes);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].kind, TcpOptionKind::Sack);
+        assert_eq!(opts[0].data, vec![0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04]);
+    }
+
+    #[test]
+    fn test_parse_options_empty() {
+        let bytes: Vec<u8> = vec![];
+        let opts = TcpOption::parse_options(&bytes);
+        assert_eq!(opts.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_options_truncated() {
+        // Truncated MSS option - kind=2, length byte missing
+        let bytes = vec![2];
+        let opts = TcpOption::parse_options(&bytes);
+        assert_eq!(opts.len(), 0);
+    }
+
+    #[test]
+    fn test_build_options_empty() {
+        let bytes = build_options(&[]);
+        assert_eq!(bytes.len(), 0);
+    }
+
+    #[test]
+    fn test_keepalive_disable() {
+        let mut ka = TcpKeepalive::enable(60, 10, 3);
+        assert!(ka.is_enabled());
+        ka.disable();
+        assert!(!ka.is_enabled());
+        assert_eq!(ka.probe_count(), 0);
+    }
+
+    #[test]
+    fn test_keepalive_default_via_socket() {
+        let sock = TcpSocket::new();
+        // Newly created socket has keepalive disabled
+        assert!(!sock.keepalive().is_enabled());
+        assert_eq!(sock.keepalive().probe_count(), 0);
+        assert_eq!(sock.keepalive().remaining_probes(), 0);
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(0x12345678, 0x12345678));
+        assert!(!constant_time_eq(0x12345678, 0x12345679));
+        assert!(constant_time_eq(0, 0));
+    }
+
+    // ========================================================================
+    // New tests: segment round-trip with options, keepalive probe segment,
+    // keepalive probe response handling, and expanded NoOp coverage.
+    // ========================================================================
+
+    #[test]
+    fn test_nop_option_to_bytes_is_single_byte() {
+        let nop = TcpOption {
+            kind: TcpOptionKind::NoOp,
+            raw_kind: None,
+            data: Vec::new(),
+        };
+        assert_eq!(nop.to_bytes(), vec![1]);
+    }
+
+    #[test]
+    fn test_multiple_nops_in_a_row_parse_correctly() {
+        // 4 NOPs back to back - the parser must advance exactly one
+        // byte per NOP and emit four distinct TcpOptionKind::NoOp.
+        let bytes = vec![1, 1, 1, 1];
+        let opts = TcpOption::parse_options(&bytes);
+        assert_eq!(opts.len(), 4);
+        for opt in &opts {
+            assert_eq!(opt.kind, TcpOptionKind::NoOp);
+        }
+    }
+
+    #[test]
+    fn test_nop_padding_to_four_byte_boundary() {
+        // 3 bytes of NOPs => pad with one EOL (0x00).
+        let opts = vec![
+            TcpOption { kind: TcpOptionKind::NoOp, raw_kind: None, data: Vec::new() },
+            TcpOption { kind: TcpOptionKind::NoOp, raw_kind: None, data: Vec::new() },
+            TcpOption { kind: TcpOptionKind::NoOp, raw_kind: None, data: Vec::new() },
+        ];
+        let bytes = build_options(&opts);
+        assert_eq!(bytes.len(), 4);
+        assert_eq!(bytes[3], 0); // EOL pad
+    }
+
+    #[test]
+    fn test_segment_round_trip_with_options() {
+        let mut seg = TcpSegment::new();
+        seg.header.src_port = 12345u16.to_be();
+        seg.header.dst_port = 80u16.to_be();
+        seg.header.seq = 0xDEADBEEFu32.to_be();
+        seg.header.ack = 0xCAFEBABEu32.to_be();
+        seg.header.set_flags(flag::SYN | flag::ACK);
+        seg.add_option(TcpOption {
+            kind: TcpOptionKind::MSS,
+            raw_kind: None,
+            data: vec![0x05, 0xb4],
+        });
+        seg.add_option(TcpOption {
+            kind: TcpOptionKind::NoOp,
+            raw_kind: None,
+            data: Vec::new(),
+        });
+
+        let bytes = seg.to_bytes();
+        let parsed = TcpSegment::parse(&bytes).expect("round-trip parse");
+        assert_eq!(parsed.header.src_port, 12345u16.to_be());
+        assert_eq!(parsed.header.dst_port, 80u16.to_be());
+        assert_eq!(parsed.header.seq, 0xDEADBEEFu32.to_be());
+        assert_eq!(parsed.header.ack, 0xCAFEBABEu32.to_be());
+        assert_eq!(parsed.header.flags() & (flag::SYN | flag::ACK),
+                   flag::SYN | flag::ACK);
+        // Data offset in words should reflect 24-byte header (5 + 1
+        // padding word = 6 words = 24 bytes).
+        assert_eq!(parsed.header.header_len(), 24);
+        // Options decoded by parse_options should include MSS + NOP.
+        assert_eq!(parsed.options.len(), 2);
+        assert_eq!(parsed.options[0].kind, TcpOptionKind::MSS);
+        assert_eq!(parsed.options[1].kind, TcpOptionKind::NoOp);
+    }
+
+    #[test]
+    fn test_segment_set_options_replaces_previous() {
+        let mut seg = TcpSegment::new();
+        seg.add_option(TcpOption {
+            kind: TcpOptionKind::NoOp,
+            raw_kind: None,
+            data: Vec::new(),
+        });
+        seg.set_options(vec![TcpOption {
+            kind: TcpOptionKind::MSS,
+            raw_kind: None,
+            data: vec![0x05, 0xb4],
+        }]);
+        assert_eq!(seg.options.len(), 1);
+        assert_eq!(seg.options[0].kind, TcpOptionKind::MSS);
+    }
+
+    #[test]
+    fn test_segment_options_data_offset_is_updated() {
+        // Header length on wire must equal TCP_HEADER_LEN + padded options.
+        let mut seg = TcpSegment::new();
+        seg.add_option(TcpOption {
+            kind: TcpOptionKind::MSS,
+            raw_kind: None,
+            data: vec![0x05, 0xb4],
+        });
+        // MSS = 4 bytes; pad 0 to multiple of 4 -> header length 24.
+        let bytes = seg.to_bytes();
+        // Data offset (upper 4 bits of byte 12) = 6.
+        let offset_word = u16::from_be_bytes([bytes[12], bytes[13]]);
+        assert_eq!(offset_word >> 12, 6);
+        assert_eq!(seg.size(), 24);
+    }
+
+    #[test]
+    fn test_segment_with_empty_options_serializes_cleanly() {
+        // No options: header must remain 20 bytes (5 words).
+        let mut seg = TcpSegment::new();
+        seg.header.src_port = 22u16.to_be();
+        seg.set_payload(vec![0xAB, 0xCD]);
+        let bytes = seg.to_bytes();
+        let offset_word = u16::from_be_bytes([bytes[12], bytes[13]]);
+        assert_eq!(offset_word >> 12, 5);
+        // Total = 20 header + 2 payload.
+        assert_eq!(bytes.len(), 22);
+        assert_eq!(&bytes[20..], &[0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn test_keepalive_probe_segment_fields() {
+        let mut sock = TcpSocket::new();
+        sock.local_port = 8080;
+        sock.remote_port = 22;
+        sock.remote_ip = 0x0A000001; // 10.0.0.1
+        sock.snd_nxt = 1000;
+        sock.rcv_nxt = 500;
+        sock.snd_wnd = 8192;
+
+        let probe = sock.build_keepalive_probe();
+        // No payload, no options.
+        assert!(probe.payload.is_empty());
+        assert!(probe.options.is_empty());
+        // Ports swapped to network byte order.
+        assert_eq!(u16::from_be(probe.header.src_port), 8080);
+        assert_eq!(u16::from_be(probe.header.dst_port), 22);
+        // Seq = snd_nxt - 1, in network byte order.
+        assert_eq!(u32::from_be(probe.header.seq), 999);
+        assert_eq!(u32::from_be(probe.header.ack), 500);
+        // ACK flag set, no other flags.
+        assert_eq!(probe.header.flags(), flag::ACK);
+        // Window in network byte order.
+        assert_eq!(u16::from_be(probe.header.window), 8192);
+    }
+
+    #[test]
+    fn test_keepalive_probe_wraps_at_zero() {
+        // snd_nxt = 0 must not panic on the saturating_sub.
+        let mut sock = TcpSocket::new();
+        sock.snd_nxt = 0;
+        let probe = sock.build_keepalive_probe();
+        // wrapping_sub(1) yields u32::MAX.
+        assert_eq!(u32::from_be(probe.header.seq), u32::MAX);
+    }
+
+    #[test]
+    fn test_handle_keepalive_response_accepts_matching_ack() {
+        let mut sock = TcpSocket::new();
+        sock.snd_nxt = 1000;
+        sock.rcv_nxt = 500;
+        sock.enable_keepalive(60, 10, 3);
+        // Pretend we just sent a probe.
+        sock.keepalive.on_probe_sent(123);
+        assert_eq!(sock.keepalive.probe_count(), 1);
+
+        // Build a healthy response: ACK with seq = snd_nxt - 1.
+        let mut resp = TcpSegment::new();
+        resp.header.ack = sock.snd_nxt.wrapping_sub(1).to_be();
+        resp.header.set_flags(flag::ACK);
+        assert!(sock.handle_keepalive_response(&resp));
+        // Probe counter reset on response.
+        assert_eq!(sock.keepalive.probe_count(), 0);
+    }
+
+    #[test]
+    fn test_handle_keepalive_response_rejects_unhealthy_ack() {
+        let mut sock = TcpSocket::new();
+        sock.snd_nxt = 1000;
+        sock.rcv_nxt = 500;
+        sock.enable_keepalive(60, 10, 3);
+        sock.keepalive.on_probe_sent(0);
+        // Wrong seq - not our probe's sequence.
+        let mut resp = TcpSegment::new();
+        resp.header.ack = 1u32.to_be();
+        resp.header.set_flags(flag::ACK);
+        assert!(!sock.handle_keepalive_response(&resp));
+        // Probe counter must not reset.
+        assert_eq!(sock.keepalive.probe_count(), 1);
+    }
+
+    #[test]
+    fn test_handle_keepalive_response_ignores_when_disabled() {
+        let mut sock = TcpSocket::new();
+        sock.snd_nxt = 1000;
+        sock.rcv_nxt = 500;
+        // Keepalive disabled.
+        let mut resp = TcpSegment::new();
+        resp.header.ack = 999u32.to_be();
+        resp.header.set_flags(flag::ACK);
+        assert!(!sock.handle_keepalive_response(&resp));
+    }
+
+    #[test]
+    fn test_handle_keepalive_response_rejects_segment_without_ack() {
+        let mut sock = TcpSocket::new();
+        sock.snd_nxt = 1000;
+        sock.rcv_nxt = 500;
+        sock.enable_keepalive(60, 10, 3);
+        // SYN segment - keepalive probes never carry SYN.
+        let mut resp = TcpSegment::new();
+        resp.header.ack = 999u32.to_be();
+        resp.header.set_flags(flag::SYN);
+        assert!(!sock.handle_keepalive_response(&resp));
+    }
+
+    #[test]
+    fn test_keepalive_probe_then_response_resets_full_state() {
+        let mut sock = TcpSocket::new();
+        sock.enable_keepalive(1, 1, 3);
+        sock.snd_nxt = 50;
+        sock.rcv_nxt = 0;
+
+        // 1 second of idle, then probe is triggered.
+        assert!(sock.check_keepalive(2) == KeepaliveAction::SendProbe);
+        // After probe is sent, in_keepalive is true.
+        assert!(sock.keepalive().is_enabled());
+
+        let probe = sock.build_keepalive_probe();
+        let mut resp = TcpSegment::new();
+        resp.header.ack = u32::from_be(probe.header.seq);
+        resp.header.set_flags(flag::ACK);
+        assert!(sock.handle_keepalive_response(&resp));
+        // Connection healthy - no further probe needed at the same time.
+        assert_eq!(sock.check_keepalive(2), KeepaliveAction::None);
+    }
+}
+

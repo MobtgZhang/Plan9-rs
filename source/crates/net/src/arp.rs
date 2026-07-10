@@ -2,13 +2,11 @@
 //!
 //! Implements ARP for mapping IPv4 addresses to MAC addresses.
 
-#![no_std]
 
 extern crate alloc;
 
 use crate::common::sync::Spinlock;
 use crate::eth::ETH_ADDR_LEN;
-use alloc::vec;
 use alloc::vec::Vec;
 
 /// ARP operation types
@@ -364,6 +362,7 @@ impl ArpTable {
 
     /// Handle incoming ARP packet
     pub fn handle_packet(&mut self, hdr: &ArpHdr) -> Option<ArpHdr> {
+        let _guard = self.lock.lock();
         let sender_ip = hdr.sender_ip();
         let target_ip = hdr.target_ip();
 
@@ -643,12 +642,21 @@ impl EnhancedArpTable {
         let now = self.now();
         let mut requests_to_send = alloc::vec::Vec::new();
 
+        // Collect requests to process and their timeouts
+        let base_timeout = self.config.retrans_timeout_ms;
+        let max_retrans = self.config.max_retrans;
+        
         for req in &mut self.pending_requests {
             let elapsed = now.saturating_sub(req.sent_at);
-            let timeout = self.calculate_timeout(req.retrans_count);
+            let retrans_count = req.retrans_count;
+            
+            // Calculate timeout: base * 2^retrans_count, capped
+            let timeout = base_timeout << retrans_count as u64;
+            let max_timeout = self.config.max_retrans_timeout_ms;
+            let actual_timeout = if timeout > max_timeout { max_timeout } else { timeout };
 
-            if elapsed >= timeout {
-                if req.retrans_count < self.config.max_retrans {
+            if elapsed >= actual_timeout {
+                if retrans_count < max_retrans {
                     // Retransmit
                     req.retrans_count += 1;
                     req.sent_at = now;
@@ -668,7 +676,7 @@ impl EnhancedArpTable {
     }
 
     /// Calculate timeout for retransmission (with exponential backoff)
-    fn calculate_timeout(&self, retrans_count: u8) -> u64 {
+    pub fn calculate_timeout(&self, retrans_count: u8) -> u64 {
         let base = self.config.retrans_timeout_ms;
         let max = self.config.max_retrans_timeout_ms;
 

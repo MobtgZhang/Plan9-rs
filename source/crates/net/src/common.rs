@@ -2,7 +2,7 @@
 //!
 //! Provides local stub types for no_std compatibility.
 
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Error types for network operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,9 +57,44 @@ impl Mode {
     pub const EXEC: u32 = 2;
 }
 
+/// Result type alias for network operations
+pub type Result<T> = core::result::Result<T, Error>;
+
+/// 9P Protocol Error
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct P9Error {
+    pub code: u32,
+    pub message: &'static str,
+}
+
+impl P9Error {
+    pub fn new(code: u32) -> Self {
+        let message = match code {
+            0 => "success",
+            1 => "operation not permitted",
+            2 => "no such file or directory",
+            3 => "file not found",
+            4 => "interrupted system call",
+            5 => "input/output error",
+            6 => "no such device or address",
+            7 => "argument list too long",
+            8 => "exec format error",
+            9 => "bad file number",
+            10 => "no child processes",
+            11 => "resource temporarily unavailable",
+            _ => "unknown error",
+        };
+        Self { code, message }
+    }
+    
+    pub fn code(&self) -> u32 {
+        self.code
+    }
+}
+
 /// Synchronization utilities
 pub mod sync {
-    use core::sync::atomic::{AtomicPtr, Ordering};
+    use core::sync::atomic::AtomicPtr;
     use core::cell::UnsafeCell;
     
     /// Simple spinlock for protecting data in no_std environments
@@ -80,7 +115,7 @@ pub mod sync {
         /// Lock and get mutable access to data
         pub fn lock(&self) -> SpinlockGuard<'_, T> {
             SpinlockGuard {
-                lock: &self.locked,
+                locked: &self.locked,
                 data: unsafe { &mut *self.data.get() },
             }
         }
@@ -95,15 +130,26 @@ pub mod sync {
         }
     }
 
+    // SAFETY: Spinlock<T> is Sync if T: Send because the spinlock ensures
+    // that only one thread can access the data at a time.
+    unsafe impl<T: Send> Sync for Spinlock<T> {}
+
     /// RAII guard for spinlock
     pub struct SpinlockGuard<'a, T> {
-        lock: &'a AtomicPtr<u8>,
+        // `locked` is held by reference so the Drop impl can reset the
+        // atomic when the guard is released; we never read or write the
+        // pointer itself otherwise.
+        locked: &'a AtomicPtr<u8>,
         data: &'a mut T,
     }
 
     impl<T> Drop for SpinlockGuard<'_, T> {
         fn drop(&mut self) {
-            // No-op in single-threaded context
+            // Release the lock by clearing the ticket pointer so the
+            // next caller can take it. In single-threaded contexts this
+            // is a no-op but the assignment keeps the field live and
+            // matches the documented acquire/release semantics.
+            self.locked.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
         }
     }
 

@@ -2,7 +2,6 @@
 //!
 //! Implements User Datagram Protocol for connectionless packet delivery.
 
-#![no_std]
 
 extern crate alloc;
 
@@ -10,7 +9,6 @@ use crate::common::{Error, Result};
 use crate::ipv4::proto;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use alloc::vec;
 
 // ============================================================================
 // UDP Constants
@@ -234,6 +232,16 @@ impl UdpSocket {
             recv_buf: Vec::new(),
             recv_queue: Vec::new(),
         }
+    }
+
+    /// Currently buffered bytes that have not yet been consumed by `recv`.
+    pub fn recv_buf_len(&self) -> usize {
+        self.recv_buf.len()
+    }
+
+    /// Append a chunk to the receive buffer (used by the demuxer).
+    pub fn push_recv_buf(&mut self, chunk: &[u8]) {
+        self.recv_buf.extend_from_slice(chunk);
     }
 
     /// Bind to local port

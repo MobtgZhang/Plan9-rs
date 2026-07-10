@@ -41,12 +41,9 @@
 //! }
 //! ```
 
-#![no_std]
 
 extern crate alloc;
 use crate::common::sync::Spinlock;
-use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
 /// IPv6 address length
@@ -322,10 +319,13 @@ impl NeighborSolicit {
         let mut options = Vec::new();
         let mut offset = 20;
         while offset + 8 <= bytes.len() {
-            if let Some(opt) = NdOption::parse(&bytes[offset..]) {
-                options.push(opt);
+            let parse_result = NdOption::parse(&bytes[offset..]);
+            if let Some(ref opt) = parse_result {
                 let opt_len = opt.length() * 8;
-                offset += opt_len;
+                if let Some(parsed_opt) = parse_result {
+                    options.push(parsed_opt);
+                }
+                offset += opt_len as usize;
             } else {
                 break;
             }
@@ -437,10 +437,13 @@ impl NeighborAdvert {
         let mut options = Vec::new();
         let mut offset = 20;
         while offset + 8 <= bytes.len() {
-            if let Some(opt) = NdOption::parse(&bytes[offset..]) {
-                options.push(opt);
+            let parse_result = NdOption::parse(&bytes[offset..]);
+            if let Some(ref opt) = parse_result {
                 let opt_len = opt.length() * 8;
-                offset += opt_len;
+                if let Some(parsed_opt) = parse_result {
+                    options.push(parsed_opt);
+                }
+                offset += opt_len as usize;
             } else {
                 break;
             }
@@ -503,16 +506,24 @@ impl RouterSolicit {
         let mut options = Vec::new();
         let mut offset = 4;
         while offset + 8 <= bytes.len() {
-            if let Some(opt) = NdOption::parse(&bytes[offset..]) {
-                options.push(opt);
+            let parse_result = NdOption::parse(&bytes[offset..]);
+            if let Some(ref opt) = parse_result {
                 let opt_len = opt.length() * 8;
-                offset += opt_len;
+                if let Some(parsed_opt) = parse_result {
+                    options.push(parsed_opt);
+                }
+                offset += opt_len as usize;
             } else {
                 break;
             }
         }
 
         Some(Self { reserved, options })
+    }
+    
+    /// Convert to bytes
+    pub fn to_bytes(&self) -> [u8; 4] {
+        self.reserved.to_be_bytes()
     }
 }
 
@@ -610,10 +621,13 @@ impl RouterAdvert {
         let mut options = Vec::new();
         let mut offset = 16;
         while offset + 8 <= bytes.len() {
-            if let Some(opt) = NdOption::parse(&bytes[offset..]) {
-                options.push(opt);
+            let parse_result = NdOption::parse(&bytes[offset..]);
+            if let Some(ref opt) = parse_result {
                 let opt_len = opt.length() * 8;
-                offset += opt_len;
+                if let Some(parsed_opt) = parse_result {
+                    options.push(parsed_opt);
+                }
+                offset += opt_len as usize;
             } else {
                 break;
             }
@@ -627,6 +641,17 @@ impl RouterAdvert {
             retrans_timer,
             options,
         })
+    }
+    
+    /// Convert to bytes
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[0] = self.hop_limit;
+        bytes[1] = self.flags;
+        bytes[2..4].copy_from_slice(&self.router_lifetime.to_be_bytes());
+        bytes[4..8].copy_from_slice(&self.reachable_time.to_be_bytes());
+        bytes[8..12].copy_from_slice(&self.retrans_timer.to_be_bytes());
+        bytes
     }
 }
 
@@ -1002,7 +1027,7 @@ impl Icmpv6Packet {
             }
             Icmpv6Body::RouterAdvertisement(ra) => {
                 // RA has fixed header + options
-                let mut ra_bytes = ra.to_bytes();
+                let ra_bytes = ra.to_bytes();
                 header_bytes[4..8].copy_from_slice(&[
                     ra_bytes[0],
                     ra_bytes[1],
@@ -1089,7 +1114,6 @@ pub fn calculate_checksum(src: &[u8; 16], dst: &[u8; 16], data: &[u8]) -> u16 {
 // ============================================================================
 
 /// ICMPv6 statistics
-#[derive(Debug, Clone, Default)]
 pub struct Icmpv6Stats {
     /// Messages received
     pub in_msgs: u64,
@@ -1106,6 +1130,46 @@ pub struct Icmpv6Stats {
     /// Messages by type
     pub in_by_type: [u64; 256],
     pub out_by_type: [u64; 256],
+}
+
+impl Default for Icmpv6Stats {
+    fn default() -> Self {
+        Self {
+            in_msgs: 0,
+            out_msgs: 0,
+            in_errors: 0,
+            csum_errors: 0,
+            len_errors: 0,
+            hoplim_errors: 0,
+            in_by_type: [0; 256],
+            out_by_type: [0; 256],
+        }
+    }
+}
+
+impl core::fmt::Debug for Icmpv6Stats {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Icmpv6Stats")
+            .field("in_msgs", &self.in_msgs)
+            .field("out_msgs", &self.out_msgs)
+            .field("in_errors", &self.in_errors)
+            .finish()
+    }
+}
+
+impl Clone for Icmpv6Stats {
+    fn clone(&self) -> Self {
+        Self {
+            in_msgs: self.in_msgs,
+            out_msgs: self.out_msgs,
+            in_errors: self.in_errors,
+            csum_errors: self.csum_errors,
+            len_errors: self.len_errors,
+            hoplim_errors: self.hoplim_errors,
+            in_by_type: self.in_by_type,
+            out_by_type: self.out_by_type,
+        }
+    }
 }
 
 impl Icmpv6Stats {
@@ -1164,8 +1228,8 @@ impl Icmpv6Handler {
     /// Handle incoming ICMPv6 packet
     pub fn handle_packet(
         &mut self,
-        src: &[u8; 16],
-        dst: &[u8; 16],
+        _src: &[u8; 16],
+        _dst: &[u8; 16],
         data: &[u8],
     ) -> Option<Icmpv6Packet> {
         let _guard = self.lock.lock();
