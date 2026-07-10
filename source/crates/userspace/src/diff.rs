@@ -3,12 +3,12 @@
 //! This is a simplified implementation of the POSIX/Plan 9 diff utility.
 //! Supports unified (-u) and context (-c) output formats.
 
-use std::cmp::{max, min};
-use std::fs::{self, File};
+use std::cmp::max;
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum DiffLineType {
     Equal,
     Insert,
@@ -128,7 +128,7 @@ fn backtrack_lcs(dp: &[Vec<usize>], lines1: &[String], lines2: &[String],
 }
 
 /// Compare two files and return the diff lines
-pub fn diff_files(file1: &Path, file2: &Path, opts: &DiffOptions) -> io::Result<Vec<DiffLine>> {
+pub fn diff_files(file1: &Path, file2: &Path, _opts: &DiffOptions) -> io::Result<Vec<DiffLine>> {
     let lines1 = read_lines(file1)?;
     let lines2 = read_lines(file2)?;
     
@@ -242,10 +242,10 @@ fn group_changes(lines: &[DiffLine], context: usize) -> Vec<DiffChange> {
                         new_count: 0,
                         lines: Vec::new(),
                     });
-                    equal_run_len = 0;
                 }
                 
                 current_group.as_mut().unwrap().lines.push(line.clone());
+                // Reset the context counter since we just emitted a change line.
                 equal_run_len = 0;
             }
         }
@@ -269,11 +269,11 @@ pub fn print_context_diff<W: Write>(output: &mut W, file1: &str, file2: &str,
     }
     
     for group in &groups {
-        let old_end = group.lines.iter()
+        let _old_end = group.lines.iter()
             .filter_map(|l| l.old_line_num)
             .max()
             .unwrap_or(group.old_start);
-        let new_end = group.lines.iter()
+        let _new_end = group.lines.iter()
             .filter_map(|l| l.new_line_num)
             .max()
             .unwrap_or(group.new_start);
@@ -284,7 +284,7 @@ pub fn print_context_diff<W: Write>(output: &mut W, file1: &str, file2: &str,
         for line in &group.lines {
             match line.line_type {
                 DiffLineType::Equal => {
-                    if let (Some(old), Some(new)) = (line.old_line_num, line.new_line_num) {
+                    if let (Some(old), Some(_new)) = (line.old_line_num, line.new_line_num) {
                         writeln!(output, "  {} {}", old, line.content)?;
                     }
                 }
@@ -443,3 +443,4 @@ mod tests {
         assert!(diff.iter().any(|l| l.line_type == DiffLineType::Delete));
     }
 }
+

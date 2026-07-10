@@ -4,6 +4,7 @@
 
 use std::env;
 use std::fs;
+use std::format;
 
 pub fn run_du(args: &[String]) -> i32 {
     let mut human = false;
@@ -33,17 +34,35 @@ pub fn run_du(args: &[String]) -> i32 {
                     let size = m.len();
                     total += size;
                     if !summarize {
-                        println!("{}\t{}", size / 1024, entry.path().display());
+                        println!("{}\t{}", format_size(size, human), entry.path().display());
                     }
                 }
             }
             if summarize {
-                println!("{}\t{}", total / 1024, path);
+                println!("{}\t{}", format_size(total, human), path);
             }
         }
     }
 
     0
+}
+
+fn format_size(bytes: u64, human: bool) -> String {
+    if !human {
+        return format!("{}", bytes / 1024);
+    }
+    const UNITS: &[&str] = &["K", "M", "G", "T", "P"];
+    let mut size = bytes as f64;
+    let mut unit = "K";
+    for u in UNITS {
+        if size < 1024.0 {
+            unit = u;
+            break;
+        }
+        size /= 1024.0;
+        unit = u;
+    }
+    format!("{:.1}{}", size, unit)
 }
 
 pub fn main() {

@@ -3,7 +3,7 @@
 //! Implementation of the cut command.
 
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead};
 
 pub fn run_cut(args: &[String]) -> i32 {
     let mut fields: Option<Vec<usize>> = None;
@@ -49,7 +49,7 @@ pub fn run_cut(args: &[String]) -> i32 {
         }
     };
 
-    let mut stdout = io::stdout();
+    let _stdout = io::stdout();
     let mut line = String::new();
     let mut reader = read_from;
 

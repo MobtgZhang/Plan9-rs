@@ -3,14 +3,7 @@
 //! This is a simplified implementation of AWK for Plan 9.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::Path;
-use std::process;
-use std::sync::LazyLock;
-
-static REGEX_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
-    regex_lite::Regex::new(r#"^/(.+)/$"#).unwrap()
-});
+use std::io::{self};
 
 #[derive(Debug, Clone)]
 pub enum AwkValue {
@@ -30,7 +23,7 @@ impl AwkValue {
         match self {
             AwkValue::Number(n) => {
                 if n.fract() == 0.0 && n.abs() < 1e15 {
-                    (n as i64).to_string()
+                    (*n as i64).to_string()
                 } else {
                     n.to_string()
                 }
@@ -188,6 +181,17 @@ impl Awk {
         awk.init_vars();
         awk
     }
+
+    /// Borrow the associative-array table used for `arr[key]` expressions.
+    pub fn arrays(&self) -> &HashMap<String, HashMap<String, AwkValue>> {
+        &self.arrays
+    }
+
+    /// Mutable access to the associative-array table. Used by future
+    /// array assignment rules to populate `arr[key]` cells.
+    pub fn arrays_mut(&mut self) -> &mut HashMap<String, HashMap<String, AwkValue>> {
+        &mut self.arrays
+    }
     
     fn init_vars(&mut self) {
         self.vars.insert("FS".to_string(), AwkValue::String(self.opts.field_separator.clone()));
@@ -225,7 +229,7 @@ impl Awk {
             pos += 1;
         }
         
-        let start_pos = pos;
+        let _start_pos = pos;
         
         let mut pattern: AwkPattern = AwkPattern::All;
         
@@ -381,7 +385,7 @@ impl Awk {
         Ok((AwkPrintItem::Expression(expr), new_pos))
     }
     
-    fn parse_if_statement(program: &str, pos: usize) -> Result<(AwkAction, usize), String> {
+    fn parse_if_statement(program: &str, _pos: usize) -> Result<(AwkAction, usize), String> {
         let program = program.trim_start_matches("if");
         let mut pos = 0;
         let chars: Vec<char> = program.chars().collect();
@@ -547,7 +551,7 @@ impl Awk {
         }
         
         if expr.starts_with('$') {
-            if let Ok(n) = expr[1..].parse::<usize>() {
+            if let Ok(_n) = expr[1..].parse::<usize>() {
                 return Ok(AwkExpression::Field(expr.to_string()));
             }
         }
@@ -567,17 +571,20 @@ impl Awk {
     
     pub fn run(&mut self, input: &str) -> Result<String, String> {
         let mut output = String::new();
-        
-        for rule in &self.program {
-            if matches!(rule.pattern, AwkPattern::Begin) {
-                self.execute_actions(&rule.actions, &mut output)?;
-            }
+
+        // Collect Begin actions first to release the immutable borrow on self
+        let begin_actions: Vec<Vec<AwkAction>> = self.program.iter()
+            .filter(|r| matches!(r.pattern, AwkPattern::Begin))
+            .map(|r| r.actions.clone())
+            .collect();
+        for actions in &begin_actions {
+            self.execute_actions(actions, &mut output)?;
         }
-        
+
         let rs = self.vars.get("RS")
             .map(|v| v.to_string())
             .unwrap_or_else(|| "\n".to_string());
-        
+
         for record_str in input.split(&rs).filter(|s| !s.is_empty()) {
             self.vars.insert("FNR".to_string(), AwkValue::Number(
                 self.vars.get("FNR").map(|v| v.to_number()).unwrap_or(0.0) + 1.0
@@ -585,46 +592,50 @@ impl Awk {
             self.vars.insert("NR".to_string(), AwkValue::Number(
                 self.vars.get("NR").map(|v| v.to_number()).unwrap_or(0.0) + 1.0
             ));
-            
+
             let fs = self.vars.get("FS")
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| " ".to_string());
-            
+
             let fnr = self.vars.get("FNR").map(|v| v.to_number()).unwrap_or(1.0) as usize;
             let nr = self.vars.get("NR").map(|v| v.to_number()).unwrap_or(1.0) as usize;
-            
+
             let record = AwkRecord::new(record_str, &fs, nr, fnr);
             let nf = record.fields.len();
             self.vars.insert("NF".to_string(), AwkValue::Number(nf as f64));
-            
+
             for (i, field) in record.fields.iter().enumerate() {
                 self.vars.insert(format!("${}", i + 1), AwkValue::String(field.clone()));
             }
             self.vars.insert("$0".to_string(), AwkValue::String(record.f0.clone()));
-            
+
             let matches = match &self.program[0].pattern {
                 AwkPattern::All => true,
                 AwkPattern::Begin | AwkPattern::End => false,
                 AwkPattern::Expression(_) => true,
                 AwkPattern::Regex(_, _) => true,
             };
-            
+
             if matches {
-                for rule in &self.program {
-                    if matches!(rule.pattern, AwkPattern::Begin | AwkPattern::End) {
-                        continue;
-                    }
-                    self.execute_actions(&rule.actions, &mut output)?;
+                // Collect main actions first
+                let main_actions: Vec<Vec<AwkAction>> = self.program.iter()
+                    .filter(|r| !matches!(r.pattern, AwkPattern::Begin | AwkPattern::End))
+                    .map(|r| r.actions.clone())
+                    .collect();
+                for actions in &main_actions {
+                    self.execute_actions(actions, &mut output)?;
                 }
             }
         }
-        
-        for rule in &self.program {
-            if matches!(rule.pattern, AwkPattern::End) {
-                self.execute_actions(&rule.actions, &mut output)?;
-            }
+
+        let end_actions: Vec<Vec<AwkAction>> = self.program.iter()
+            .filter(|r| matches!(r.pattern, AwkPattern::End))
+            .map(|r| r.actions.clone())
+            .collect();
+        for actions in &end_actions {
+            self.execute_actions(actions, &mut output)?;
         }
-        
+
         Ok(output)
     }
     
@@ -841,3 +852,4 @@ mod tests {
         assert_eq!(lines, vec!["1", "2", "3"]);
     }
 }
+

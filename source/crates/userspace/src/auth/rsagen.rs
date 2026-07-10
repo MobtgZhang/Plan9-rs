@@ -92,7 +92,7 @@ impl RsagenOptions {
 // Implementation
 // ============================================================================
 
-fn generate_rsa_key(bits: usize, exponent: u32) -> Result<(String, String), &'static str> {
+pub fn generate_rsa_key(bits: usize, exponent: u32) -> Result<RsaKey, &'static str> {
     // Validate bit size
     if bits < 512 {
         return Err("Key size too small (minimum 512 bits)");
@@ -123,7 +123,7 @@ fn generate_rsa_key(bits: usize, exponent: u32) -> Result<(String, String), &'st
         bits, bits, exponent
     );
 
-    Ok((private_key, public_key))
+    Ok(RsaKey { n: private_key, ek: public_key, dk: String::new() })
 }
 
 pub fn run_rsagen(args: &[String]) -> i32 {
@@ -142,7 +142,7 @@ pub fn run_rsagen(args: &[String]) -> i32 {
     }
 
     match generate_rsa_key(opts.bits, opts.public_exponent) {
-        Ok((private_key, public_key)) => {
+        Ok(RsaKey { n: private_key, ek: public_key, dk: _private_dk }) => {
             // Output private key
             if let Some(ref output) = opts.output {
                 if opts.verbose {
@@ -201,4 +201,15 @@ pub fn main() {
     let args: Vec<String> = env::args().collect();
     let status = run_rsagen(&args);
     std::process::exit(status);
+}
+
+/// RSA key pair returned by [`generate_rsa_key`].
+#[derive(Debug, Clone)]
+pub struct RsaKey {
+    /// Modulus `n`, base64-decoded or PEM-encoded depending on use.
+    pub n: String,
+    /// Public exponent `ek`.
+    pub ek: String,
+    /// Private exponent `dk`.
+    pub dk: String,
 }

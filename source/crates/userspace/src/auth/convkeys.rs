@@ -126,7 +126,7 @@ fn convert_key(
     key_data: &str,
     from: &KeyFormat,
     to: &KeyFormat,
-    key_type: &str,
+    _key_type: &str,
 ) -> Result<String, &'static str> {
     if from == to {
         return Ok(key_data.to_string());

@@ -5,7 +5,7 @@
 use std::env;
 
 pub fn run_ps(args: &[String]) -> i32 {
-    let show_all = args.iter().any(|a| a == "-e" || a == "-A");
+    let _show_all = args.iter().any(|a| a == "-e" || a == "-A");
 
     println!("  PID TTY      TIME CMD");
     println!("{:>5} ??      00:00:00 ps", std::process::id());

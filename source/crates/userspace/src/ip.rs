@@ -2,8 +2,6 @@
 //!
 //! Implementation of the ip command for network configuration.
 
-use std::env;
-
 // ============================================================================
 // Options
 // ============================================================================
@@ -115,30 +113,38 @@ pub fn run_ip(args: &[String]) -> i32 {
 }
 
 fn show_links(opts: &IpOptions) {
-    println!("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000");
-    println!("    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00");
-    println!("2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP mode DEFAULT group default qlen 1000");
-    println!("    link/ether 52:54:00:12:34:56 brd ff:ff:ff:ff:ff:ff");
+    for iface in get_interfaces() {
+        println!(
+            "{}: {}: <{}> mtu {} state {}",
+            iface.name, iface.name, iface.state, iface.mtu, iface.state
+        );
+        println!("    link/ether {} brd ff:ff:ff:ff:ff:ff", iface.mac);
+        if opts.brief {
+            println!("    {}", iface.mac);
+        }
+    }
 }
 
 fn show_addresses(opts: &IpOptions) {
-    println!("1: lo inet 127.0.0.1/8 scope host lo valid_lft forever preferred_lft forever");
-    println!("2: eth0 inet 192.168.1.100/24 brd 192.168.1.255 scope global eth0 valid_lft forever preferred_lft forever");
+    for iface in get_interfaces() {
+        if let Some(ip) = &iface.ip {
+            if opts.brief {
+                println!("{} {}", iface.name, ip);
+            } else {
+                println!("{}: {} scope global {} valid_lft forever preferred_lft forever", iface.name, ip, iface.name);
+            }
+        }
+    }
 }
 
-fn show_routes(opts: &IpOptions) {
+fn show_routes(_opts: &IpOptions) {
     println!("default via 192.168.1.1 dev eth0 proto static");
     println!("192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.100");
     println!("127.0.0.0/8 dev lo proto kernel scope host src 127.0.0.1");
 }
 
-fn show_neighbours(opts: &IpOptions) {
+fn show_neighbours(_opts: &IpOptions) {
     println!("192.168.1.1 dev eth0 lladdr 00:11:22:33:44:55 REACHABLE");
     println!("192.168.1.100 dev eth0 lladdr 52:54:00:12:34:56 PERMANENT");
 }
 
-pub fn main() {
-    let args: Vec<String> = env::args().collect();
-    let status = run_ip(&args);
-    std::process::exit(status);
-}

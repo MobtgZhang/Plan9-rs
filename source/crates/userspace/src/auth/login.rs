@@ -73,7 +73,7 @@ impl LoginOptions {
 struct UserDatabase;
 
 impl UserDatabase {
-    fn check_password(user: &str, password: &str) -> bool {
+    fn check_password(_user: &str, password: &str) -> bool {
         // Simulated password check
         // In real implementation, this would check against a secure password database
         !password.is_empty()

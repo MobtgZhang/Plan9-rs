@@ -35,6 +35,8 @@ pub mod ping;
 pub mod netstat;
 pub mod nc;
 pub mod auth;
+// pub mod acme; // TODO: module not yet implemented
+// pub mod rio;  // TODO: module not yet implemented
 pub mod diff;
 pub mod awk;
 pub mod sed;

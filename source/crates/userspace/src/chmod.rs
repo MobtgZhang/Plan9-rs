@@ -37,7 +37,7 @@ impl ChmodOptions {
 
 /// Run chmod command
 pub fn run_chmod(args: &[String]) -> i32 {
-    let (opts, paths) = ChmodOptions::parse(args);
+    let (_opts, paths) = ChmodOptions::parse(args);
 
     if paths.len() < 2 {
         eprintln!("chmod: missing operand");

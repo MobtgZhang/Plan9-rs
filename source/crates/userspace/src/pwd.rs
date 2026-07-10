@@ -2,7 +2,6 @@
 //!
 //! Implementation of the pwd command.
 
-use std::env;
 
 pub fn run_pwd() -> i32 {
     match std::env::current_dir() {

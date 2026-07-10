@@ -122,7 +122,7 @@ impl AuthsrvOptions {
 // Authentication Functions
 // ============================================================================
 
-fn simulate_auth(user: &str, domain: &str) -> AuthResponse {
+fn simulate_auth(user: &str, _domain: &str) -> AuthResponse {
     if user.is_empty() {
         return AuthResponse {
             ok: false,

@@ -2,8 +2,7 @@
 //!
 //! This is a simplified implementation of the POSIX/Plan 9 sed utility.
 
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::Path;
+use std::io::{self, Write};
 use regex_lite::Regex;
 
 #[derive(Debug, Clone)]
@@ -131,9 +130,9 @@ impl Sed {
                 SedCommand::Substitute {
                     pattern,
                     replacement,
-                    global: flags.contains('g'),
-                    ignore_case: flags.contains('i'),
-                    print_on_match: flags.contains('p'),
+                    global: flags == 'g',
+                    ignore_case: flags == 'i',
+                    print_on_match: flags == 'p',
                 }
             }
             'd' => SedCommand::Delete,
@@ -300,7 +299,7 @@ impl Sed {
         Ok((pattern, replacement, flags, pos))
     }
     
-    fn parse_text_arg(script: &str, mut pos: usize) -> Result<String, usize> {
+    fn parse_text_arg(script: &str, mut pos: usize) -> Result<String, String> {
         let chars: Vec<char> = script.chars().collect();
         
         while pos < chars.len() && (chars[pos].is_whitespace() || chars[pos] == '\\' && pos + 1 < chars.len() && chars[pos + 1] == '\n') {
@@ -320,7 +319,7 @@ impl Sed {
         Ok(text)
     }
     
-    fn parse_filename(script: &str, mut pos: usize) -> Result<String, usize> {
+    fn parse_filename(script: &str, mut pos: usize) -> Result<String, String> {
         let chars: Vec<char> = script.chars().collect();
         
         while pos < chars.len() && (chars[pos].is_whitespace() || chars[pos] == '\\' && pos + 1 < chars.len() && chars[pos + 1] == '\n') {
@@ -415,7 +414,7 @@ impl Sed {
             return Err("Strings for y command must have the same length".to_string());
         }
         
-        let mapping: std::collections::HashMap<char, char> = from.chars()
+        let _mapping: std::collections::HashMap<char, char> = from.chars()
             .zip(to.chars())
             .collect();
         
@@ -443,7 +442,7 @@ impl Sed {
         Ok(output)
     }
     
-    fn process_line(&mut self, line: &str, output: &mut String, is_last: bool) -> Result<(), String> {
+    fn process_line(&mut self, line: &str, output: &mut String, _is_last: bool) -> Result<(), String> {
         let mut current_line = line.to_string();
         let mut line_deleted = false;
         let mut printed = false;
@@ -528,7 +527,14 @@ impl Sed {
 
 /// Run sed with the given script and input
 pub fn run_sed(script: &str, input: &str) -> Result<String, String> {
+    run_sed_with(script, input, false)
+}
+
+/// Run sed with the given script and input, optionally suppressing the
+/// automatic print of pattern space at end-of-cycle (the `-n` flag).
+pub fn run_sed_with(script: &str, input: &str, suppress_auto_print: bool) -> Result<String, String> {
     let mut sed = Sed::new();
+    sed.auto_print = !suppress_auto_print;
     sed.parse_script(script)?;
     sed.run(input)
 }
@@ -539,7 +545,7 @@ pub fn main_sed(args: &[String]) -> i32 {
     let mut input_file = None;
     let mut output_file = None;
     let mut suppress_auto_print = false;
-    let mut use_extended = false;
+    let _use_extended = false;
     
     let mut i = 1;
     while i < args.len() {
@@ -596,7 +602,7 @@ pub fn main_sed(args: &[String]) -> i32 {
         io::read_to_string(io::stdin()).unwrap_or_default()
     };
     
-    match run_sed(&script, &input) {
+    match run_sed_with(&script, &input, suppress_auto_print) {
         Ok(result) => {
             if let Some(ref filename) = output_file {
                 if let Err(e) = std::fs::write(filename, &result) {

@@ -112,7 +112,7 @@ fn show_unix_sockets(opts: &NetstatOptions) {
     println!("unix  1      [ ]         DGRAM      UNCONNECTED   12348   -                    /run/systemd/journal/dev-log");
 }
 
-fn show_routing_table(opts: &NetstatOptions) {
+fn show_routing_table(_opts: &NetstatOptions) {
     println!("\nKernel IP routing table");
     println!("Destination     Gateway         Genmask         Flags   MSS Window  irtt Iface");
     println!("0.0.0.0         192.168.1.1     0.0.0.0         UG        0 0          0 eth0");
@@ -120,7 +120,7 @@ fn show_routing_table(opts: &NetstatOptions) {
     println!("127.0.0.0       0.0.0.0         255.0.0.0       U         0 0          0 lo");
 }
 
-fn show_interface_stats(opts: &NetstatOptions) {
+fn show_interface_stats(_opts: &NetstatOptions) {
     println!("\nKernel Interface table");
     println!("Iface      MTU    RX-OK RX-ERR RX-DRP RX-OVR    TX-OK TX-ERR TX-DRP TX-OVR Flg");
     println!("lo       65536      100      0      0      0        100      0      0      0 BMRU");

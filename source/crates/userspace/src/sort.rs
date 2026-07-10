@@ -31,7 +31,7 @@ pub fn run_sort(args: &[String]) -> i32 {
 
     if paths.is_empty() || paths[0] == "-" {
         let stdin = io::stdin();
-        let mut reader = io::BufReader::new(stdin.lock());
+        let reader = io::BufReader::new(stdin.lock());
         lines = reader.lines().map_while(Result::ok).collect();
     } else {
         lines = Vec::new();

@@ -6,12 +6,10 @@ use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write};
 
-const BUFFER_SIZE: usize = 8192;
-
 pub fn run_dd(args: &[String]) -> i32 {
     let mut input_file = None;
     let mut output_file = None;
-    let mut block_size = 512;
+    let mut block_size: usize = 512;
     let mut count = None;
 
     let mut i = 1;
@@ -20,7 +18,7 @@ pub fn run_dd(args: &[String]) -> i32 {
             match key {
                 "if" => input_file = Some(value.to_string()),
                 "of" => output_file = Some(value.to_string()),
-                "bs" => { let _ = block_size = value.parse().unwrap_or(512); }
+                "bs" => { block_size = value.parse().unwrap_or(512); }
                 "count" => count = value.parse().ok(),
                 _ => {}
             }
@@ -54,7 +52,7 @@ pub fn run_dd(args: &[String]) -> i32 {
         Box::new(io::stdout())
     };
 
-    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut buffer = vec![0u8; block_size];
     let mut total_bytes = 0u64;
     let max_count = count.unwrap_or(usize::MAX);
     let mut blocks_read = 0usize;
