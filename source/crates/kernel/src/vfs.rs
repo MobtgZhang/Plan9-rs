@@ -9,6 +9,7 @@
 //! - Channel reference counting and management
 //! - Path parsing and walk operations
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use crate::dev::{self, DevTable, Chan, Qid, DirEntry, Error as DevError, devtype, qidtype, devs, Error as DevErrorEnum};
 use crate::proc::Fgrp;
@@ -48,8 +49,10 @@ pub struct MountPoint {
     pub flags: u32,
     /// Root channel for this mount
     pub root: Option<Chan>,
-    /// Next mount in list
-    pub next: Option<*const MountPoint>,
+    /// Next mount in list, stored as an index into the static
+    /// `MOUNTS` table rather than a raw pointer so the table is
+    /// `Send`/`Sync` without `unsafe impl`.
+    pub next: Option<usize>,
 }
 
 impl MountPoint {
@@ -140,6 +143,8 @@ pub enum NamecMode {
     Bind(u32),
     /// Unmount
     Unmount,
+    /// Remove file or directory
+    Remove,
 }
 
 /// Path starting point
@@ -624,6 +629,32 @@ pub fn sys_close(fd: i32) -> Result<(), VfsError> {
     Ok(())
 }
 
+/// Apply/remove an advisory lock on an open file.
+///
+/// `operation` follows the flock(2) encoding:
+///   LOCK_SH=1, LOCK_EX=2, LOCK_UN=8, LOCK_NB=4.
+///
+/// Plan 9 has no equivalent; we always report success because
+/// downstream syscalls assume locks are advisory. A future
+/// `9P.lock` extension can replace this stub.
+pub fn sys_flock(_fd: i32, _operation: i32) -> Result<(), VfsError> {
+    Ok(())
+}
+
+/// Create a symbolic link.
+///
+/// Plan 9 has no symbolic links; this returns `Enotsup`.
+pub fn symlink(_target: &[u8], _link: &[u8]) -> Result<(), VfsError> {
+    Err(VfsError::Enotsup)
+}
+
+/// Read a symbolic link target.
+///
+/// Plan 9 has no symbolic links; this returns `Enotsup`.
+pub fn readlink(_path: &[u8], _buf: &mut [u8]) -> Result<usize, VfsError> {
+    Err(VfsError::Enotsup)
+}
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -641,6 +672,8 @@ pub enum VfsError {
     Eisdir,
     Enotdir,
     Eexists,
+    Enametoolong,
+    Enotsup,
     Unknown,
 }
 
@@ -657,6 +690,8 @@ impl VfsError {
             VfsError::Eisdir => -9,
             VfsError::Enotdir => -8,
             VfsError::Eexists => -7,
+            VfsError::Enametoolong => -11,
+            VfsError::Enotsup => -13,
             VfsError::Unknown => -1,
         }
     }
@@ -708,7 +743,7 @@ pub struct MountTable {
 
 impl MountTable {
     /// Create new mount table
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             entries: [const { None }; NMOUNT],
             count: 0,
