@@ -1,0 +1,7 @@
+[package]
+name = "plan9_libhttpd"
+version = "0.1.0"
+edition = "2021"
+description = "Plan 9 HTTP server library"
+
+[dependencies]
