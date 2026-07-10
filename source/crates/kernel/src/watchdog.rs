@@ -6,7 +6,8 @@
 //! ## Reference
 //! - Plan 9: `/sys/src/9/port/devwd.c`, `/sys/src/9/pc/x86watchdog.c`
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicPtr, Ordering};
+use core::sync::atomic::{ AtomicBool, AtomicU64, Ordering };use alloc::boxed::Box;
+// use alloc::format;
 
 use crate::dev::{Chan, Qid, Error, devtype, qidtype, Dev, DirEntry};
 
@@ -142,7 +143,7 @@ fn watchdog_timeout() {
 
         // Log the timeout
         crate::debug::debug_puts("!!! WATCHDOG TIMEOUT !!!\n");
-        crate::debug::debug_printf("Timeout count: {}\n", status.timeout_count);
+        crate::debug_printf!("Timeout count: {}\n", status.timeout_count);
 
         // Try to recover by dumping debug info
         crate::debug::procdump();
@@ -230,7 +231,7 @@ impl Dev for WatchdogDev {
     fn read(&mut self, _ch: &mut Chan, buf: &mut [u8], _offset: u64) -> Result<usize, Error> {
         // Read watchdog status
         if let Some(status) = watchdog_status() {
-            let msg = format_args!(
+            let s = alloc::format!(
                 "enabled={} timeout={}ms last_pet={} timeouts={}\n",
                 status.enabled,
                 status.timeout_ms,
@@ -238,7 +239,6 @@ impl Dev for WatchdogDev {
                 status.timeout_count
             );
 
-            let s = core::fmt::format(msg);
             let n = s.len().min(buf.len());
             buf[..n].copy_from_slice(s.as_bytes());
             Ok(n)
@@ -271,16 +271,16 @@ impl Dev for WatchdogDev {
             }
             "reset" => {
                 // Reset the timeout count
-                if let Some(ref mut w) = *watchdog().lock() {
+                if let Some(ref mut _w) = *watchdog().lock() {
                     // This would need a reset method
                 }
                 Ok(buf.len())
             }
             _ => {
-                if let Some(ref mut w) = *watchdog().lock() {
+                if let Some(ref mut _w) = *watchdog().lock() {
                     if cmd.starts_with("timeout=") {
                         // Set timeout: "timeout=5000" (ms)
-                        if let Ok(ms) = cmd[8..].parse::<u32>() {
+                        if let Ok(_ms) = cmd[8..].parse::<u32>() {
                             // Would need set_timeout method
                             Ok(buf.len())
                         } else {

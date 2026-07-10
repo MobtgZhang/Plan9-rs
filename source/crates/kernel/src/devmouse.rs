@@ -1,3 +1,5 @@
+
+
 //! Mouse Device Implementation
 //!
 //! Implements the Plan 9 mouse device (#m) for mouse input.
@@ -15,9 +17,14 @@
 //! └── mousedata       (raw mouse packets)
 //! ```
 
-use crate::dev::{self, Dev, Chan, Qid, DirEntry, Error as DevError, qidtype};
+
+extern crate alloc;
+
+use crate::dev::{ self, Dev, Chan, Qid, DirEntry, Error as DevError };
 use crate::plan9_common::sync::Spinlock;
-use alloc::vec::Vec;
+// use alloc::vec::Vec;
+use alloc::format;
+use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Qid paths for mouse device
@@ -69,7 +76,7 @@ impl MouseDev {
     /// Enable the mouse
     pub fn enable(&self) {
         // Initialize the underlying mouse driver
-        if let Err(e) = crate::drivers::mouse::mouse_init() {
+        if let Err(e) = crate::plan9_drivers::mouse::mouse_init() {
             // Log error but continue
             let _ = e;
         }
@@ -95,7 +102,7 @@ impl Dev for MouseDev {
         Ok(Chan::new(
             dev::devtype::MOUSE,
             Qid::new(mouse_qid::QMOUSE, 0, 0),
-            0oOREAD,
+            0,
         ))
     }
 
@@ -157,7 +164,7 @@ impl Dev for MouseDev {
                 }
                 
                 // Try to get mouse event from driver
-                let mouse = crate::drivers::mouse::mouse();
+                let mouse = crate::plan9_drivers::mouse::mouse();
                 let state = self.state.lock();
                 
                 let (buttons, dx, dy) = if mouse.has_events() {
@@ -198,7 +205,7 @@ impl Dev for MouseDev {
             }
             mouse_qid::QDATA => {
                 // Read raw mouse packets
-                let mouse = crate::drivers::mouse::mouse();
+                let mouse = crate::plan9_drivers::mouse::mouse();
                 if mouse.has_events() {
                     if let Some(event) = mouse.get_event() {
                         let mut pos = 0;

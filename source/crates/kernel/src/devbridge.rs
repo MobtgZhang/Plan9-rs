@@ -1,3 +1,5 @@
+
+
 //! Bridge Device Implementation
 //!
 //! Implements the Plan 9 bridge device (#l) for Ethernet bridging.
@@ -20,11 +22,16 @@
 //!     └── status    (port status)
 //! ```
 
+
+extern crate alloc;
+
 use crate::dev::{self, Dev, Chan, Qid, DirEntry, Error as DevError, qidtype};
+
 use crate::plan9_common::sync::Spinlock;
 use alloc::vec::Vec;
+use alloc::format;
 use alloc::string::String;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
+use core::sync::atomic::{ AtomicU64, Ordering};
 
 /// Maximum number of bridges
 const BRIDGE_MAX_COUNT: usize = 4;
@@ -97,7 +104,7 @@ struct MacEntry {
 }
 
 /// Bridge statistics
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct BridgeStats {
     /// Frames received
     rx_frames: AtomicU64,
@@ -113,6 +120,20 @@ struct BridgeStats {
     forwarded: AtomicU64,
     /// CAM misses
     cam_miss: AtomicU64,
+}
+
+impl Clone for BridgeStats {
+    fn clone(&self) -> Self {
+        Self {
+            rx_frames: AtomicU64::new(self.rx_frames.load(Ordering::Relaxed)),
+            tx_frames: AtomicU64::new(self.tx_frames.load(Ordering::Relaxed)),
+            rx_bytes: AtomicU64::new(self.rx_bytes.load(Ordering::Relaxed)),
+            tx_bytes: AtomicU64::new(self.tx_bytes.load(Ordering::Relaxed)),
+            dropped: AtomicU64::new(self.dropped.load(Ordering::Relaxed)),
+            forwarded: AtomicU64::new(self.forwarded.load(Ordering::Relaxed)),
+            cam_miss: AtomicU64::new(self.cam_miss.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 /// Bridge port info
@@ -132,7 +153,7 @@ struct BridgePort {
 
 /// Bridge information
 #[derive(Debug, Clone)]
-struct BridgeInfo {
+pub struct BridgeInfo {
     /// Bridge number
     num: usize,
     /// Bridge name
@@ -176,7 +197,7 @@ impl BridgeDev {
         
         let info = BridgeInfo {
             num,
-            name: name.to_string(),
+            name: alloc::string::String::from(name),
             ports: Vec::new(),
             mac_cache: Vec::new(),
             stats: BridgeStats::default(),
@@ -237,7 +258,7 @@ impl Dev for BridgeDev {
         Ok(Chan::new(
             dev::devtype::BRIDGE,
             Qid::new(bridge_qid::QDIR, 0, qidtype::DIR),
-            0oOREAD,
+            0,
         ))
     }
 
@@ -324,7 +345,7 @@ impl Dev for BridgeDev {
                 let mut pos = 0;
                 let bridges = self.bridges.lock();
                 
-                for (i, bridge) in bridges.iter().enumerate() {
+                for (i, _bridge) in bridges.iter().enumerate() {
                     if pos >= offset as usize {
                         let entry = format!("bridge{}\n", i);
                         let entry_bytes = entry.as_bytes();
@@ -394,7 +415,7 @@ impl Dev for BridgeDev {
     }
 
     fn write(&mut self, ch: &mut Chan, buf: &[u8], _offset: u64) -> Result<usize, DevError> {
-        let qid = ch.qid.path;
+        let _qid =ch.qid.path;
         
         // Parse command
         let cmd = String::from_utf8_lossy(buf);
@@ -423,7 +444,7 @@ impl Dev for BridgeDev {
     fn stat(&mut self, ch: &mut Chan) -> Result<DirEntry, DevError> {
         let qid = ch.qid.path;
         
-        let (name, mode, qtype) = if qid == bridge_qid::QDIR {
+        let (name, mode, _qtype) = if qid == bridge_qid::QDIR {
             (b"bridge".to_vec(), 0o555 | 0o40000, qidtype::DIR)
         } else {
             (b"data".to_vec(), 0o666, 0)

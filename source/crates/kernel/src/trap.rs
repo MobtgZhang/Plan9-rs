@@ -6,10 +6,17 @@
 //! - System call handling
 //! - Page fault handling
 
-use crate::proc::{curproc, State, Proc};
-use crate::sched::{scheduler, sched_ticks};
-use crate::plan9_arch::x86_64::{cr2_read, cr3_read, cr3_write};
+use crate::proc::{ curproc, curproc_mut, Proc };use crate::sched::{scheduler, sched_ticks};
 use crate::fault::page_fault_handler as do_page_fault;
+
+/// Exec context for syscall return
+/// Entry point stored here, retrieved before sysret after exec
+#[no_mangle]
+static mut SYSCALL_EXEC_ENTRY: u64 = 0;
+
+/// Flag indicating exec context should be used for return
+#[no_mangle]
+static mut SYSCALL_USE_EXEC_CONTEXT: bool = false;
 
 // ============================================================================
 // Exception Frame
@@ -130,6 +137,7 @@ pub const NUM_VECTORS: usize = 256;
 
 /// IDT entry structure (8 bytes)
 #[repr(C, packed)]
+#[derive(Copy, Clone)]
 struct IdtEntry {
     /// Offset low 16 bits
     offset_low: u16,
@@ -149,7 +157,7 @@ struct IdtEntry {
 
 impl IdtEntry {
     /// Create a new IDT entry
-    fn new(offset: u64, selector: u16, ist: u8, attr: u8) -> Self {
+    const fn new(offset: u64, selector: u16, ist: u8, attr: u8) -> Self {
         Self {
             offset_low: offset as u16,
             selector,
@@ -202,7 +210,7 @@ type ExHandler = fn(&ExceptionFrame);
 /// Panic handler for unrecoverable exceptions
 fn panic_handler(frame: &ExceptionFrame) {
     // Print exception info
-    let exc = frame.error_code;
+    let _exc = frame.error_code;
     
     // Disable interrupts
     crate::plan9_arch::x86_64::cli();
@@ -291,9 +299,9 @@ fn timer_interrupt() {
     sched.timer_tick();
     
     // Update process time
-    if let Some(proc) = curproc() {
+    if let Some(proc) = curproc_mut() {
         proc.utime += 1;
-        
+
         // Check if we need to preempt
         if sched.should_preempt() && !proc.insyscall {
             // Set preempt flag
@@ -316,15 +324,17 @@ fn check_and_deliver_alarms() {
     
     // Check the global alarm handler if it exists
     // For now, we check the current process's alarm directly
-    if let Some(proc) = curproc() {
+    if let Some(proc) = curproc_mut() {
         // Check if current process's alarm has expired
         if proc.alarm.expired(current_ticks) {
             // Consume the alarm
             proc.alarm.consume();
-            
+
             // Post SIGALRM note to the process
-            // In Plan 9, alarm fires as a note with "alarm" message
-            proc.post_note(0, b"alarm\0".as_ptr() as u64);
+            // In Plan 9, alarm fires as a note with "alarm" message.
+            // We ignore the result since alarm delivery is fire-and-forget;
+            // a failure to enqueue the note is not fatal to the kernel.
+            let _ = proc.postnote(0, b"alarm\0");
         }
     }
 }
@@ -337,7 +347,11 @@ fn keyboard_interrupt() {
     // Send EOI if using PIC
     // pic_eoi(1); // IRQ1 for keyboard
     
-    // TODO: Add scancode to keyboard buffer
+    // The scancode would be added to a keyboard buffer here.
+    // In a full implementation, this would:
+    // 1. Read the scancode from the PS/2 keyboard controller
+    // 2. Convert it to a key code or character
+    // 3. Add it to a keyboard buffer for consumption by the keyboard driver
 }
 
 /// Spurious interrupt handler
@@ -364,9 +378,13 @@ fn syscall_handler(num: usize) -> i64 {
     // Set up process context
     if let Some(proc) = curproc() {
         unsafe {
-            let p = &mut *(proc as *const Proc as *mut Proc);
+            let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
             p.insyscall = true;
             p.nsyscall += 1;
+
+            // Clear any previous exec context
+            SYSCALL_USE_EXEC_CONTEXT = false;
+            SYSCALL_EXEC_ENTRY = 0;
         }
     }
 
@@ -393,18 +411,42 @@ fn syscall_handler(num: usize) -> i64 {
     // Dispatch to syscall handler in syscall.rs
     let result = crate::syscall::dispatch(num, &frame);
 
+    // Check if exec was successful (exec sets exec_context in the process)
+    if num == 1 {
+        // EXEC syscall
+        if let Some(proc) = curproc() {
+            unsafe {
+                let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
+                if p.has_exec_context() && result >= 0 {
+                    // Store exec entry point for assembly stub
+                    SYSCALL_EXEC_ENTRY = p.get_exec_entry();
+                    // Set flag to indicate we should return to exec context
+                    SYSCALL_USE_EXEC_CONTEXT = true;
+                    // Clear exec context in process
+                    p.clear_exec_context();
+                    // Return the entry point in RAX for the stub
+                    // Note: RAX is clobbered by the call, so we need to use the stub
+                    // The stub will read from SYSCALL_EXEC_ENTRY
+                }
+            }
+        }
+    }
+
     // Clear syscall context
     if let Some(proc) = curproc() {
         unsafe {
-            let p = &mut *(proc as *const Proc as *mut Proc);
+            let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
             p.insyscall = false;
         }
     }
 
-    match result {
-        Ok(n) => n as i64,
-        Err(e) => e.to_usize() as isize as i64,
-    }
+    result
+}
+
+/// Get whether to use exec context for syscall return
+#[inline]
+pub fn should_use_exec_context() -> bool {
+    unsafe { SYSCALL_USE_EXEC_CONTEXT }
 }
 
 // ============================================================================
@@ -431,7 +473,7 @@ pub fn init_idt() {
     }
     
     // Set up syscall entry (interrupt 0x80 / 128)
-    let syscall_addr = syscall_entry_stub as u64;
+    let syscall_addr = syscall_entry_stub as *const () as u64;
     let syscall_entry = IdtEntry::new(
         syscall_addr,
         code_sel,
@@ -445,7 +487,7 @@ pub fn init_idt() {
     // Load IDT
     let idtr = IdtReg {
         limit: (NUM_VECTORS * core::mem::size_of::<IdtEntry>() - 1) as u16,
-        base: unsafe { &IDT as *const _ as u64 },
+        base: (&raw const IDT) as *const _ as u64,
     };
     
     unsafe {
@@ -505,7 +547,9 @@ unsafe extern "C" fn syscall_entry_stub() {
             "and rsp, -16",
 
             // Get syscall number from stack
-            "mov rdi, [rbp + 7*8]",
+            // Stack (from rbp): r15, r14, r13, r12, rbx, rbp, arg5, arg4, arg3, arg2, arg1, arg0, syscall_num, rflags, rip
+            // syscall_num is at rbp + 96 = rbp + 12*8
+            "mov rdi, [rbp + 96]",
 
             // Call syscall handler
             "call syscall_handler",
@@ -513,6 +557,37 @@ unsafe extern "C" fn syscall_entry_stub() {
             // Restore stack pointer
             "mov rsp, rbp",
 
+            // Check if we should return to exec context
+            "mov rax, SYSCALL_USE_EXEC_CONTEXT",
+            "cmp byte ptr [rax], 0",
+            "jne 2f",
+
+            // Exec return path: clear flag and use exec entry point
+            "mov byte ptr [rax], 0",  // Clear flag
+            "mov r12, SYSCALL_EXEC_ENTRY",  // Load exec entry into r12
+
+            // Restore callee-saved registers
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",         // Restore original r12
+            "pop rbx",
+            "pop rbp",
+
+            // Skip saved args (syscall number + 6 args = 7)
+            "add rsp, 7*8",
+
+            // Pop user RFLAGS but discard it
+            "pop r11",
+            // Use exec entry point as new RIP
+            "mov rcx, r12",
+            // Use default RFLAGS for user mode (IF set)
+            "mov r11, 0x200",
+
+            // Return to user mode to exec'd program
+            "sysretq",
+
+            "2:",  // normal return label
             // Restore callee-saved registers
             "pop r15",
             "pop r14",

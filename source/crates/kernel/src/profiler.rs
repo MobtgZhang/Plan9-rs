@@ -7,9 +7,9 @@
 //! - Plan 9: `/sys/src/9/port/proc.c` (proftimer)
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use alloc::boxed::Box;
 
-use crate::proc::{Proc, Pid, curproc};
-use crate::dev::{Chan, Qid, Error, devtype, qidtype, Dev, DirEntry};
+use crate::proc::{ Pid, curproc };use crate::dev::{Chan, Qid, Error, devtype, qidtype, Dev, DirEntry};
 
 /// Maximum number of profiling samples
 pub const PROF_SAMPLES: usize = 4096;
@@ -114,7 +114,7 @@ impl Kprof {
 
     /// Record a sample
     /// Called from timer interrupt
-    pub fn sample(&self, pc: u64) {
+    pub fn sample(&mut self, pc: u64) {
         if !self.config.is_enabled() {
             return;
         }
@@ -194,10 +194,15 @@ pub fn kprof() -> &'static Kprof {
     unsafe { &*KPROF.load(Ordering::SeqCst) }
 }
 
+/// Get mutable global kernel profiler
+pub fn kprof_mut() -> &'static mut Kprof {
+    unsafe { &mut *KPROF.load(Ordering::SeqCst) }
+}
+
 /// Sample the current program counter
 /// Called from timer interrupt
 pub fn kprof_sample(pc: u64) {
-    kprof().sample(pc);
+    kprof_mut().sample(pc);
 }
 
 // ============================================================================
@@ -248,7 +253,7 @@ impl ProcProf {
     }
 
     /// Record a sample
-    pub fn sample(&self, pc: u64, pid: Pid) {
+    pub fn sample(&mut self, pc: u64, pid: Pid) {
         if !self.is_enabled() {
             return;
         }
@@ -404,12 +409,14 @@ impl Dev for ProfDev {
             Ok(5)
         } else if buf.starts_with(b"rate=") {
             // Parse rate: "rate=100"
-            if let Ok(rate) = core::str::from_utf8(&buf[5..])
-                .and_then(|s| s.trim_end_matches(|c| c == '\n' || c == '\r' || c == '\0'))
-                .parse::<u64>()
-            {
-                kprof().config().set_rate(rate);
-                Ok(buf.len())
+            if let Ok(rate_str) = core::str::from_utf8(&buf[5..]) {
+                let rate_str = rate_str.trim_end_matches(|c| c == '\n' || c == '\r' || c == '\0');
+                if let Ok(rate) = rate_str.parse::<u64>() {
+                    kprof().config().set_rate(rate);
+                    Ok(buf.len())
+                } else {
+                    Err(Error::Einval)
+                }
             } else {
                 Err(Error::Einval)
             }

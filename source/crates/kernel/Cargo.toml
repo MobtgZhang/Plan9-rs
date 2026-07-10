@@ -2,9 +2,27 @@
 name = "plan9-kernel"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 plan9-common = { path = "../common", features = ["alloc"] }
 plan9-arch = { path = "../arch" }
-plan9-drivers = { path = "../drivers" }
-bitflags = "2.4"
+plan9_drivers = { path = "../drivers" }
+plan9-net = { path = "../net" }
+plan9-ipc = { path = "../ipc" }
+plan9-servers = { path = "../servers" }
+spin = "0.9"
+bitflags = { version = "2.13.0", default-features = false }
+
+[build-dependencies]
+cc = "1"
+
+[[bin]]
+name = "plan9_kernel"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

@@ -147,7 +147,7 @@ impl NetFs {
         let id = self.alloc_id();
         let conv = TcpConnection {
             id,
-            local_addr: remote_ip, // placeholder
+            local_addr: [0, 0, 0, 0],
             remote_addr: remote_ip,
             local_port,
             remote_port,

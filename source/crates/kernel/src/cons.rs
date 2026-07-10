@@ -4,8 +4,7 @@
 
 use alloc::vec::Vec;
 use crate::dev::{Chan, Qid, Error, devtype, qidtype, Dev, DirEntry};
-use crate::plan9_common::sync::{Spinlock, Mutex};
-
+use crate::plan9_common::sync::{ Mutex };
 // ============================================================================
 // Console Device State
 // ============================================================================
@@ -28,8 +27,8 @@ impl ConsoleDev {
         Self {
             name: "cons",
             dev_char: 'c',
-            input: Spinlock::new(Vec::new()),
-            output: Spinlock::new(Vec::new()),
+            input: Mutex::new(Vec::new()),
+            output: Mutex::new(Vec::new()),
         }
     }
     
@@ -140,7 +139,7 @@ impl KbdDev {
         Self {
             name: "kbd",
             dev_char: 'k',
-            buffer: Spinlock::new(Vec::new()),
+            buffer: Mutex::new(Vec::new()),
             shift: false,
             caps_lock: false,
         }
@@ -252,6 +251,7 @@ impl Dev for KbdDev {
 // ============================================================================
 
 /// Serial port device
+#[cfg(target_arch = "x86_64")]
 pub struct SerialDev {
     /// Port I/O address
     port: u16,
@@ -259,6 +259,16 @@ pub struct SerialDev {
     name: &'static str,
 }
 
+/// Stub serial device for non-x86_64 architectures
+#[cfg(not(target_arch = "x86_64"))]
+pub struct SerialDev {
+    /// Port I/O address (unused on non-x86_64)
+    _port: u16,
+    /// Device name
+    name: &'static str,
+}
+
+#[cfg(target_arch = "x86_64")]
 impl SerialDev {
     /// Create a new serial device
     pub const fn new(port: u16) -> Self {
@@ -331,6 +341,33 @@ impl SerialDev {
     }
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+impl SerialDev {
+    /// Create a new serial device
+    pub const fn new(port: u16) -> Self {
+        Self {
+            _port: port,
+            name: if port == 0x3F8 { "com1" } else { "com2" },
+        }
+    }
+    
+    /// Initialize the serial port (stub for non-x86_64)
+    pub fn init(&self) {
+        // No serial port on non-x86_64 architectures
+    }
+    
+    /// Read a byte from the serial port (stub for non-x86_64)
+    pub fn read_byte(&self) -> Option<u8> {
+        None
+    }
+    
+    /// Write a byte to the serial port (stub for non-x86_64)
+    pub fn write_byte(&self, _byte: u8) {
+        // No serial port on non-x86_64 architectures
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 impl Dev for SerialDev {
     fn attach(&mut self, _spec: Option<&str>) -> Result<Chan, Error> {
         self.init();
@@ -363,7 +400,14 @@ impl Dev for SerialDev {
     }
 
     fn dev_char(&self) -> char {
-        if self.port == 0x3F8 { 'c' } else { 'c' }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.port == 0x3F8 { 'c' } else { 'c' }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            'c'
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -382,8 +426,10 @@ static CONSOLE: AtomicPtr<ConsoleDev> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Initialize the console
 pub fn init_console() {
-    let console = ConsoleDev::new();
-    CONSOLE.store(&console as *const ConsoleDev as *mut ConsoleDev, Ordering::SeqCst);
+    let mut console = ConsoleDev::new();
+    let console_ptr: *mut ConsoleDev = core::ptr::addr_of_mut!(console);
+    CONSOLE.store(console_ptr, Ordering::SeqCst);
+    core::mem::forget(console);
 }
 
 /// Print a single character to the console
@@ -392,7 +438,7 @@ pub fn putchar(c: u8) {
         if let Some(console) = CONSOLE.load(Ordering::SeqCst).as_ref() {
             // For now, just add to input buffer for reads
             // Real implementation would write to VGA/serial
-            let _ = console.write_byte(c);
+            console.output.lock().push(c);
         }
     }
 }
@@ -409,9 +455,11 @@ static SERIAL: AtomicPtr<SerialDev> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Initialize serial console
 pub fn init_serial() {
-    let serial = SerialDev::new(0x3F8); // COM1
+    let mut serial = SerialDev::new(0x3F8); // COM1
     serial.init();
-    SERIAL.store(&serial as *const SerialDev as *mut SerialDev, Ordering::SeqCst);
+    let serial_ptr: *mut SerialDev = core::ptr::addr_of_mut!(serial);
+    SERIAL.store(serial_ptr, Ordering::SeqCst);
+    core::mem::forget(serial);
 }
 
 /// Write a byte to serial port

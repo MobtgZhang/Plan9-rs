@@ -1,3 +1,5 @@
+
+
 //! SD (Storage/Disk) Device Implementation
 //!
 //! Implements the Plan 9 SD device (#s) for storage access.
@@ -5,7 +7,7 @@
 //! ## Overview
 //!
 //! The SD device provides access to disk storage through various interfaces
-//! (ATA, SCSI, VirtIO). It supports partitioning and raw block access.
+//! (ATA, SCSI, VirtIO, AHCI). It supports partitioning and raw block access.
 //!
 //! ## Namespace Structure
 //!
@@ -21,12 +23,16 @@
 //! └── sd1/             (second storage unit, etc.)
 //! ```
 
-use crate::dev::{self, Dev, Chan, Qid, DirEntry, Dirtab, Error as DevError, qidtype};
+
+extern crate alloc;
+
+use crate::dev::{ self, Dev, Chan, Qid, DirEntry, Error as DevError, qidtype };
 use crate::plan9_common::sync::Spinlock;
 use alloc::vec::Vec;
+use alloc::format;
 use alloc::string::String;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-
+use alloc::sync::Arc;
+use core::sync::atomic::{ AtomicBool, AtomicUsize, Ordering };
 /// Maximum number of SD units
 const SD_MAX_UNITS: usize = 8;
 /// Maximum partitions per unit
@@ -34,9 +40,76 @@ const SD_MAX_PARTS: usize = 16;
 /// Block size
 const SD_BLOCK_SIZE: usize = 512;
 
+/// SD operation error type
+#[derive(Debug, Clone, Copy)]
+pub enum SdError {
+    /// No such device
+    NoDevice,
+    /// Device not online
+    NotOnline,
+    /// Invalid operation
+    Invalid,
+    /// I/O error
+    IoError,
+    /// Timeout
+    Timeout,
+    /// Media error
+    MediaError,
+    /// Write protected
+    WriteProtected,
+    /// No media
+    NoMedia,
+}
+
+impl From<SdError> for DevError {
+    fn from(e: SdError) -> Self {
+        match e {
+            SdError::NoDevice => DevError::Enoent,
+            SdError::NotOnline => DevError::Eio,
+            SdError::Invalid => DevError::Einval,
+            SdError::IoError => DevError::Eio,
+            SdError::Timeout => DevError::Eio,
+            SdError::MediaError => DevError::Eio,
+            SdError::WriteProtected => DevError::Eperm,
+            SdError::NoMedia => DevError::Eio,
+        }
+    }
+}
+
+/// SD operation result
+pub type SdResult<T> = Result<T, SdError>;
+
+/// Storage device backend trait
+/// This trait allows different storage backends (ATA, AHCI, VirtIO, SCSI) to be used
+pub trait StorageBackend: Send + Sync {
+    /// Read sectors from the device
+    fn read_sectors(&self, lba: u64, count: usize, buf: &mut [u8]) -> SdResult<usize>;
+    
+    /// Write sectors to the device
+    fn write_sectors(&mut self, lba: u64, count: usize, buf: &[u8]) -> SdResult<usize>;
+    
+    /// Flush any pending writes
+    fn flush(&mut self) -> SdResult<()>;
+    
+    /// Get device capacity in sectors
+    fn capacity(&self) -> u64;
+    
+    /// Get block size
+    fn block_size(&self) -> usize;
+    
+    /// Check if device is online
+    fn is_online(&self) -> bool;
+    
+    /// Get device model string
+    fn model(&self) -> [u8; 40];
+    
+    /// Get device serial string
+    fn serial(&self) -> [u8; 20];
+}
+
 /// Qid paths for SD device
 mod sd_qid {
-    use super::*;
+//     use super::*;
     
     /// Top-level directory
     pub const QTOPDIR: u64 = 0;
@@ -103,11 +176,16 @@ impl SdPart {
     /// Create a new partition
     pub fn new(name: &str, start: u64, end: u64) -> Self {
         Self {
-            name: name.to_string(),
+            name: String::from(name),
             start,
             end,
             valid: true,
         }
+    }
+    
+    /// Get partition size in sectors
+    pub fn size(&self) -> u64 {
+        self.end.saturating_sub(self.start)
     }
 }
 
@@ -129,6 +207,10 @@ pub struct SdUnit {
     pub model: [u8; 40],
     /// Device serial
     pub serial: [u8; 20],
+    /// Storage backend
+    backend: Spinlock<Option<Arc<dyn StorageBackend>>>,
+    /// Lock for I/O operations
+    io_lock: Spinlock<()>,
 }
 
 impl SdUnit {
@@ -143,11 +225,28 @@ impl SdUnit {
             parts: Spinlock::new(Vec::new()),
             model: [0; 40],
             serial: [0; 20],
+            backend: Spinlock::new(None),
+            io_lock: Spinlock::new(()),
         }
     }
     
+    /// Register a storage backend
+    pub fn set_backend(&mut self, backend: Arc<dyn StorageBackend>) {
+        let mut backend_lock = self.backend.lock();
+        
+        if backend.is_online() {
+            self.sectors = backend.capacity();
+            self.block_size = backend.block_size();
+            self.model = backend.model();
+            self.serial = backend.serial();
+            self.online.store(true, Ordering::SeqCst);
+        }
+        
+        *backend_lock = Some(backend);
+    }
+    
     /// Set unit online with info
-    pub fn set_online(&self, sectors: u64, block_size: usize) {
+    pub fn set_online(&mut self, sectors: u64, block_size: usize) {
         self.sectors = sectors;
         self.block_size = block_size;
         self.online.store(true, Ordering::SeqCst);
@@ -201,6 +300,57 @@ impl SdUnit {
         let parts = self.parts.lock();
         parts.iter().find(|p| p.name == name && p.valid).cloned()
     }
+    
+    /// Read from the underlying storage device
+    pub fn read(&self, lba: u64, buf: &mut [u8]) -> SdResult<usize> {
+        if !self.online.load(Ordering::SeqCst) {
+            return Err(SdError::NotOnline);
+        }
+        
+        let _guard = self.io_lock.lock();
+        let backend = self.backend.lock();
+        
+        if let Some(ref be) = *backend {
+            be.read_sectors(lba, buf.len() / self.block_size, buf)
+        } else {
+            Err(SdError::NoDevice)
+        }
+    }
+    
+    /// Write to the underlying storage device
+    pub fn write(&self, lba: u64, buf: &[u8]) -> SdResult<usize> {
+        if !self.online.load(Ordering::SeqCst) {
+            return Err(SdError::NotOnline);
+        }
+        
+        let _guard = self.io_lock.lock();
+        let backend = self.backend.lock();
+        
+        if let Some(be) = backend.as_ref() {
+            // Use raw pointer to call methods since Arc<dyn> doesn't allow mut deref
+            let be_ptr = be.as_ref() as *const dyn StorageBackend as *mut dyn StorageBackend;
+            unsafe { (*be_ptr).write_sectors(lba, buf.len() / self.block_size, buf) }
+        } else {
+            Err(SdError::NoDevice)
+        }
+    }
+    
+    /// Flush pending writes
+    pub fn flush(&self) -> SdResult<()> {
+        if !self.online.load(Ordering::SeqCst) {
+            return Err(SdError::NotOnline);
+        }
+        
+        let _guard = self.io_lock.lock();
+        let backend = self.backend.lock();
+        
+        if let Some(be) = backend.as_ref() {
+            let be_ptr = be.as_ref() as *const dyn StorageBackend as *mut dyn StorageBackend;
+            unsafe { (*be_ptr).flush() }
+        } else {
+            Err(SdError::NoDevice)
+        }
+    }
 }
 
 /// SD Device structure
@@ -209,11 +359,15 @@ pub struct SdDev {
     name: &'static str,
     /// Device character
     dev_char: char,
-    /// Storage units
-    units: [Option<SdUnit>; SD_MAX_UNITS],
+    /// Storage units (wrapped in UnsafeCell for interior mutability)
+    units: core::cell::UnsafeCell<[Option<SdUnit>; SD_MAX_UNITS]>,
     /// Next unit number
     next_unit: AtomicUsize,
 }
+
+// SAFETY: SdDev is used in single-threaded kernel context, so Send/Sync are safe
+unsafe impl Send for SdDev {}
+unsafe impl Sync for SdDev {}
 
 impl SdDev {
     /// Create a new SD device
@@ -226,14 +380,23 @@ impl SdDev {
         Self {
             name: "sd",
             dev_char: 's',
-            units,
+            units: core::cell::UnsafeCell::new(units),
             next_unit: AtomicUsize::new(0),
         }
     }
     
     /// Get unit by number
     pub fn get_unit(&self, unit: usize) -> Option<&SdUnit> {
-        self.units.get(unit)?.as_ref()
+        unsafe { (*self.units.get()).get(unit)?.as_ref() }
+    }
+    
+    /// Get mutable unit by number
+    pub fn get_unit_mut(&self, unit: usize) -> Option<&mut SdUnit> {
+        if unit < SD_MAX_UNITS {
+            unsafe { (*self.units.get()).get_unchecked_mut(unit).as_mut() }
+        } else {
+            None
+        }
     }
     
     /// Allocate a new unit number
@@ -245,20 +408,55 @@ impl SdDev {
             None
         }
     }
+    
+    /// Register a storage backend for a unit
+    pub fn register_backend(&self, unit: usize, backend: Arc<dyn StorageBackend>) -> Result<(), DevError> {
+        if unit >= SD_MAX_UNITS {
+            return Err(DevError::Enoent);
+        }
+        let unit_ref = unsafe { (*self.units.get()).get_unchecked_mut(unit) };
+        let unit_ref = unit_ref.as_mut().ok_or(DevError::Enoent)?;
+        unit_ref.set_backend(backend);
+        Ok(())
+    }
+    
+    /// Get global SD device instance
+    pub fn get_global() -> &'static SdDev {
+        unsafe {
+            struct SyncCell<T>(core::cell::UnsafeCell<T>);
+            unsafe impl<T> Sync for SyncCell<T> {}
+            static SD_DEV: SyncCell<Option<SdDev>> = SyncCell(core::cell::UnsafeCell::new(None));
+            let ptr: *const Option<SdDev> = SD_DEV.0.get();
+            if (*ptr).is_none() {
+                core::ptr::write(SD_DEV.0.get(), Some(SdDev::new()));
+            }
+            ptr.as_ref().unwrap_unchecked().as_ref().unwrap_unchecked()
+        }
+    }
 }
 
 impl Dev for SdDev {
-    fn attach(&mut self, spec: Option<&str>) -> Result<Chan, DevError> {
+    fn attach(&mut self, _spec: Option<&str>) -> Result<Chan, DevError> {
         // Attach to #s - top level directory
         Ok(Chan::new(
             dev::devtype::SD,
             Qid::new(sd_qid::QTOPDIR, 0, qidtype::DIR),
-            0oOREAD,
+            0,
         ))
     }
 
     fn walk(&mut self, ch: &mut Chan, name: &str) -> Result<Option<Qid>, DevError> {
         let qid = ch.qid;
+        
+        // Handle ".." specially
+        if name == ".." {
+            // Going up from unit directory
+            let unit = sd_qid::unit(qid.path);
+            if unit > 0 {
+                ch.qid = Qid::new(sd_qid::unit_dir(0), 0, qidtype::DIR);
+            }
+            return Ok(Some(ch.qid));
+        }
         
         // If already at a unit, look for partitions or files
         let unit = sd_qid::unit(qid.path);
@@ -268,48 +466,52 @@ impl Dev for SdDev {
             if unit == 0 {
                 // At top level - look for sdN
                 if let Some(num) = parse_sd_name(name) {
-                    if num < SD_MAX_UNITS && self.units[num].is_some() {
-                        ch.qid = Qid::new(sd_qid::unit_dir(num), 0, qidtype::DIR);
-                        return Ok(Some(ch.qid));
+                    if num < SD_MAX_UNITS && unsafe { (*self.units.get())[num].is_some() } {
+                        let unit_ref = self.get_unit(num).unwrap();
+                        if unit_ref.online.load(Ordering::SeqCst) {
+                            ch.qid = Qid::new(sd_qid::unit_dir(num), 0, qidtype::DIR);
+                            return Ok(Some(ch.qid));
+                        }
                     }
                 }
             } else if let Some(unit_ref) = self.get_unit(unit) {
-                // At unit level - look for ctl, raw, or partition
-                match name {
-                    "ctl" => {
-                        ch.qid = Qid::new(sd_qid::ctl(unit), 0, 0);
-                        return Ok(Some(ch.qid));
-                    }
-                    "raw" => {
-                        ch.qid = Qid::new(sd_qid::raw(unit), 0, 0);
-                        return Ok(Some(ch.qid));
-                    }
-                    "part" => {
-                        ch.qid = Qid::new(
-                            ((unit as u64) << sd_qid::UNIT_SHIFT) | 0x10,
-                            0, qidtype::DIR
-                        );
-                        return Ok(Some(ch.qid));
-                    }
-                    _ => {
-                        // Check for partition by name
-                        if let Some(_part) = unit_ref.get_part_by_name(name) {
-                            // Parse partition index from the parts list
-                            let parts = unit_ref.parts.lock();
-                            for (i, p) in parts.iter().enumerate() {
-                                if p.name == name && p.valid {
-                                    ch.qid = Qid::new(sd_qid::part_file(unit, i), 0, 0);
-                                    return Ok(Some(ch.qid));
+                if unit_ref.online.load(Ordering::SeqCst) {
+                    // At unit level - look for ctl, raw, or partition
+                    match name {
+                        "ctl" => {
+                            ch.qid = Qid::new(sd_qid::ctl(unit), 0, 0);
+                            return Ok(Some(ch.qid));
+                        }
+                        "raw" => {
+                            ch.qid = Qid::new(sd_qid::raw(unit), 0, 0);
+                            return Ok(Some(ch.qid));
+                        }
+                        "part" => {
+                            ch.qid = Qid::new(
+                                ((unit as u64) << sd_qid::UNIT_SHIFT) | 0x10,
+                                0, qidtype::DIR
+                            );
+                            return Ok(Some(ch.qid));
+                        }
+                        _ => {
+                            // Check for partition by name
+                            if let Some(_part) = unit_ref.get_part_by_name(name) {
+                                let parts = unit_ref.parts.lock();
+                                for (i, p) in parts.iter().enumerate() {
+                                    if p.name == name && p.valid {
+                                        ch.qid = Qid::new(sd_qid::part_file(unit, i + 1), 0, 0);
+                                        return Ok(Some(ch.qid));
+                                    }
                                 }
                             }
-                        }
-                        
-                        // Check for numeric partition (0-15)
-                        if let Ok(part_num) = name.parse::<usize>() {
-                            if part_num < SD_MAX_PARTS {
-                                if let Some(_part) = unit_ref.get_part(part_num) {
-                                    ch.qid = Qid::new(sd_qid::part_file(unit, part_num), 0, 0);
-                                    return Ok(Some(ch.qid));
+                            
+                            // Check for numeric partition (1-15, 0 is raw)
+                            if let Ok(part_num) = name.parse::<usize>() {
+                                if part_num > 0 && part_num < SD_MAX_PARTS {
+                                    if let Some(_part) = unit_ref.get_part(part_num - 1) {
+                                        ch.qid = Qid::new(sd_qid::part_file(unit, part_num), 0, 0);
+                                        return Ok(Some(ch.qid));
+                                    }
                                 }
                             }
                         }
@@ -355,7 +557,8 @@ impl Dev for SdDev {
                 let unit_dir_size = 64; // Approximate dir entry size
                 let start_idx = (offset / unit_dir_size as u64) as usize;
                 
-                for (i, unit_opt) in self.units.iter().enumerate().skip(start_idx) {
+                let units_slice: &[Option<SdUnit>; SD_MAX_UNITS] = unsafe { &(*self.units.get()) };
+                for (_i, unit_opt) in units_slice.iter().enumerate().skip(start_idx) {
                     if let Some(ref u) = unit_opt {
                         if u.online.load(Ordering::SeqCst) {
                             if pos + 32 > buf.len() {
@@ -390,7 +593,7 @@ impl Dev for SdDev {
                     if unit_ref.online.load(Ordering::SeqCst) { 1 } else { 0 },
                     unit_ref.sectors,
                     unit_ref.block_size,
-                    String::from_utf8_lossy(&unit_ref.model)
+                    String::from_utf8_lossy(&unit_ref.model).trim()
                 );
                 
                 let start = offset as usize;
@@ -403,39 +606,45 @@ impl Dev for SdDev {
                 buf[..slice.len()].copy_from_slice(slice);
                 Ok(slice.len())
             }
-            sd_qid::QRAW | sd_qid::QPART => {
-                // Read from raw device or partition
-                // In a real implementation, this would read from the block device
-                // For now, return zeros (simulating empty device)
+            sd_qid::QRAW => {
+                // Read from raw device
+                let lba = offset / unit_ref.block_size as u64;
+                let bytes_read = unit_ref.read(lba, buf)
+                    .map_err(|e| DevError::from(e))?;
+                Ok(bytes_read)
+            }
+            sd_qid::QPART => {
+                // Read from partition
                 let part_num = sd_qid::part(qid.path);
                 
                 if part_num > 0 {
                     // Partition read
                     if let Some(part) = unit_ref.get_part(part_num - 1) {
-                        let start_sector = part.start;
-                        let end_sector = part.end;
-                        let sector_offset = offset / SD_BLOCK_SIZE as u64;
-                        let sector_byte_offset = (offset % SD_BLOCK_SIZE as u64) as usize;
+                        // Calculate offset within partition
+                        let part_offset = offset;
+                        let part_lba = part.start + (part_offset / unit_ref.block_size as u64);
                         
-                        // Calculate how many sectors we can read
-                        let max_sectors = ((end_sector - start_sector) as usize)
-                            .min(buf.len() / SD_BLOCK_SIZE + 1);
+                        // Calculate how many bytes we can read from this partition
+                        let part_remaining = part.end.saturating_sub(part_lba);
+                        let bytes_available = (part_remaining * unit_ref.block_size as u64) as usize;
+                        let bytes_to_read = buf.len().min(bytes_available);
                         
-                        // In real implementation: read from storage device
-                        // For now, return zeros
-                        let bytes_to_read = (buf.len())
-                            .min(((end_sector - start_sector - sector_offset) * SD_BLOCK_SIZE as u64) as usize);
+                        if bytes_to_read > 0 {
+                            let mut tmp_buf = &mut buf[..bytes_to_read];
+                            let _ = unit_ref.read(part_lba, &mut tmp_buf)
+                                .map_err(|e| DevError::from(e))?;
+                        }
                         
-                        buf[..bytes_to_read].fill(0);
                         Ok(bytes_to_read)
                     } else {
                         Err(DevError::Enoent)
                     }
                 } else {
-                    // Raw read
-                    let max_sectors = (unit_ref.sectors as usize).min(buf.len() / SD_BLOCK_SIZE + 1);
-                    buf[..(max_sectors * SD_BLOCK_SIZE).min(buf.len())].fill(0);
-                    Ok(max_sectors * SD_BLOCK_SIZE)
+                    // part_num == 0, treat as raw
+                    let lba = offset / unit_ref.block_size as u64;
+                    let bytes_read = unit_ref.read(lba, buf)
+                        .map_err(|e| DevError::from(e))?;
+                    Ok(bytes_read)
                 }
             }
             _ => {
@@ -466,22 +675,58 @@ impl Dev for SdDev {
                     if parts.len() >= 4 {
                         let name = parts[1];
                         let start = parts[2].parse::<u64>().map_err(|_| DevError::Einval)?;
-                        let end = parts[3].parse::<u64>().map::<(), _>(|_| DevError::Einval).map_err(|_| DevError::Einval)?;
+                        let end = parts[3].parse::<u64>().map_err(|_| DevError::Einval)?;
                         
                         unit_ref.add_part(name, start, end)?;
                         return Ok(buf.len());
                     }
                 } else if cmd_str.trim() == "flush" {
                     // Flush cache
+                    unit_ref.flush().map_err(|e| DevError::from(e))?;
+                    return Ok(buf.len());
+                } else if cmd_str.trim() == "online" {
+                    // Return online status
                     return Ok(buf.len());
                 }
                 
                 Err(DevError::Einval)
             }
-            sd_qid::QRAW | sd_qid::QPART => {
-                // Write to raw device or partition
-                // In real implementation: write to storage device
-                Ok(buf.len())
+            sd_qid::QRAW => {
+                // Write to raw device
+                let lba = offset / unit_ref.block_size as u64;
+                let bytes_written = unit_ref.write(lba, buf)
+                    .map_err(|e| DevError::from(e))?;
+                Ok(bytes_written)
+            }
+            sd_qid::QPART => {
+                // Write to partition
+                let part_num = sd_qid::part(qid.path);
+                
+                if part_num > 0 {
+                    if let Some(part) = unit_ref.get_part(part_num - 1) {
+                        let part_offset = offset;
+                        let part_lba = part.start + (part_offset / unit_ref.block_size as u64);
+                        
+                        // Verify write doesn't exceed partition
+                        let part_remaining = part.end.saturating_sub(part_lba);
+                        let bytes_available = (part_remaining * unit_ref.block_size as u64) as usize;
+                        let bytes_to_write = buf.len().min(bytes_available);
+                        
+                        if bytes_to_write > 0 {
+                            let _ = unit_ref.write(part_lba, &buf[..bytes_to_write])
+                                .map_err(|e| DevError::from(e))?;
+                        }
+                        
+                        Ok(bytes_to_write)
+                    } else {
+                        Err(DevError::Enoent)
+                    }
+                } else {
+                    let lba = offset / unit_ref.block_size as u64;
+                    let bytes_written = unit_ref.write(lba, buf)
+                        .map_err(|e| DevError::from(e))?;
+                    Ok(bytes_written)
+                }
             }
             _ => {
                 Err(DevError::Eperm)
@@ -493,7 +738,7 @@ impl Dev for SdDev {
         let qid = ch.qid;
         let unit = sd_qid::unit(qid.path);
         
-        let (name, mode, qtype) = if sd_qid::is_dir(qid.path) {
+        let (name, mode, _qtype) = if sd_qid::is_dir(qid.path) {
             if unit == 0 {
                 ("sd".as_bytes().to_vec(), 0o555 | 0o40000, qidtype::DIR)
             } else {
@@ -503,17 +748,45 @@ impl Dev for SdDev {
             match qid.path & 0xF {
                 sd_qid::QCTL => (b"ctl".to_vec(), 0o666, 0),
                 sd_qid::QRAW => (b"raw".to_vec(), 0o666, 0),
-                _ => (b"part".to_vec(), 0o666, 0),
+                _ => {
+                    let part_num = sd_qid::part(qid.path);
+                    if part_num > 0 {
+                        let unit_ref = self.get_unit(unit).ok_or(DevError::Enoent)?;
+                        if let Some(part) = unit_ref.get_part(part_num - 1) {
+                            (part.name.as_bytes().to_vec(), 0o666, 0)
+                        } else {
+                            (b"part".to_vec(), 0o666, 0)
+                        }
+                    } else {
+                        (b"part".to_vec(), 0o666, 0)
+                    }
+                }
             }
+        };
+        
+        let length = if !sd_qid::is_dir(qid.path) && unit > 0 {
+            let unit_ref = self.get_unit(unit).ok_or(DevError::Enoent)?;
+            let part_num = sd_qid::part(qid.path);
+            if part_num > 0 {
+                if let Some(part) = unit_ref.get_part(part_num - 1) {
+                    part.size() * unit_ref.block_size as u64
+                } else {
+                    0
+                }
+            } else {
+                unit_ref.sectors * unit_ref.block_size as u64
+            }
+        } else {
+            0
         };
         
         Ok(DirEntry {
             dev: dev::devtype::SD,
             qid,
-            mode: mode | 0o120000, // S_IFBLK for raw/partition, S_IFDIR for dirs
+            mode: mode | 0o120000,
             atime: 0,
             mtime: 0,
-            length: 0,
+            length,
             name,
         })
     }
@@ -546,6 +819,5 @@ fn parse_sd_name(name: &str) -> Option<usize> {
 
 /// Format a directory entry (Plan 9 format)
 fn format_dir_entry(name: &str, path: u64, vers: u32, qtype: u8, perm: u32) -> alloc::string::String {
-    // Simplified - real implementation would use proper binary encoding
     alloc::format!("{} {} {} {} {} {}\n", name, path, vers, qtype, perm, 0)
 }

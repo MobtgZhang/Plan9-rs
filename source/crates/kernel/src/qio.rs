@@ -94,7 +94,7 @@ impl Qiowq {
     /// Create a new work queue
     pub fn new() -> Self {
         Self {
-            lock: Spinlock::new(),
+            lock: Spinlock::new(()),
             dq: Vec::new(),
             q: Vec::new(),
             ndq: 0,

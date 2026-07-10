@@ -1,3 +1,4 @@
+
 //! Draw Device Implementation
 //!
 //! Implements the Plan 9 draw device (#d) for graphics context.
@@ -19,9 +20,12 @@
 //! └── screen           (screen information)
 //! ```
 
+extern crate alloc;
+
 use crate::dev::{self, Dev, Chan, Qid, DirEntry, Error as DevError, qidtype};
 use crate::plan9_common::sync::Spinlock;
 use alloc::vec::Vec;
+use alloc::format;
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -41,7 +45,7 @@ mod draw_qid {
 
 /// Draw context
 #[derive(Debug, Clone)]
-struct DrawContext {
+pub struct DrawContext {
     /// Context ID
     id: u64,
     /// Screen width
@@ -108,7 +112,7 @@ impl DrawDev {
             id,
             width,
             height,
-            format: format.to_string(),
+            format: alloc::string::String::from(format),
             needs_refresh: false,
         });
         id
@@ -126,7 +130,7 @@ impl DrawDev {
         screen.width = width;
         screen.height = height;
         screen.depth = depth;
-        screen.format = format.to_string();
+        screen.format = alloc::string::String::from(format);
         drop(screen);
         self.available.store(true, Ordering::SeqCst);
     }
@@ -137,7 +141,7 @@ impl Dev for DrawDev {
         Ok(Chan::new(
             dev::devtype::DRAW,
             Qid::new(draw_qid::QDIR, 0, qidtype::DIR),
-            0oOREAD,
+            0,
         ))
     }
 
@@ -283,7 +287,7 @@ impl Dev for DrawDev {
     fn stat(&mut self, ch: &mut Chan) -> Result<DirEntry, DevError> {
         let qid = ch.qid.path;
         
-        let (name, mode, qtype) = match qid {
+        let (name, mode, _qtype) = match qid {
             draw_qid::QDIR => (b"draw".to_vec(), 0o555 | 0o40000, qidtype::DIR),
             draw_qid::QSCREEN => (b"screen".to_vec(), 0o444, 0),
             draw_qid::QNEW => (b"new".to_vec(), 0o666, 0),

@@ -7,10 +7,10 @@
 //! - Plan 9: similar to various debugging facilities in `/sys/src/9/port/`
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::proc::{Proc, Pid, curproc};
-use crate::dev::{Chan, Qid, Error, devtype, qidtype, Dev, DirEntry};
+use crate::proc::{ Pid, curproc };use crate::dev::{Chan, Qid, Error, devtype, qidtype, Dev, DirEntry};
 
 /// Maximum number of trace records
 pub const SYSCALL_TRACE_SIZE: usize = 4096;
@@ -237,7 +237,7 @@ impl SyscallTracer {
     }
 
     /// Record a system call entry
-    pub fn enter(&self, syscall_num: usize) {
+    pub fn enter(&mut self, syscall_num: usize) {
         if !self.should_record(syscall_num) {
             return;
         }
@@ -247,7 +247,7 @@ impl SyscallTracer {
 
         // Get current process info
         let (pid, ppid) = curproc()
-            .map(|p| (p.pid, p.parent.map(|pp| pp.pid).unwrap_or(0)))
+            .map(|p| (p.pid, p.parent.unwrap_or(0)))
             .unwrap_or((0, 0));
 
         // Get current time (would use HPET/APIC timer in real impl)
@@ -273,7 +273,8 @@ impl SyscallTracer {
         // Go back one record to update it
         let idx = (self.next.load(Ordering::Relaxed) + SYSCALL_TRACE_SIZE - 1)
             % SYSCALL_TRACE_SIZE;
-        let record = &mut self.records[idx];
+        let records_ptr = self.records.as_ptr() as *mut SyscallRecord;
+        let record = unsafe { &mut *records_ptr.add(idx) };
 
         // Only update if this record matches
         if record.syscall == syscall_num && record.ret == 0 {
@@ -384,14 +385,19 @@ pub fn syscall_tracer() -> &'static SyscallTracer {
     unsafe { &*SYSCALL_TRACER.load(Ordering::SeqCst) }
 }
 
+/// Get mutable global tracer
+pub fn syscall_tracer_mut() -> &'static mut SyscallTracer {
+    unsafe { &mut *SYSCALL_TRACER.load(Ordering::SeqCst) }
+}
+
 /// Called on syscall entry
 pub fn syscall_trace_enter(syscall_num: usize) {
-    syscall_tracer().enter(syscall_num);
+    syscall_tracer_mut().enter(syscall_num);
 }
 
 /// Called on syscall exit
 pub fn syscall_trace_exit(syscall_num: usize, ret: isize) {
-    syscall_tracer().exit(syscall_num, ret);
+    syscall_tracer_mut().exit(syscall_num, ret);
 }
 
 // ============================================================================

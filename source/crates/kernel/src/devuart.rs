@@ -1,3 +1,5 @@
+
+
 //! UART Device Implementation
 //!
 //! Implements the Plan 9 UART device (#U) for serial communication.
@@ -18,12 +20,16 @@
 //! └── tty                (default TTY - console)
 //! ```
 
+
+extern crate alloc;
+
 use crate::dev::{self, Dev, Chan, Qid, DirEntry, Error as DevError, qidtype};
+
 use crate::plan9_common::sync::{Spinlock, Mutex};
 use alloc::vec::Vec;
+use alloc::format;
 use alloc::string::String;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-
+use core::sync::atomic::{ AtomicBool, Ordering };
 /// Maximum number of UART ports
 const UART_MAX_PORTS: usize = 4;
 
@@ -35,7 +41,8 @@ const UART_PORT_COM4: u16 = 0x2E8;
 
 /// UART registers (offset from base port)
 mod uart_reg {
-    pub const UART_RBR: u16 = 0;  // Receive Buffer (read), Transmit Hold (write)
+    pub const UART_RBR: u16 = 0;  // Receive Buffer (read)
+    pub const UART_THR: u16 = 0;  // Transmit Hold (write)
     pub const UART_IER: u16 = 1;  // Interrupt Enable
     pub const UART_IIR: u16 = 2;  // Interrupt Identification (read)
     pub const UART_FCR: u16 = 2;  // FIFO Control (write)
@@ -316,7 +323,7 @@ impl Dev for UartDev {
         Ok(Chan::new(
             dev::devtype::AUDIO,  // Use audio type since there's no specific UART type
             Qid::new(uart_qid::QDIR, 0, qidtype::DIR),
-            0oOREAD,
+            0,
         ))
     }
 
@@ -456,7 +463,7 @@ impl Dev for UartDev {
             if port == 0 {
                 ("eia".as_bytes().to_vec(), 0o555 | 0o40000)
             } else {
-                (format!("eia{}", port), 0o555 | 0o40000)
+                (format!("eia{}", port).into_bytes(), 0o555 | 0o40000)
             }
         } else {
             match file {

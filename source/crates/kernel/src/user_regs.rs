@@ -10,8 +10,11 @@
 //! - TCP retransmission timers
 //! - Periodic scheduling
 
-use crate::plan9_common::types::{VirtAddr, PhysAddr};
-use crate::plan9_common::sync::Spinlock;
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use crate::plan9_common::types::{ VirtAddr };use crate::plan9_common::sync::Spinlock;
 
 // ============================================================================
 // User Register Frame
@@ -96,7 +99,7 @@ impl Default for UserRegs {
 
 impl UserRegs {
     /// Create a new register frame for a new process
-    pub fn new_user_frame(entry: VirtAddr, stack_top: VirtAddr, args: &[u64]) -> Self {
+    pub fn new_user_frame(entry: VirtAddr, stack_top: VirtAddr, _args: &[u64]) -> Self {
         let mut regs = Self::default();
         
         // Set instruction pointer to entry point
@@ -166,19 +169,23 @@ pub struct Note {
 
 impl Default for Note {
     fn default() -> Self {
-        Self {
-            flag: 0,
-            pid: 0,
-            msg: 0,
-        }
+        Note::empty()
     }
 }
 
 impl Note {
     /// Create a new note
-    pub fn new(pid: u32, msg: u64, flag: u32) -> Self {
+    pub const fn new(pid: u32, msg: u64, flag: u32) -> Self {
         Self { flag, pid, msg }
     }
+
+    /// Create an empty (zeroed) note - const-compatible
+    pub const fn empty() -> Self {
+        Self { flag: 0, pid: 0, msg: 0 }
+    }
+
+    /// Segfault note flag
+    pub const SEGFAULT: Note = Note { flag: 1, pid: 0, msg: 0 };
 
     /// Check if note is empty
     pub fn is_empty(&self) -> bool {
@@ -202,10 +209,10 @@ pub mod note_flag {
 // ============================================================================
 
 /// Timer structure for process timers (alarm, sleep)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Timer {
     /// Next timer in list
-    pub next: Option<*mut Timer>,
+    pub next: Option<Box<Timer>>,
     /// When timer expires (in ticks)
     pub when: u64,
     /// Timer type
@@ -213,6 +220,11 @@ pub struct Timer {
     /// Timer argument
     pub arg: u64,
 }
+
+// SAFETY: Timer contains raw pointers but is designed to be shared between threads
+// in the kernel's timer management. Proper synchronization is done at the usage site.
+unsafe impl Send for Timer {}
+unsafe impl Sync for Timer {}
 
 impl Default for Timer {
     fn default() -> Self {
@@ -350,8 +362,9 @@ fn current_ticks() -> u64 {
 
 /// Insert a timer into the sorted timer list
 /// Timers are sorted by expiration time (earliest first)
-fn timer_insert(head: &mut Option<Box<Timer>>, new_timer: Box<Timer>) {
+fn timer_insert(head: &mut Option<Box<Timer>>, mut new_timer: Box<Timer>) {
     let when = new_timer.when;
+    new_timer.next = None;
 
     match head {
         None => {
@@ -361,7 +374,7 @@ fn timer_insert(head: &mut Option<Box<Timer>>, new_timer: Box<Timer>) {
         Some(head_box) => {
             if when < head_box.when {
                 // Insert before head
-                new_timer.next = Some(head_box.as_mut() as *mut Timer);
+                new_timer.next = head_box.next.take();
                 *head = Some(new_timer);
             } else {
                 // Insert in order
@@ -379,7 +392,7 @@ pub unsafe fn timerset(t: &mut Timer) {
     let mut list = TIMER_LIST.lock();
 
     // Take ownership of the timer
-    let mut timer_box = Box::new(core::ptr::read(t));
+    let timer_box = Box::new(core::ptr::read(t));
 
     timer_insert(&mut list, timer_box);
 }
@@ -410,11 +423,14 @@ fn timer_remove(list: &mut Option<Box<Timer>>, t: *const Timer) -> Option<Box<Ti
     match list {
         None => None,
         Some(ref mut head) => {
-            if let Some(ref mut next) = head.next {
-                if core::ptr::eq(next.as_ref() as *const Timer, t) {
+            if let Some(ref mut next_box) = head.next {
+                let next_ptr: *const Timer = &**next_box;
+                if core::ptr::eq(next_ptr, t) {
                     // Found it - remove from next
-                    let removed = head.next.take();
-                    head.next = removed.as_mut().and_then(|n| n.next.take());
+                    let mut removed = head.next.take();
+                    if let Some(ref mut n) = removed {
+                        head.next = n.next.take();
+                    }
                     return removed;
                 } else {
                     return timer_remove(&mut head.next, t);
@@ -454,14 +470,12 @@ pub fn timerintr() -> usize {
 
                     // Remove from current position
                     let mut timer = list.take().unwrap();
-                    let next = timer.next.take();
 
                     // Update when and reinsert
                     timer.when = next_time;
 
                     // Reinsert in correct position
-                    *list = next;
-                    timer_insert(list, timer);
+                    timer_insert(&mut *list, timer);
                 }
             }
 
@@ -504,11 +518,11 @@ impl TimerStats {
     pub fn get() -> Self {
         let list = TIMER_LIST.lock();
         let mut count = 0;
-        let mut curr = list.as_ref();
+        let mut curr: Option<&Box<Timer>> = list.as_ref();
 
         while let Some(t) = curr {
             count += 1;
-            curr = t.next.as_ref().map(|p| unsafe { &*p });
+            curr = t.next.as_ref();
         }
 
         Self {

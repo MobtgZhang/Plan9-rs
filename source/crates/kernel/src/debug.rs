@@ -11,8 +11,8 @@
 
 use crate::proc::{Proc, Pid, State, curproc, proctable};
 use crate::trap::ExceptionFrame;
-use crate::cons::{puts, putchar};
 
+use crate::{ debug_printf };
 // ============================================================================
 // Register Dumps
 // ============================================================================
@@ -20,43 +20,30 @@ use crate::cons::{puts, putchar};
 /// Dump all registers from an exception frame
 pub fn dump_regs(frame: &ExceptionFrame) {
     debug_puts("Registers:\n");
-    debug_printf("  RAX: {:016x}  RBX: {:016x}\n", frame.rip, frame.rbx);
-    debug_printf("  RCX: {:016x}  RDX: {:016x}\n", frame.rcx, frame.rdx);
-    debug_printf("  RSI: {:016x}  RDI: {:016x}\n", frame.rsi, frame.rdi);
-    debug_printf("  RBP: {:016x}  RSP: {:016x}\n", frame.rbp, frame.rsp);
-    debug_printf("  R8:  {:016x}  R9:  {:016x}\n", frame.r8, frame.r9);
-    debug_printf("  R10: {:016x}  R11: {:016x}\n", frame.r10, frame.r11);
-    debug_printf("  R12: {:016x}  R13: {:016x}\n", frame.r12, frame.r13);
-    debug_printf("  R14: {:016x}  R15: {:016x}\n", frame.r14, frame.r15);
-    debug_printf("  RIP: {:016x}  RFLAGS: {:016x}\n", frame.rip, frame.rflags);
-    debug_printf("  CS:  {:04x}     SS:  {:04x}\n", frame.cs as u16, frame.ss as u16);
+    debug_printf!("  RIP: {:016x}  RFLAGS: {:016x}\n", frame.rip, frame.rflags);
+    debug_printf!("  RSP: {:016x}\n", frame.rsp);
+    debug_printf!("  CS:  {:04x}     SS:  {:04x}\n", frame.cs as u16, frame.ss as u16);
+    debug_printf!("  Error Code: {:016x}\n", frame.error_code);
 }
 
 /// Dump general purpose registers only
 pub fn dump_gp_regs(frame: &ExceptionFrame) {
-    debug_puts("GP Registers:\n");
-    debug_printf("  RAX: {:016x}  RCX: {:016x}  RDX: {:016x}  RBX: {:016x}\n",
-        frame.rax, frame.rcx, frame.rdx, frame.rbx);
-    debug_printf("  RSP: {:016x}  RBP: {:016x}  RSI: {:016x}  RDI: {:016x}\n",
-        frame.rsp, frame.rbp, frame.rsi, frame.rdi);
-    debug_printf("  R8:  {:016x}  R9:  {:016x}  R10: {:016x}  R11: {:016x}\n",
-        frame.r8, frame.r9, frame.r10, frame.r11);
-    debug_printf("  R12: {:016x}  R13: {:016x}  R14: {:016x}  R15: {:016x}\n",
-        frame.r12, frame.r13, frame.r14, frame.r15);
+    debug_puts("GP Registers (limited in ExceptionFrame):\n");
+    debug_printf!("  RSP: {:016x}\n", frame.rsp);
 }
 
 /// Dump segment registers and control registers
 pub fn dump_control_regs() {
-    let cr0 = unsafe { crate::plan9_arch::x86_64::cr0_read() };
-    let cr2 = unsafe { crate::plan9_arch::x86_64::cr2_read() };
-    let cr3 = unsafe { crate::plan9_arch::x86_64::cr3_read() };
-    let cr4 = unsafe { crate::plan9_arch::x86_64::cr4_read() };
+    let cr0 = crate::plan9_arch::x86_64::cr0_read();
+    let cr2 = crate::plan9_arch::x86_64::cr2_read();
+    let cr3 = crate::plan9_arch::x86_64::cr3_read();
+    let cr4 = crate::plan9_arch::x86_64::cr4_read();
 
     debug_puts("Control Registers:\n");
-    debug_printf("  CR0: {:016x}\n", cr0);
-    debug_printf("  CR2: {:016x} (Page Fault Address)\n", cr2);
-    debug_printf("  CR3: {:016x} (Page Directory Base)\n", cr3);
-    debug_printf("  CR4: {:016x}\n", cr4);
+    debug_printf!("  CR0: {:016x}\n", cr0);
+    debug_printf!("  CR2: {:016x} (Page Fault Address)\n", cr2);
+    debug_printf!("  CR3: {:016x} (Page Directory Base)\n", cr3);
+    debug_printf!("  CR4: {:016x}\n", cr4);
 }
 
 /// Dump debug registers
@@ -102,9 +89,9 @@ pub fn dump_proc(proc: &Proc) {
         State::Stopped => "Stopped",
     };
 
-    let ppid = proc.parent.map(|p| p.pid).unwrap_or(0);
+    let ppid = proc.parent.unwrap_or(0);
 
-    debug_printf("{:4}  {:4}  {:13}  {:4}  {:5}  {:6}  {:016x}\n",
+    debug_printf!("{:4}  {:4}  {:13}  {:4}  {:5}  {:6}  {:016x}\n",
         proc.pid,
         ppid,
         state_str,
@@ -122,7 +109,7 @@ pub fn procdump_detailed(pid: Pid) {
     if let Some(proc) = table.get(pid) {
         dump_proc_detailed(proc);
     } else {
-        debug_printf("Process {} not found\n", pid);
+        debug_printf!("Process {} not found\n", pid);
     }
 }
 
@@ -141,33 +128,33 @@ pub fn dump_proc_detailed(proc: &Proc) {
         State::Stopped => "Stopped",
     };
 
-    let ppid = proc.parent.map(|p| p.pid).unwrap_or(0);
+    let ppid = proc.parent.unwrap_or(0);
 
     debug_puts("\n=== Process Detail ===\n");
-    debug_printf("PID:        {}\n", proc.pid);
-    debug_printf("Parent:     {}\n", ppid);
-    debug_printf("State:      {}\n", state_str);
-    debug_printf("Priority:   {}\n", proc.pri);
-    debug_printf("CPU:        {}\n", proc.cpu);
+    debug_printf!("PID:        {}\n", proc.pid);
+    debug_printf!("Parent:     {}\n", ppid);
+    debug_printf!("State:      {}\n", state_str);
+    debug_printf!("Priority:   {}\n", proc.pri);
+    debug_printf!("CPU:        {}\n", proc.cpu);
 
     debug_puts("\n--- Timing ---\n");
-    debug_printf("User Time:  {} ms\n", proc.utime);
-    debug_printf("Kernel Time: {} ms\n", proc.ktime);
-    debug_printf("Child Time: {} ms\n", proc.ctime);
-    debug_printf("Wall Time:  {} ms\n", proc.wtime);
+    debug_printf!("User Time:  {} ms\n", proc.utime);
+    debug_printf!("Kernel Time: {} ms\n", proc.ktime);
+    debug_printf!("Child Time: {} ms\n", proc.ctime);
+    debug_printf!("Wall Time:  {} ms\n", proc.wtime);
 
     debug_puts("\n--- Memory ---\n");
-    debug_printf("KStack:     {:016x}\n", proc.kstack as u64);
-    debug_printf("MMU PDB:    {:016x}\n", proc.mmupdb.as_u64());
+    debug_printf!("KStack:     {:016x}\n", proc.kstack as u64);
+    debug_printf!("MMU PDB:    {:016x}\n", proc.mmupdb.as_u64());
 
     debug_puts("\n--- Syscall ---\n");
-    debug_printf("In Syscall: {}\n", proc.insyscall);
-    debug_printf("Syscalls:   {}\n", proc.nsyscall);
+    debug_printf!("In Syscall: {}\n", proc.insyscall);
+    debug_printf!("Syscalls:   {}\n", proc.nsyscall);
 
     debug_puts("\n--- Scheduling ---\n");
-    debug_printf("Preempted:  {}\n", proc.preempted);
-    debug_printf("Children:    {}\n", proc.nchild);
-    debug_printf("Waiters:    {}\n", proc.nwait);
+    debug_printf!("Preempted:  {}\n", proc.preempted);
+    debug_printf!("Children:    {}\n", proc.nchild);
+    debug_printf!("Waiters:    {}\n", proc.nwait);
 
     debug_puts("=== End Process Detail ===\n\n");
 }
@@ -178,20 +165,20 @@ pub fn dump_proc_detailed(proc: &Proc) {
 
 /// Dump memory in hex and ASCII format (like hexdump -C)
 pub fn hexdump(addr: u64, len: usize) {
-    debug_printf("\n--- Memory at {:016x} ({} bytes) ---\n", addr, len);
+    debug_printf!("\n--- Memory at {:016x} ({} bytes) ---\n", addr, len);
 
     let mut offset = 0usize;
     while offset < len {
         let line_len = (len - offset).min(16);
 
         // Print offset
-        debug_printf("{:016x}  ", addr + offset as u64);
+        debug_printf!("{:016x}  ", addr + offset as u64);
 
         // Print hex bytes
         for i in 0..16 {
             if i < line_len {
-                let byte = unsafe { *(addr as *const u8).add(offset + i) };
-                debug_printf("{:02x} ", byte);
+                let byte = unsafe { *(addr as *const u64).add(offset + i) };
+                debug_printf!("{:02x} ", byte);
             } else {
                 debug_puts("   ");
             }
@@ -217,7 +204,7 @@ pub fn hexdump(addr: u64, len: usize) {
         offset += line_len;
     }
 
-    debug_printf("--- End Memory Dump ---\n\n");
+    debug_printf!("--- End Memory Dump ---\n\n");
 }
 
 /// Dump a specific memory range with virtual address translation
@@ -232,6 +219,7 @@ pub fn hexdump_virt(vaddr: u64, len: usize) {
 // ============================================================================
 
 /// Dump the current stack trace
+#[cfg(target_arch = "x86_64")]
 pub fn dump_stack() {
     debug_puts("\n=== Stack Trace ===\n");
 
@@ -246,7 +234,16 @@ pub fn dump_stack() {
     debug_puts("=== End Stack Trace ===\n\n");
 }
 
+/// Stub dump_stack for non-x86_64 architectures
+#[cfg(not(target_arch = "x86_64"))]
+pub fn dump_stack() {
+    debug_puts("\n=== Stack Trace ===\n");
+    debug_puts("  <not available on this architecture>\n");
+    debug_puts("=== End Stack Trace ===\n\n");
+}
+
 /// Dump stack frames from a given frame pointer
+#[cfg(target_arch = "x86_64")]
 pub fn dump_stack_frames(mut rbp: u64, max_frames: usize) {
     let mut frames = 0;
 
@@ -258,7 +255,7 @@ pub fn dump_stack_frames(mut rbp: u64, max_frames: usize) {
             break;
         }
 
-        debug_printf("  #{}  {:016x}\n", frames, ret_addr);
+        debug_printf!("  #{}  {:016x}\n", frames, ret_addr);
 
         // Move to next frame
         rbp = unsafe { *(rbp as *const u64) };
@@ -267,19 +264,23 @@ pub fn dump_stack_frames(mut rbp: u64, max_frames: usize) {
     }
 }
 
+/// Stub dump_stack_frames for non-x86_64 architectures
+#[cfg(not(target_arch = "x86_64"))]
+pub fn dump_stack_frames(_rbp: u64, _max_frames: usize) {
+    // Stack frame walking is architecture-specific
+}
+
 /// Dump stack for a specific process
 pub fn dump_proc_stack(proc: &Proc) {
     debug_puts("\n=== Process Stack ===\n");
-    debug_printf("PID:     {}\n", proc.pid);
-    debug_printf("KStack:  {:016x}\n", proc.kstack as u64);
+    debug_printf!("PID:     {}\n", proc.pid);
+    debug_printf!("KStack:  {:016x}\n", proc.kstack as u64);
 
     // Dump top of stack
     let stack_top = proc.kstack;
     let dump_size = 128.min(4096);  // Dump 128 or 4KB
 
-    unsafe {
-        hexdump(stack_top as u64, dump_size);
-    }
+    hexdump(stack_top as u64, dump_size);
 
     debug_puts("=== End Process Stack ===\n\n");
 }
@@ -291,13 +292,25 @@ pub fn dump_proc_stack(proc: &Proc) {
 /// Kernel panic handler
 pub fn kernel_panic(msg: &[u8]) {
     // Disable interrupts
-    unsafe {
-        crate::plan9_arch::x86_64::cli();
-    }
+    crate::plan9_arch::x86_64::cli();
 
     debug_puts("\n!!! KERNEL PANIC !!!\n");
     debug_puts("Message: ");
-    debug_puts(msg);
+    // Convert bytes to string if valid UTF-8
+    if let Ok(s) = core::str::from_utf8(msg) {
+        debug_putstr(s);
+    } else {
+        // Fallback: print as hex
+        debug_puts("<binary data: ");
+        for &b in msg.iter().take(32) {
+            debug_printf!("{:02x}", b);
+        }
+        if msg.len() > 32 {
+            debug_puts("...>");
+        } else {
+            debug_puts(">");
+        }
+    }
     debug_puts("\n\n");
 
     // Dump current process if any
@@ -318,16 +331,16 @@ pub fn kernel_panic(msg: &[u8]) {
 pub fn kernel_error(msg: &[u8]) {
     debug_puts("!!! KERNEL ERROR !!!\n");
     debug_puts("Message: ");
-    debug_puts(msg);
+    debug_putstr(core::str::from_utf8(msg).unwrap_or("<invalid utf8>"));
     debug_puts("\n");
 }
 
 /// Assert failed handler
 pub fn assert_failed(file: &str, line: u32, expr: &str) {
     debug_puts("\n!!! ASSERTION FAILED !!!\n");
-    debug_printf("File:    {}\n", file);
-    debug_printf("Line:    {}\n", line);
-    debug_printf("Expr:    {}\n", expr);
+    debug_printf!("File:    {}\n", file);
+    debug_printf!("Line:    {}\n", line);
+    debug_printf!("Expr:    {}\n", expr);
     kernel_panic(b"assertion failed");
 }
 
@@ -348,44 +361,63 @@ pub fn debug_putchar(c: u8) {
 }
 
 /// Simple puts without formatting
-pub fn debug_puts(s: &[u8]) {
-    for &c in s {
+pub fn debug_puts(s: &str) {
+    for &c in s.as_bytes() {
+        debug_putchar(c);
+    }
+}
+
+/// Simple puts for &str (alias)
+pub fn debug_putstr(s: &str) {
+    for &c in s.as_bytes() {
         debug_putchar(c);
     }
 }
 
 /// Simple formatted printf (limited support)
-pub fn debug_printf(format: &str, args: core::fmt::Arguments) {
+pub fn debug_printf_str(_format: &str, args: core::fmt::Arguments<'_>) {
     use core::fmt::Write;
 
     struct DebugWriter;
     impl Write for DebugWriter {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            debug_puts(s.as_bytes());
+            debug_puts(s);
             Ok(())
         }
     }
 
     let mut writer = DebugWriter;
-    let _ = write!(&mut writer, "{}", args);
+    let _ = write!(writer, "{}", args).map_err(|_| ());
 }
 
-/// Print debug message with location info
+/// Print debug message with newline
 #[macro_export]
 macro_rules! debugln {
+    ($($arg:tt)*) => {{
+        $crate::debug::debug_printf_str(stringify!($($arg)*), format_args!($($arg)*));
+    }};
+}
+
+/// Print debug message
+#[macro_export]
+macro_rules! debug_printf {
+    ($($arg:tt)*) => {{
+        $crate::debug::debug_printf_str(stringify!($($arg)*), format_args!($($arg)*));
+    }};
+}
+
+/// Alias for debugln macro
+#[macro_export]
+macro_rules! debug {
     ($($arg:tt)*) => {
-        debug_puts(concat!(file!(), ":", line!(), ": ").as_bytes());
-        debug_printf(format!($($arg)*), format_args!($($arg)*));
-        debug_puts(b"\n");
+        $crate::debugln!($($arg)*);
     };
 }
 
 /// Halt the system
 pub fn halt() -> ! {
     loop {
-        unsafe {
-            crate::plan9_arch::x86_64::hlt();
-        }
+        crate::plan9_arch::x86_64::hlt();
     }
 }
 

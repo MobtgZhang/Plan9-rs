@@ -3,15 +3,15 @@
 //! This module implements the page fault handler for demand paging,
 //! copy-on-write (COW), and stack expansion.
 
-use crate::proc::{curproc, Proc, State};
-use crate::plan9_arch::x86_64::paging::{PAGESIZE, PAGE_SHIFT, USER_VIRT_END, PteFlags};
-use crate::plan9_arch::x86_64::mmu::{
-    cr2_read, invlpg, is_user_addr, PageFaultError,
-};
-use crate::plan9_common::sync::Spinlock;
+use alloc::vec::Vec;
+use crate::proc::{curproc, Proc, State, SegType};
+use crate::plan9_arch::x86_64::paging::{ PAGESIZE, USER_VIRT_END, PteFlags, PT_ENTRIES };
+use crate::plan9_arch::x86_64::mmu::{cr2_read, invlpg, PageFaultError};
 use crate::plan9_common::types::PhysAddr;
 
 const PAGE_SIZE: u64 = PAGESIZE as u64;
+const PAGE_FRAME_MASK: u64 = 0x000_FFFF_FFFF_F000;
+const COW_PTE_BIT: u64 = 1 << 9;
 
 // ============================================================================
 // Page Fault Handler
@@ -28,7 +28,7 @@ pub fn page_fault_handler(frame: &crate::trap::ExceptionFrame) {
     
     // Get current process
     let proc_ptr = match curproc() {
-        Some(p) => p as *const Proc as *mut Proc,
+        Some(p) => core::ptr::addr_of!(*p) as *mut Proc,
         None => {
             // No current process - kernel page fault
             panic!(
@@ -54,7 +54,7 @@ pub fn page_fault_handler(frame: &crate::trap::ExceptionFrame) {
     // Validate fault address
     if fault_addr >= USER_VIRT_END {
         // Invalid user address
-        unsafe { kill_process(&*proc_ptr, "invalid address"); }
+        unsafe { kill_process(&mut *proc_ptr, "invalid address"); }
         return;
     }
 
@@ -104,10 +104,24 @@ impl FaultError {
 /// Handle a page fault for a process
 fn handle_page_fault(proc: &mut Proc, addr: u64, error: PageFaultError) -> Result<(), FaultError> {
     // Find the segment that contains this address (mutable for mapping)
-    let seg = match find_segment_mut(proc, addr) {
-        Some(s) => s,
-        None => return Err(FaultError::NoSegment),
+    // Use raw pointer to avoid borrow conflicts
+    let _seg_ptr: *mut ProcSegment = core::ptr::null_mut();
+    let seg_idx = proc.seg.iter().position(|opt_seg| {
+        if let Some(seg) = opt_seg {
+            addr >= seg.base && addr < seg.top
+        } else {
+            false
+        }
+    }).ok_or(FaultError::NoSegment)?;
+    
+    // Get pointer to the segment
+    let seg_ptr_raw = match proc.seg.get_mut(seg_idx) {
+        Some(Some(seg)) => core::ptr::addr_of_mut!(*seg),
+        _ => return Err(FaultError::NoSegment),
     };
+
+    // Now use the segment with immutable reference to proc
+    let seg = unsafe { &mut *seg_ptr_raw };
 
     // Check write permission for write faults
     if error.write() && !seg.perm().write() {
@@ -123,30 +137,47 @@ fn handle_page_fault(proc: &mut Proc, addr: u64, error: PageFaultError) -> Resul
 
     if pte == 0 {
         // Page doesn't exist - need to allocate
-        if seg.is_cow() || seg.segtype == crate::proc::SegType::Bss {
+        // Extract needed data before mutable borrow ends
+        let segtype = seg.segtype;
+        let is_cow = seg.is_cow();
+
+        if is_cow || segtype == crate::proc::SegType::Bss {
             // COW or BSS - allocate a new page
-            handle_cow_or_zero_page(proc, seg, addr, page_idx as usize)
-        } else if seg.segtype == crate::proc::SegType::Stack {
+            // Re-acquire mutable reference for the call
+            let seg_ptr = match proc.seg.get_mut(seg_idx) {
+                Some(Some(s)) => core::ptr::addr_of_mut!(*s),
+                _ => return Err(FaultError::NoSegment),
+            };
+            handle_cow_or_zero_page(proc, unsafe { &mut *seg_ptr }, addr, page_idx as usize)
+        } else if segtype == crate::proc::SegType::Stack {
             // Stack - expand the stack
-            handle_stack_expansion(proc, seg, addr)
+            let seg_ptr = match proc.seg.get_mut(seg_idx) {
+                Some(Some(s)) => core::ptr::addr_of_mut!(*s),
+                _ => return Err(FaultError::NoSegment),
+            };
+            handle_stack_expansion(proc, unsafe { &mut *seg_ptr }, addr)
         } else {
             // Text or data segment - should have been mapped
             Err(FaultError::NoSegment)
         }
-    } else {
-        // Page exists but wasn't present
-        if (pte & 1) != 0 {
-            // Page is present but wasn't accessible - shouldn't happen
-            Ok(())
+    } else if (pte & PteFlags::PRESENT.bits()) != 0 {
+        if error.write() && (pte & PteFlags::WRITABLE.bits()) == 0 {
+            let seg_ptr = match proc.seg.get_mut(seg_idx) {
+                Some(Some(s)) => core::ptr::addr_of_mut!(*s),
+                _ => return Err(FaultError::NoSegment),
+            };
+            handle_cow_or_zero_page(proc, unsafe { &mut *seg_ptr }, addr, page_idx as usize)
         } else {
-            // Page was paged out - need to page in
-            handle_swap_in(seg, addr, page_idx as usize)
+            Ok(())
         }
+    } else {
+        // Page was paged out - need to page in
+        handle_swap_in_page(seg, page_idx as usize)
     }
 }
 
 /// Find the segment containing a given address (mutable version)
-fn find_segment_mut(proc: &mut Proc, addr: u64) -> Option<&mut Segment> {
+fn find_segment_mut(proc: &mut Proc, addr: u64) -> Option<&mut ProcSegment> {
     for opt_seg in &mut proc.seg {
         if let Some(seg) = opt_seg {
             if addr >= seg.base && addr < seg.top {
@@ -160,7 +191,7 @@ fn find_segment_mut(proc: &mut Proc, addr: u64) -> Option<&mut Segment> {
 /// Handle COW (Copy-on-Write) or zero page allocation
 fn handle_cow_or_zero_page(
     _proc: &Proc,
-    seg: &mut Segment,
+    seg: &mut ProcSegment,
     addr: u64,
     page_idx: usize,
 ) -> Result<(), FaultError> {
@@ -173,13 +204,25 @@ fn handle_cow_or_zero_page(
             Some(f) => f,
             None => return Err(FaultError::OutOfMemory),
         };
-        seg.map_page(addr, frame, false);  // Zero page is read-only initially
+        let frame_idx = (frame.addr / PAGE_SIZE) as usize;
+        page_ref::init(frame_idx);
+        seg.map_page(addr, frame, false);
         return Ok(());
     }
     
-    // Page exists - check if it's a COW page
-    // In a real implementation, we would check refcount in the page frame
-    // For now, assume all pages are potentially shared
+    let is_cow_pte = (pte & COW_PTE_BIT) != 0;
+    if !is_cow_pte {
+        let frame_addr = pte & PAGE_FRAME_MASK;
+        seg.map_page(addr, PhysFrame::new(frame_addr), true);
+        return Ok(());
+    }
+    
+    let src_frame_addr = pte & PAGE_FRAME_MASK;
+    let src_frame_idx = (src_frame_addr / PAGE_SIZE) as usize;
+    if !page_ref::is_shared(src_frame_idx) {
+        seg.map_page(addr, PhysFrame::new(src_frame_addr), true);
+        return Ok(());
+    }
     
     // Allocate a new frame for copy
     let new_frame = match alloc_user_frame() {
@@ -187,18 +230,12 @@ fn handle_cow_or_zero_page(
         None => return Err(FaultError::OutOfMemory),
     };
     
-    // Get the source frame address from PTE
-    let src_frame_addr = pte & 0x000_FFFF_FFFF_F000;
-    
-    // Copy content from source frame to new frame
-    // In a real implementation, this would use memcpy
     copy_page_content(src_frame_addr, new_frame.addr)?;
-    
-    // Mark the new page as writable
-    let writable_frame = PhysFrame::new(new_frame.addr);
+    page_ref::decref(src_frame_idx);
+    page_ref::init((new_frame.addr / PAGE_SIZE) as usize);
     
     // Map the new frame with write permission
-    seg.map_page(addr, writable_frame, true);
+    seg.map_page(addr, new_frame, true);
     
     Ok(())
 }
@@ -235,38 +272,41 @@ fn copy_page_content(src: u64, dst: u64) -> Result<(), FaultError> {
 /// This is essential for COW page handling. Each physical frame
 /// tracks how many virtual mappings reference it.
 pub mod page_ref {
-    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use alloc::vec::Vec;
+    use crate::plan9_common::sync::Spinlock;
     
-    /// Maximum number of frames we can track
-    const MAX_FRAMES: usize = 65536;
+    /// Reference counts for physical frames, grown on demand.
+    static REF_COUNTS: Spinlock<Vec<u32>> = Spinlock::new(Vec::new());
     
-    /// Reference count array
-    static REF_COUNTS: [AtomicU32; MAX_FRAMES] = [const { AtomicU32::new(0) }; MAX_FRAMES];
-    
-    /// Global reference count lock (for atomic operations on frame indices)
-    static REF_LOCK: AtomicU64 = AtomicU64::new(0);
+    fn ensure_size(counts: &mut Vec<u32>, frame_idx: usize) {
+        if frame_idx >= counts.len() {
+            counts.resize(frame_idx + 1, 0);
+        }
+    }
     
     /// Increment reference count for a frame
     pub fn incref(frame_idx: usize) {
-        if frame_idx < MAX_FRAMES {
-            REF_COUNTS[frame_idx].fetch_add(1, Ordering::Relaxed);
-        }
+        let mut counts = REF_COUNTS.lock();
+        ensure_size(&mut counts, frame_idx);
+        counts[frame_idx] = counts[frame_idx].saturating_add(1);
     }
     
     /// Decrement reference count for a frame
     /// Returns the new reference count
     pub fn decref(frame_idx: usize) -> u32 {
-        if frame_idx < MAX_FRAMES {
-            REF_COUNTS[frame_idx].fetch_sub(1, Ordering::Relaxed)
-        } else {
-            0
+        let mut counts = REF_COUNTS.lock();
+        if frame_idx >= counts.len() {
+            return 0;
         }
+        counts[frame_idx] = counts[frame_idx].saturating_sub(1);
+        counts[frame_idx]
     }
     
     /// Get current reference count
     pub fn get_refcount(frame_idx: usize) -> u32 {
-        if frame_idx < MAX_FRAMES {
-            REF_COUNTS[frame_idx].load(Ordering::Relaxed)
+        let counts = REF_COUNTS.lock();
+        if frame_idx < counts.len() {
+            counts[frame_idx]
         } else {
             0
         }
@@ -279,9 +319,9 @@ pub mod page_ref {
     
     /// Initialize reference count for a new frame
     pub fn init(frame_idx: usize) {
-        if frame_idx < MAX_FRAMES {
-            REF_COUNTS[frame_idx].store(1, Ordering::Relaxed);
-        }
+        let mut counts = REF_COUNTS.lock();
+        ensure_size(&mut counts, frame_idx);
+        counts[frame_idx] = 1;
     }
 }
 
@@ -289,6 +329,12 @@ pub mod page_ref {
 /// 
 /// When a process forks, all its pages are marked as COW.
 /// This function sets up COW mappings for the child process.
+/// 
+/// For each writable page in the parent's segments:
+/// 1. Find the corresponding child segment
+/// 2. Copy the PTE (page table entry) to child's page table
+/// 3. Mark both pages as COW (read-only)
+/// 4. Increment reference count on the physical frame
 pub fn setup_cow_for_fork(child: &mut Proc, parent: &Proc) -> Result<(), FaultError> {
     // Walk through all segments in parent
     for (i, parent_seg) in parent.seg.iter().enumerate() {
@@ -297,15 +343,46 @@ pub fn setup_cow_for_fork(child: &mut Proc, parent: &Proc) -> Result<(), FaultEr
             if !seg.can_write() {
                 continue;
             }
-            
-            // For each page in the segment, mark it as COW
-            // This is a simplified version - real implementation would
-            // walk the page table and set COW flags
-            let _ = i;
-            let _ = seg;
+
+            // Find corresponding child segment
+            let child_seg = match child.seg.get_mut(i) {
+                Some(Some(cs)) => cs,
+                _ => continue,
+            };
+
+            // Walk through all pages in this segment
+            let page_count = seg.page_count();
+            // Collect PTEs first to avoid borrow conflict
+            let ptes: Vec<u64> = (0..page_count).map(|i| seg.get_pte(i)).collect();
+            for page_idx in 0..page_count {
+                let pte = ptes[page_idx as usize];
+
+                // Skip if page not present
+                if (pte & PteFlags::PRESENT.bits()) == 0 {
+                    continue;
+                }
+
+                let frame_addr = pte & PAGE_FRAME_MASK;
+
+                // Create a COW PTE: present, user, read-only, and marked with bit 9.
+                let flags = PteFlags::new((pte & 0xFFF) & !PteFlags::WRITABLE.bits())
+                    | PteFlags::PRESENT
+                    | PteFlags::USER;
+                let cow_pte = frame_addr | flags.bits() | COW_PTE_BIT;
+
+                // Set the COW PTE in child's page table (also COW)
+                child_seg.set_pte(page_idx, cow_pte);
+
+                // Increment reference count on the physical frame
+                let frame_idx = (frame_addr / PAGE_SIZE) as usize;
+                if page_ref::get_refcount(frame_idx) == 0 {
+                    page_ref::init(frame_idx);
+                }
+                page_ref::incref(frame_idx);
+            }
         }
     }
-    
+
     Ok(())
 }
 
@@ -334,8 +411,13 @@ pub fn handle_cow_write(
     }
     
     // Get frame address
-    let frame_addr = pte & 0x000_FFFF_FFFF_F000;
+    let frame_addr = pte & PAGE_FRAME_MASK;
     let frame_idx = (frame_addr / PAGE_SIZE) as usize;
+    
+    if (pte & COW_PTE_BIT) == 0 {
+        seg.map_page(addr, PhysFrame::new(frame_addr), true);
+        return Ok(());
+    }
     
     // Check if page is shared
     if page_ref::is_shared(frame_idx) {
@@ -350,14 +432,13 @@ pub fn handle_cow_write(
         
         // Decrement old frame refcount
         page_ref::decref(frame_idx);
+        page_ref::init((new_frame.addr / PAGE_SIZE) as usize);
         
-        // Update PTE with new frame (writable)
-        let new_pte = new_frame.addr | 0x07;  // Present, Writable, User
-        seg.set_pte(page_idx, new_pte);
+        // Update PTE with new frame (writable, not COW)
+        seg.map_page(addr, new_frame, true);
     } else {
-        // Page is private - just make it writable
-        let new_pte = pte | 0x02;  // Set Writable bit
-        seg.set_pte(page_idx, new_pte);
+        // Page is private - just make it writable and clear COW
+        seg.map_page(addr, PhysFrame::new(frame_addr), true);
     }
     
     Ok(())
@@ -366,13 +447,17 @@ pub fn handle_cow_write(
 /// Handle stack expansion
 fn handle_stack_expansion(
     _proc: &Proc,
-    seg: &Segment,
+    seg: &mut ProcSegment,
     addr: u64,
 ) -> Result<(), FaultError> {
     // Stack grows downward
+    let page_addr = addr & !(PAGE_SIZE - 1);
+    let page_end = page_addr.saturating_add(PAGE_SIZE);
+
     // Check if we're expanding into the guard page
     let guard_size = PAGE_SIZE * 4; // 4 pages of guard
-    if addr < seg.top - seg.size() as u64 - guard_size {
+    let lower_limit = seg.top.saturating_sub(seg.size() as u64).saturating_sub(guard_size);
+    if page_addr < lower_limit {
         return Err(FaultError::StackFault);
     }
 
@@ -381,12 +466,13 @@ fn handle_stack_expansion(
         Some(f) => f,
         None => return Err(FaultError::OutOfMemory),
     };
+    page_ref::init((frame.addr / PAGE_SIZE) as usize);
 
-    // Map the frame
-    seg.map_page(addr, frame, true);
-
-    // Update segment top if needed
-    // (In a real implementation, we'd track the actual growth)
+    // Map the frame and expand the segment limit if this fault extends it.
+    seg.map_page(page_addr, frame, true);
+    if page_end > seg.top {
+        seg.top = page_end;
+    }
 
     Ok(())
 }
@@ -397,8 +483,8 @@ fn handle_stack_expansion(
 /// been swapped out. The page's PTE should contain the swap offset
 /// in its high bits.
 fn handle_swap_in(
-    seg: &Segment,
-    addr: u64,
+    seg: &mut ProcSegment,
+    _addr: u64,
     page_idx: usize,
 ) -> Result<(), FaultError> {
     // Get the swap offset from the PTE
@@ -432,8 +518,15 @@ fn handle_swap_in(
     };
     
     // Read the page from swap
-    // TODO: Call swap device to read the page at swap_offset
-    // swap_device.read(swap_offset, frame.addr);
+    // Convert swap offset to byte offset
+    let swap_byte_offset = (swap_offset as usize) * 4096;
+    
+    // Perform the actual swap I/O
+    if let Err(_) = crate::swap::read_page_from_swap(frame.addr, swap_byte_offset) {
+        // I/O error - release the frame and return error
+        free_user_frame(frame);
+        return Err(FaultError::OutOfMemory);
+    }
     
     // Update the PTE with the new frame address
     // The page is now present, not in swap
@@ -448,28 +541,34 @@ fn handle_swap_in(
     seg.set_pte(page_idx, frame.addr | flags);
     
     // Free the swap slot
-    let swap_addr = swap_offset * 4096; // Convert back to byte offset
-    crate::swap::free_swap(swap_addr);
+    crate::swap::free_swap(swap_byte_offset as usize);
     
     // Update statistics
-    // swap_stats.swapped_in += 1;
+    crate::swap::swap_manager().stats();
     
     Ok(())
+}
+
+/// Handle swap-in when we already have the page_idx
+fn handle_swap_in_page(seg: &mut ProcSegment, page_idx: usize) -> Result<(), FaultError> {
+    // Redirect to the full function
+    handle_swap_in(seg, 0, page_idx)
 }
 
 // ============================================================================
 // Segment Extension (for page fault handling)
 // ============================================================================
 
-use crate::proc::Segment;
-use crate::proc::SegType;
+use crate::proc::ProcSegment;
+use crate::proc::SegType as ProcSegType;
+// use crate::segment::ProcSegmentPerm;
 
-/// Extension trait for Segment to support page fault handling
-impl Segment {
+/// Extension trait for ProcSegment to support page fault handling
+impl ProcSegment {
     /// Check if segment uses copy-on-write
     pub fn is_cow(&self) -> bool {
         // COW is typically used for data and BSS segments
-        matches!(self.segtype, SegType::Data | SegType::Bss)
+        matches!(self.segtype, ProcSegType::Data | ProcSegType::Bss)
     }
 
     /// Check if segment is readable
@@ -495,10 +594,10 @@ impl Segment {
     ///
     /// Updates both the segment's page_table and the process's actual page table.
     pub fn map_page(&mut self, addr: u64, frame: PhysFrame, writable: bool) {
-        use crate::plan9_arch::x86_64::mmu::{switch_page_table_safe, cr3_read};
+        
         use crate::plan9_arch::x86_64::paging::{
             phys_to_virt, PageTableIndices, PteFlags, PAGESIZE,
-            KERNEL_VIRT_BASE, PT_ENTRIES,
+//             KERNEL_VIRT_BASE, PT_ENTRIES,
         };
         use crate::proc::curproc;
 
@@ -636,8 +735,14 @@ fn alloc_user_frame() -> Option<PhysFrame> {
 fn free_user_frame(frame: PhysFrame) {
     use crate::vm::frame_allocator;
     use crate::plan9_common::types::PhysAddr;
+    
 
-    let _ = frame; // TODO: implement reference counting
+    // Reference counting would be implemented here:
+    // In a full implementation, frames would have a reference count
+    // and only be freed when count reaches zero
+    
+    // For now, just free the frame directly
+    let _ = frame;
     let _ = frame_allocator().free_frame(PhysAddr::new(frame.addr));
 }
 
@@ -646,19 +751,20 @@ fn free_user_frame(frame: PhysFrame) {
 // ============================================================================
 
 /// Kill a process with a signal
-fn kill_process(proc: &Proc, msg: &str) {
-    // TODO: Send SIGSEGV to the process
+fn kill_process(proc: &mut Proc, _msg: &str) {
+    // Send SIGSEGV to the process
     // This would:
     // 1. Set up the note with the error message
     // 2. If the process has a signal handler, jump to it
     // 3. Otherwise, terminate the process
     
-    // For now, just panic
-    panic!(
-        "Process {} killed: {}",
-        proc.pid,
-        msg
-    );
+    // Mark for termination
+    proc.state = State::Moribund;
+    
+    // Log for debugging. The kmesg call is cheap and helpful so we keep it
+    // in both debug and release builds; the call site is preserved as a
+    // single point that can later be moved behind a runtime toggle.
+    crate::kmesg::kmesg_puts(b"Process killed\n");
 }
 
 // ============================================================================
@@ -705,7 +811,7 @@ impl SegmentPerm {
     }
 }
 
-impl Segment {
+impl ProcSegment {
     /// Get segment permissions
     pub fn perm(&self) -> SegmentPerm {
         SegmentPerm::new(self.can_read(), self.can_write(), self.can_exec())

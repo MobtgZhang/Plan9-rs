@@ -1,3 +1,5 @@
+
+
 //! Audio Device Implementation
 //!
 //! Implements the Plan 9 audio device (#a) for audio playback and recording.
@@ -14,9 +16,14 @@
 //! └── volume          (volume control)
 //! ```
 
+
+extern crate alloc;
+
 use crate::dev::{self, Dev, Chan, Qid, DirEntry, Error as DevError};
+
 use crate::plan9_common::sync::Spinlock;
 use alloc::vec::Vec;
+use alloc::format;
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -63,7 +70,7 @@ impl AudioDev {
     
     /// Enable the audio device
     pub fn enable(&self) {
-        if let Err(e) = crate::drivers::audio::audio_init() {
+        if let Err(e) = crate::plan9_drivers::audio::audio_init() {
             let _ = e;
         }
         self.enabled.store(true, Ordering::SeqCst);
@@ -80,7 +87,7 @@ impl Dev for AudioDev {
         Ok(Chan::new(
             dev::devtype::AUDIO,
             Qid::new(audio_qid::QAUDIO, 0, 0),
-            0oORDWR,
+            0,
         ))
     }
 
@@ -130,7 +137,7 @@ impl Dev for AudioDev {
         }
         
         let qid = ch.qid.path;
-        let audio = crate::drivers::audio::audio();
+        let audio = crate::plan9_drivers::audio::audio();
         
         match qid {
             audio_qid::QAUDIO => {
@@ -173,7 +180,7 @@ impl Dev for AudioDev {
         }
         
         let qid = ch.qid.path;
-        let audio = crate::drivers::audio::audio();
+        let audio = crate::plan9_drivers::audio::audio();
         
         match qid {
             audio_qid::QAUDIO => {
@@ -223,8 +230,8 @@ impl Dev for AudioDev {
                     "rate" => {
                         if parts.len() >= 2 {
                             if let Ok(rate) = parts[1].parse::<u32>() {
-                                let mut config = audio.config();
-                                crate::drivers::audio::AudioConfig {
+                                let config = audio.config();
+                                crate::plan9_drivers::audio::AudioConfig {
                                     sample_rate: rate,
                                     channels: config.channels,
                                     format: config.format,

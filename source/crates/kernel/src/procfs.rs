@@ -8,8 +8,12 @@
 
 #![allow(dead_code)]
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+// use core::cell::UnsafeCell;
+use core::sync::atomic::{ AtomicI32, AtomicU32, AtomicUsize, Ordering };use crate::dev::{Chan, Qid, DirEntry, Error as DevError, devtype, qidtype, Dev};
+
+use alloc::boxed::Box;
+// use alloc::vec::Vec;
+// use alloc::string::String;
 
 // ============================================================================
 // Constants (from devproc.c)
@@ -215,6 +219,16 @@ struct ProcTableEntry {
     in_use: bool,
 }
 
+impl Clone for ProcTableEntry {
+    fn clone(&self) -> Self {
+        // Don't clone proc - for procfs we just reference the same data
+        Self {
+            proc: None, // Skip actual proc cloning for procfs
+            in_use: self.in_use,
+        }
+    }
+}
+
 /// Global process table
 struct ProcessTable {
     entries: [ProcTableEntry; MAXPROCS],
@@ -224,10 +238,20 @@ struct ProcessTable {
 
 impl ProcessTable {
     const fn new() -> Self {
-        let entries = [(); MAXPROCS].map(|_| ProcTableEntry {
-            proc: None,
-            in_use: false,
-        });
+        let entries = {
+            let mut arr: [ProcTableEntry; MAXPROCS] = unsafe {
+                core::mem::zeroed()
+            };
+            let mut i = 0;
+            while i < MAXPROCS {
+                arr[i] = ProcTableEntry {
+                    proc: None,
+                    in_use: false,
+                };
+                i += 1;
+            }
+            arr
+        };
         Self {
             entries,
             next_pid: AtomicI32::new(1),
@@ -241,7 +265,7 @@ impl ProcessTable {
     }
 
     /// Add a process to the table
-    fn add(&self, proc: Proc) -> Option<i32> {
+    fn add(&self, _proc: Proc) -> Option<i32> {
         for entry in &self.entries {
             if !entry.in_use {
                 // Can't modify in const context, will be initialized at runtime
@@ -290,7 +314,7 @@ static PROCESS_TABLE: ProcessTable = ProcessTable::new();
 /// Create a new process
 pub fn proc_create(pid: Option<i32>, _comm: &[u8]) -> Option<Proc> {
     let pid = pid.unwrap_or_else(|| PROCESS_TABLE.alloc_pid());
-    let mut proc = Proc::new(pid);
+    let proc = Proc::new(pid);
     // proc.set_comm(comm);
     Some(proc)
 }
@@ -377,4 +401,377 @@ pub fn proc_format_info(proc: &Proc) -> [u8; 256] {
     buf[offset] = b'\n';
     
     buf
+}
+
+// ============================================================================
+// ProcFS Device Implementation
+// ============================================================================
+
+/// ProcFS device state
+pub struct ProcFsDev {
+    /// Device character
+    dev_char: char,
+    /// Device name
+    name: &'static str,
+}
+
+impl ProcFsDev {
+    /// Create new ProcFS device
+    pub fn new() -> Self {
+        Self {
+            dev_char: 'p',
+            name: "proc",
+        }
+    }
+    
+    /// Get PID from channel
+    fn get_pid(ch: &Chan) -> Option<i32> {
+        let path = ch.qid.path;
+        if path == 0 {
+            None // Root directory
+        } else {
+            Some((path >> 8) as i32)
+        }
+    }
+    
+    /// Get file type from channel
+    fn get_ftype(ch: &Chan) -> ProcQid {
+        let path = ch.qid.path;
+        if path == 0 {
+            ProcQid::None // Root or top directory
+        } else {
+            let ftype = (path & 0xFF) as u8;
+            match ftype {
+                1 => ProcQid::Ctl,
+                2 => ProcQid::Note,
+                3 => ProcQid::Noteid,
+                4 => ProcQid::Status,
+                5 => ProcQid::Fd,
+                6 => ProcQid::FdDir,
+                7 => ProcQid::Memory,
+                8 => ProcQid::Profile,
+                9 => ProcQid::Regs,
+                10 => ProcQid::Fpregs,
+                _ => ProcQid::None,
+            }
+        }
+    }
+}
+
+impl Dev for ProcFsDev {
+    /// Attach to proc filesystem
+    fn attach(&mut self, _spec: Option<&str>) -> Result<Chan, DevError> {
+        // Return root channel
+        Ok(Chan::new(devtype::PROC, Qid::new(0, 0, qidtype::DIR), 0))
+    }
+    
+    /// Walk in proc filesystem
+    fn walk(&mut self, ch: &mut Chan, name: &str) -> Result<Option<Qid>, DevError> {
+//         use alloc::string::ToString;
+        
+        if name.is_empty() || name == "." {
+            return Ok(Some(ch.qid));
+        }
+        
+        if name == ".." {
+            // Return parent (root)
+            return Ok(Some(Qid::new(0, 0, qidtype::DIR)));
+        }
+        
+        // Try to find a process with this PID
+        if let Ok(pid) = name.parse::<i32>() {
+            if PROCESS_TABLE.get(pid).is_some() {
+                let path = proc_qid(pid, ProcQid::None);
+                return Ok(Some(Qid::new(path, 0, qidtype::DIR)));
+            }
+        }
+        
+        Err(DevError::Enoent)
+    }
+    
+    /// Open a proc file
+    fn open(&mut self, ch: &mut Chan, _mode: u8) -> Result<(), DevError> {
+        // Just verify the file exists
+        if ch.qid.path == 0 {
+            // Root directory - always ok
+            return Ok(());
+        }
+        
+        let pid = Self::get_pid(ch).ok_or(DevError::Enoent)?;
+        if PROCESS_TABLE.get(pid).is_none() {
+            return Err(DevError::Enoent);
+        }
+        
+        Ok(())
+    }
+    
+    /// Read from proc file
+    fn read(&mut self, ch: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, DevError> {
+        // Root directory listing
+        if ch.qid.path == 0 {
+            return Self::read_dir(ch, buf, offset);
+        }
+        
+        let pid = Self::get_pid(ch).ok_or(DevError::Enoent)?;
+        let ftype = Self::get_ftype(ch);
+        
+        match ftype {
+            ProcQid::None => {
+                // Process directory - list files
+                Self::read_proc_dir(pid, buf, offset)
+            }
+            ProcQid::Status => {
+                // Process status
+                Self::read_status(pid, buf, offset)
+            }
+            ProcQid::Ctl => {
+                // Control file (write-only usually)
+                Err(DevError::Eperm)
+            }
+            ProcQid::Note => {
+                // Notes (signals)
+                Err(DevError::Eperm)
+            }
+            ProcQid::Memory => {
+                // Process memory
+                Err(DevError::Eperm)
+            }
+            ProcQid::Regs => {
+                // Registers
+                Err(DevError::Eperm)
+            }
+            _ => Err(DevError::Enoent),
+        }
+    }
+    
+    /// Write to proc file
+    fn write(&mut self, ch: &mut Chan, buf: &[u8], _offset: u64) -> Result<usize, DevError> {
+        let pid = Self::get_pid(ch).ok_or(DevError::Enoent)?;
+        let ftype = Self::get_ftype(ch);
+        
+        match ftype {
+            ProcQid::Ctl => {
+                // Process control commands
+                Self::write_ctl(pid, buf)
+            }
+            ProcQid::Note => {
+                // Send note (signal) to process
+                Self::write_note(pid, buf)
+            }
+            _ => Err(DevError::Eperm),
+        }
+    }
+    
+    /// Get file status
+    fn stat(&mut self, ch: &mut Chan) -> Result<DirEntry, DevError> {
+        let name = if ch.qid.path == 0 {
+            "proc"
+        } else if let Some(pid) = Self::get_pid(ch) {
+            let ftype = Self::get_ftype(ch);
+            match ftype {
+                ProcQid::None => {
+                    // Process directory - return PID as name
+                    return Ok(DirEntry {
+                        dev: devtype::PROC,
+                        qid: ch.qid,
+                        mode: 0o0555 | (qidtype::DIR as u32),
+                        atime: 0,
+                        mtime: 0,
+                        length: 0,
+                        name: alloc::format!("{}", pid).into_bytes(),
+                    });
+                }
+                ProcQid::Status => "status",
+                ProcQid::Ctl => "ctl",
+                ProcQid::Note => "note",
+                ProcQid::Memory => "mem",
+                ProcQid::Regs => "regs",
+                _ => return Err(DevError::Enoent),
+            }
+        } else {
+            return Err(DevError::Enoent);
+        };
+        
+        let mode = if matches!(Self::get_ftype(ch), ProcQid::None) {
+            0o0555 | (qidtype::DIR as u32)
+        } else {
+            0o0666
+        };
+        
+        Ok(DirEntry {
+            dev: devtype::PROC,
+            qid: ch.qid,
+            mode,
+            atime: 0,
+            mtime: 0,
+            length: 0,
+            name: name.as_bytes().to_vec(),
+        })
+    }
+    
+    fn dev_char(&self) -> char { self.dev_char }
+    fn name(&self) -> &'static str { self.name }
+}
+
+// ProcFS device helper functions
+impl ProcFsDev {
+    /// Read directory listing
+    fn read_dir(_ch: &Chan, buf: &mut [u8], offset: u64) -> Result<usize, DevError> {
+        let mut total = 0;
+        let mut index = 0usize;
+        
+        // Skip entries based on offset
+        if offset > 0 {
+            index = offset as usize;
+        }
+        
+        // List all processes
+        for entry in &PROCESS_TABLE.entries {
+            if !entry.in_use {
+                continue;
+            }
+            
+            if index > 0 {
+                index -= 1;
+                continue;
+            }
+            
+            if let Some(ref proc) = entry.proc {
+                // Format: "PID STATE\n"
+                let entry_str = alloc::format!("{}\n", proc.pid);
+                let entry_bytes = entry_str.as_bytes();
+                
+                if total + entry_bytes.len() > buf.len() {
+                    break;
+                }
+                
+                buf[total..total + entry_bytes.len()].copy_from_slice(entry_bytes);
+                total += entry_bytes.len();
+            }
+        }
+        
+        Ok(total)
+    }
+    
+    /// Read process directory (list files in /proc/<pid>/)
+    fn read_proc_dir(pid: i32, buf: &mut [u8], offset: u64) -> Result<usize, DevError> {
+        let files = ["ctl", "status", "note", "mem", "regs", "fpregs"];
+        
+        let mut total = 0;
+        let mut index = (offset / 64) as usize;
+        let entry_size = 64;
+        
+        // Skip entries based on offset
+        if offset > 0 {
+            index = offset as usize;
+        }
+        
+        while index < files.len() && total + entry_size <= buf.len() {
+            let name = files[index];
+            let ftype = match name {
+                "ctl" => ProcQid::Ctl as u8,
+                "status" => ProcQid::Status as u8,
+                "note" => ProcQid::Note as u8,
+                "mem" => ProcQid::Memory as u8,
+                "regs" => ProcQid::Regs as u8,
+                "fpregs" => ProcQid::Fpregs as u8,
+                _ => 0,
+            };
+            
+            let path = proc_qid(pid, ProcQid::None) | (ftype as u64);
+            let _qid = Qid::new(path, 0, qidtype::FILE);
+            
+            // Format directory entry (simplified Stat format)
+            let entry_str = alloc::format!(
+                "{}          1 root root 0 {} M {} 0 0\n",
+                name,
+                0,
+                path
+            );
+            
+            let entry_bytes = entry_str.as_bytes();
+            let copy_len = entry_bytes.len().min(entry_size);
+            buf[total..total + copy_len].copy_from_slice(&entry_bytes[..copy_len]);
+            total += entry_size;
+            index += 1;
+        }
+        
+        Ok(total)
+    }
+    
+    /// Read process status
+    fn read_status(pid: i32, buf: &mut [u8], _offset: u64) -> Result<usize, DevError> {
+        let proc = PROCESS_TABLE.get(pid).ok_or(DevError::Enoent)?;
+        
+        let status_str = alloc::format!(
+            "PID\t{}\nState\t{}\n",
+            proc.pid,
+            proc.state.as_str()
+        );
+        
+        let status_bytes = status_str.as_bytes();
+        let copy_len = status_bytes.len().min(buf.len());
+        buf[..copy_len].copy_from_slice(&status_bytes[..copy_len]);
+        
+        Ok(copy_len)
+    }
+    
+    /// Write to control file
+    fn write_ctl(pid: i32, buf: &[u8]) -> Result<usize, DevError> {
+        // Parse control command
+        let cmd = core::str::from_utf8(buf)
+            .map_err(|_| DevError::Einval)?;
+        
+        let cmd = cmd.trim();
+        
+        match cmd {
+            "kill" => {
+                // Kill the process
+                if PROCESS_TABLE.remove(pid) {
+                    Ok(buf.len())
+                } else {
+                    Err(DevError::Enoent)
+                }
+            }
+            "stop" => {
+                // Stop the process
+                Ok(buf.len())
+            }
+            "start" => {
+                // Start/resume the process
+                Ok(buf.len())
+            }
+            _ => Err(DevError::Einval),
+        }
+    }
+    
+    /// Write note (signal) to process
+    fn write_note(_pid: i32, buf: &[u8]) -> Result<usize, DevError> {
+        // Notes are Plan 9's equivalent of signals
+        // For now, just acknowledge
+        let _note = core::str::from_utf8(buf)
+            .map_err(|_| DevError::Einval)?;
+        
+        Ok(buf.len())
+    }
+}
+
+// ============================================================================
+// Global ProcFS Device Instance
+// ============================================================================
+
+use core::sync::atomic::AtomicPtr;
+
+static PROCFS_DEVICE: AtomicPtr<ProcFsDev> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Initialize the ProcFS device
+pub fn init() {
+    let dev = Box::new(ProcFsDev::new());
+    let ptr = Box::into_raw(dev);
+    PROCFS_DEVICE.store(ptr, Ordering::SeqCst);
+}
+
+/// Get the ProcFS device
+pub fn procfs_device() -> &'static mut ProcFsDev {
+    unsafe { &mut *PROCFS_DEVICE.load(Ordering::SeqCst) }
 }

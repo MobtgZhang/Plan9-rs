@@ -6,7 +6,9 @@
 //! ## Reference
 //! - Plan 9: `/sys/src/9/pc/mpacpi.c`, `/sys/src/9/pc/acpi.c`
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{ AtomicPtr, Ordering };use alloc::boxed::Box;
+use alloc::vec::Vec;
+use alloc::format;
 
 use crate::dev::{Chan, Qid, Error, devtype, qidtype, Dev, DirEntry};
 
@@ -44,7 +46,7 @@ impl AcpiSdtHeader {
         let mut sum: u8 = 0;
         let data = unsafe {
             core::slice::from_raw_parts(
-                self as *const _ as *const u8,
+                self as *const AcpiSdtHeader as *const u8,
                 self.length as usize
             )
         };
@@ -299,7 +301,7 @@ impl Acpi {
     pub fn find_table(&self, signature: &[u8; 4]) -> Option<*const AcpiSdtHeader> {
         let tables = unsafe { &*self.tables.get() };
         for (header, _) in tables {
-            if unsafe { (*header).signature == *signature } {
+            if unsafe { (**header).signature == *signature } {
                 return Some(*header);
             }
         }
@@ -335,7 +337,7 @@ pub fn init_acpi(rsdp_address: u64) -> Result<(), &'static str> {
 
     // Parse RSDT/XSDT to find FADT
     if let Some(fadt) = find_table::<Fadt>(rsdp.sdt_address(), b"FACP") {
-        acpi.info.fadt_address = fadt as u64;
+        acpi.info.fadt_address = fadt as *const Fadt as u64;
         acpi.info.dsdt_address = fadt.dsdt as u64;
         acpi.info.sci_interrupt = fadt.sci_interrupt;
         acpi.info.smi_command = fadt.smi_command;
@@ -366,7 +368,7 @@ fn parse_sdt(sdt_address: u64, acpi: &mut Acpi) {
     let num_entries = (header.length as usize - core::mem::size_of::<AcpiSdtHeader>()) / entry_size;
 
     // Parse each entry
-    let entries_base = (sdt_address as *const u8).add(core::mem::size_of::<AcpiSdtHeader>());
+    let entries_base = unsafe { (sdt_address as *const AcpiSdtHeader as *const u8).add(core::mem::size_of::<AcpiSdtHeader>()) };
 
     for i in 0..num_entries {
         let entry_addr = if entry_size == 8 {
@@ -391,7 +393,7 @@ fn find_table<T>(sdt_address: u64, signature: &[u8; 4]) -> Option<&'static T> {
     let entry_size = if header.length >= 8 { 8 } else { 4 };
     let num_entries = (header.length as usize - core::mem::size_of::<AcpiSdtHeader>()) / entry_size;
 
-    let entries_base = (sdt_address as *const u8).add(core::mem::size_of::<AcpiSdtHeader>());
+    let entries_base = unsafe { (sdt_address as *const AcpiSdtHeader as *const u8).add(core::mem::size_of::<AcpiSdtHeader>()) };
 
     for i in 0..num_entries {
         let entry_addr = if entry_size == 8 {
@@ -514,7 +516,7 @@ impl Dev for AcpiDev {
     fn read(&mut self, _ch: &mut Chan, buf: &mut [u8], _offset: u64) -> Result<usize, Error> {
         let info = acpi().info();
 
-        let msg = format_args!(
+        let s = format!(
             "ACPI available: {}\n\
              RSDP: {:#018x}\n\
              Version: {}\n\
@@ -535,7 +537,6 @@ impl Dev for AcpiDev {
             info.pm1b_cnt,
         );
 
-        let s = core::fmt::format(msg);
         let n = s.len().min(buf.len());
         buf[..n].copy_from_slice(s.as_bytes());
         Ok(n)
@@ -548,8 +549,10 @@ impl Dev for AcpiDev {
 
         if cmd == "shutdown" {
             acpi_shutdown();
+            Ok(buf.len())
         } else if cmd == "reset" {
             acpi_reset();
+            Ok(buf.len())
         } else if cmd.starts_with("sstate=") {
             if let Ok(state) = cmd[7..].parse::<u8>() {
                 if let Some(s) = AcpiPowerState::from_u8(state) {
@@ -567,7 +570,7 @@ impl Dev for AcpiDev {
     }
 
     fn stat(&mut self, _ch: &mut Chan) -> Result<DirEntry, Error> {
-        let info = acpi().info();
+        let _info =acpi().info();
         Ok(DirEntry {
             dev: devtype::NONE,
             qid: Qid::new(0, 0, qidtype::NONE),

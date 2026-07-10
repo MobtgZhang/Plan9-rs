@@ -1,3 +1,5 @@
+
+
 //! Device Driver Framework
 //!
 //! Implements the Plan 9 device driver framework including:
@@ -15,10 +17,23 @@
 //! - read/write: Data transfer
 //! - stat/wstat: Metadata operations
 
+extern crate alloc;
+
 use alloc::vec::Vec;
-use alloc::string::String;
+use alloc::vec;
+// use alloc::string::String;
 use alloc::boxed::Box;
 use crate::plan9_common::sync::{Spinlock, Mutex};
+
+// Spinlock is generic over its data; in this file we use Spinlock<()> as a
+// stateless "owned" lock.
+type ConsoleLock = Spinlock<()>;
+
+// Re-export Qid from chan module for use throughout the kernel
+pub use crate::chan::Qid;
+
+// Import block module for Block type
+use crate::block::{Block, allocb};
 
 // ============================================================================
 // Device Constants
@@ -57,31 +72,8 @@ pub mod devtype {
 }
 
 // ============================================================================
-// Qid - File Identifier
+// Qid type flags (re-exported from chan module for convenience)
 // ============================================================================
-
-/// Qid - unique file identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Qid {
-    /// Path (unique number)
-    pub path: u64,
-    /// Version
-    pub vers: u32,
-    /// Type (directory, file, etc.)
-    pub type_: u8,
-}
-
-impl Qid {
-    /// Create new Qid
-    pub fn new(path: u64, vers: u32, type_: u8) -> Self {
-        Self { path, vers, type_ }
-    }
-
-    /// Empty Qid
-    pub fn empty() -> Self {
-        Self { path: 0, vers: 0, type_: 0 }
-    }
-}
 
 /// Qid type flags
 pub mod qidtype {
@@ -92,9 +84,9 @@ pub mod qidtype {
     pub const MOUNT: u8 = 0x10;   // mounted channel
     pub const AUTH: u8 = 0x08;    // authentication file
     pub const TMP: u8 = 0x04;     // temporary file
-    pub const LINK: u8 = 0x02;    // symbolic link
-    pub const FILE: u8 = 0x00;    // regular file
-    pub const DIR: u8 = 0x80;    // directory
+    pub const LINK: u8 = 0x02;     // symbolic link
+    pub const FILE: u8 = 0x00;     // regular file
+    pub const DIR: u8 = 0x80;     // directory
 }
 
 // ============================================================================
@@ -102,7 +94,6 @@ pub mod qidtype {
 // ============================================================================
 
 /// Channel - represents an open file or device
-#[derive(Debug)]
 pub struct Chan {
     /// Device type
     pub dev: usize,
@@ -116,8 +107,23 @@ pub struct Chan {
     pub offset: u64,
     /// Device-specific data
     pub aux: Option<Box<dyn Send + Sync>>,
-    /// Reference count
-    refcount: Mutex<u32>,
+    /// Reference count (made pub for internal cloning)
+    pub refcount: Mutex<u32>,
+}
+
+impl Clone for Chan {
+    fn clone(&self) -> Self {
+        self.incref();
+        Self {
+            dev: self.dev,
+            qid: self.qid,
+            mode: self.mode,
+            flag: self.flag,
+            offset: self.offset,
+            aux: None,
+            refcount: Mutex::new(*self.refcount.lock()),
+        }
+    }
 }
 
 impl Chan {
@@ -130,7 +136,7 @@ impl Chan {
             flag: 0,
             offset: 0,
             aux: None,
-            refcount: Spinlock::new(1),
+            refcount: Mutex::new(1),
         }
     }
 
@@ -173,6 +179,20 @@ pub struct DirEntry {
     pub length: u64,
     /// Name
     pub name: Vec<u8>,
+}
+
+impl Clone for DirEntry {
+    fn clone(&self) -> Self {
+        Self {
+            dev: self.dev,
+            qid: self.qid,
+            mode: self.mode,
+            atime: self.atime,
+            mtime: self.mtime,
+            length: self.length,
+            name: self.name.clone(),
+        }
+    }
 }
 
 /// Directory entry for Dirtab
@@ -240,37 +260,152 @@ pub trait Dev: Send + Sync {
     fn attach(&mut self, spec: Option<&str>) -> Result<Chan, Error>;
     
     /// Walk directory
-    fn walk(&mut self, ch: &mut Chan, name: &str) -> Result<Option<Qid>, Error>;
+    fn walk(&mut self, ch: &mut Chan, name: &str) -> Result<Option<Qid>, Error> {
+        let _ = (ch, name);
+        Err(Error::Enoent)
+    }
     
     /// Open file/device
-    fn open(&mut self, ch: &mut Chan, mode: u8) -> Result<(), Error>;
+    fn open(&mut self, ch: &mut Chan, mode: u8) -> Result<(), Error> {
+        let _ = (ch, mode);
+        Ok(())
+    }
     
     /// Create file
-    fn create(&mut self, ch: &mut Chan, name: &str, mode: u8, perm: u32) -> Result<(), Error>;
+    fn create(&mut self, ch: &mut Chan, name: &str, mode: u8, perm: u32) -> Result<(), Error> {
+        let _ = (ch, name, mode, perm);
+        Err(Error::Eperm)
+    }
     
     /// Close channel
-    fn close(&mut self, ch: &mut Chan) {}
+    fn close(&mut self, _ch: &mut Chan) {}
     
     /// Read data
-    fn read(&mut self, ch: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error>;
+    fn read(&mut self, ch: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        let _ = (ch, buf, offset);
+        Err(Error::Eperm)
+    }
     
     /// Write data
-    fn write(&mut self, ch: &mut Chan, buf: &[u8], offset: u64) -> Result<usize, Error>;
+    fn write(&mut self, ch: &mut Chan, buf: &[u8], offset: u64) -> Result<usize, Error> {
+        let _ = (ch, buf, offset);
+        Err(Error::Eperm)
+    }
     
     /// Get file status
-    fn stat(&mut self, ch: &mut Chan) -> Result<DirEntry, Error>;
+    fn stat(&mut self, ch: &mut Chan) -> Result<DirEntry, Error> {
+        let _ = ch;
+        Err(Error::Eperm)
+    }
     
     /// Set file status
-    fn wstat(&mut self, ch: &mut Chan, dir: &DirEntry) -> Result<(), Error>;
+    fn wstat(&mut self, ch: &mut Chan, dir: &DirEntry) -> Result<(), Error> {
+        let _ = (ch, dir);
+        Err(Error::Eperm)
+    }
     
     /// Remove file
-    fn remove(&mut self, ch: &mut Chan) -> Result<(), Error>;
+    fn remove(&mut self, ch: &mut Chan) -> Result<(), Error> {
+        let _ = ch;
+        Err(Error::Eperm)
+    }
     
     /// Get device character
     fn dev_char(&self) -> char;
     
     /// Get device name
     fn name(&self) -> &'static str;
+
+    /// Downcast self to `&dyn Any` for runtime type inspection.
+    ///
+    /// Default implementation returns a no-op `&dyn Any`. Concrete device
+    /// types that want to participate in downcasting should override this
+    /// (typically by returning `self`).
+    fn as_any(&self) -> &dyn core::any::Any {
+        &()
+    }
+
+    // === Block I/O Operations ===
+    
+    /// Read a block of data (buffered I/O)
+    /// 
+    /// # Arguments
+    /// * `ch` - Channel to read from
+    /// * `n` - Number of bytes to read
+    /// * `offset` - Block offset (usually 0)
+    /// 
+    /// # Returns
+    /// * `Some(Block)` - The read block
+    /// * `None` - Error or EOF
+    fn bread(&mut self, _ch: &mut Chan, _n: i64, _offset: u32) -> Option<Box<Block> > {
+        // Default implementation using read()
+        let mut buf = vec![0u8; _n as usize];
+        match self.read(_ch, &mut buf, _offset as u64) {
+            Ok(len) => {
+                if len > 0 {
+                    // Wrap in block
+                    if let Some(mut block) = allocb(len) {
+                        block.wp = block.base;
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                buf.as_ptr(),
+                                block.wp as *mut u8,
+                                len
+                            );
+                        }
+                        block.wp += len;
+                        Some(block)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    }
+    
+    /// Write a block of data (buffered I/O)
+    /// 
+    /// # Arguments
+    /// * `ch` - Channel to write to
+    /// * `block` - Block containing data to write
+    /// * `offset` - Block offset (usually 0)
+    /// 
+    /// # Returns
+    /// * Number of bytes written, or error
+    fn bwrite(&mut self, ch: &mut Chan, block: Box<Block>, _offset: u32) -> Result<i32, Error> {
+        // Default implementation using write()
+        let len = block.len();
+        let data = unsafe {
+            core::slice::from_raw_parts(block.rp as *const u8, len)
+        };
+        let result = self.write(ch, data, _offset as u64)?;
+        Ok(result as i32)
+    }
+
+    // === Power Management ===
+    
+    /// Power management
+    /// 
+    /// # Arguments
+    /// * `state` - 1 = power on, 0 = power off
+    fn power(&mut self, _state: i32) {}
+    
+    /// Configuration
+    /// 
+    /// # Arguments
+    /// * `cf` - Configuration type
+    /// * `spec` - Device specification
+    /// * `conf` - Configuration data
+    /// 
+    /// # Returns
+    /// * 0 on success, -1 on error
+    fn config(&mut self, _cf: i32, _spec: Option<&str>, _conf: Option<&DevConf>) -> Result<i32, Error> {
+        let _ = (_cf, _spec, _conf);
+        Ok(0)
+    }
 }
 
 /// Default implementations for devices
@@ -311,6 +446,8 @@ pub enum Error {
     Eexists,
     /// Not a directory
     Enotdir,
+    /// Not a directory (alias)
+    Enottdir,
     /// Is a directory
     Eisdir,
     /// Bad file descriptor
@@ -327,6 +464,9 @@ pub enum Error {
     Unknown,
 }
 
+/// Type alias for Error (for compatibility)
+pub type DevError = Error;
+
 impl Error {
     pub fn to_isize(&self) -> isize {
         match self {
@@ -338,8 +478,9 @@ impl Error {
             Error::Ebadpath => -1,
             Error::Enospace => -1,
             Error::Eexists => -7,
-            Error::Enotdir => -8,
-            Error::Eisdir => -9,
+            Error::Enotdir => -20,
+            Error::Enottdir => -20,
+            Error::Eisdir => -21,
             Error::Ebadfd => -4,
             Error::Eio => -3,
             Error::Einval => -10,
@@ -378,7 +519,7 @@ impl Dev for NullDev {
         Ok(())
     }
 
-    fn read(&mut self, _ch: &mut Chan, buf: &mut [u8], _offset: u64) -> Result<usize, Error> {
+    fn read(&mut self, _ch: &mut Chan, _buf: &mut [u8], _offset: u64) -> Result<usize, Error> {
         // Return EOF (0 bytes read)
         Ok(0)
     }
@@ -451,7 +592,9 @@ pub struct ConsDev {
     /// Console input buffer
     input_buffer: Mutex<Vec<u8>>,
     /// Console output state
-    output_lock: Spinlock,
+    output_lock: ConsoleLock,
+    /// VGA availability flag - set to true when VGA is initialized
+    vga_available: Spinlock<bool>,
 }
 
 impl ConsDev {
@@ -460,8 +603,23 @@ impl ConsDev {
         Self {
             name: "cons",
             input_buffer: Mutex::new(Vec::new()),
-            output_lock: Spinlock::new(),
+            output_lock: Spinlock::new(()),
+            // VGA starts as unavailable, will be enabled when VGA is initialized
+            vga_available: Spinlock::new(false),
         }
+    }
+
+    /// Mark VGA as available (called during VGA initialization)
+    ///
+    /// This should be called by the VGA subsystem once it has been
+    /// successfully initialized and is ready to accept output.
+    pub fn set_vga_available(&self, available: bool) {
+        *self.vga_available.lock() = available;
+    }
+
+    /// Check if VGA is available
+    pub fn is_vga_available(&self) -> bool {
+        *self.vga_available.lock()
     }
 
     /// Add characters to input buffer (from keyboard interrupt)
@@ -482,10 +640,21 @@ impl ConsDev {
     }
 
     /// Write characters to output (screen/serial)
+    ///
+    /// This method writes to both serial console and VGA text buffer.
+    /// If VGA is not available (not initialized), the VGA write is skipped
+    /// gracefully without error.
     fn put_chars(&self, data: &[u8]) {
         let _guard = self.output_lock.lock();
+
+        // Always write to serial console
         crate::cons::serial_puts(data);
-        // TODO: VGA output
+
+        // Write to VGA text buffer only if VGA is available
+        // This provides graceful degradation when VGA is not initialized
+        if *self.vga_available.lock() {
+            crate::vga::vga_puts(data);
+        }
     }
 }
 
@@ -510,7 +679,7 @@ impl Dev for ConsDev {
         Ok(())
     }
 
-    fn read(&mut self, ch: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+    fn read(&mut self, _ch: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
         let _ = offset; // Offset not used for console
         let mut count = 0;
 
@@ -582,6 +751,33 @@ impl RootDev {
     }
 }
 
+impl RootDev {
+    /// Standard directories in Plan 9 root
+    const ROOT_DIRS: &'static [(u64, &'static str)] = &[
+        (0, "bin"),      // Executables
+        (1, "dev"),      // Devices
+        (2, "env"),      // Environment
+        (3, "lib"),      // Libraries
+        (4, "mnt"),      // Mount points
+        (5, "net"),      // Network
+        (6, "proc"),     // Process info
+        (7, "root"),     // Root home
+        (8, "srv"),      // Services
+        (9, "tmp"),      // Temporary files
+        (10, "appl"),    // Applications
+    ];
+
+    /// Check if a name is a valid root directory
+    fn lookup_dir(name: &str) -> Option<Qid> {
+        for (path, dir_name) in Self::ROOT_DIRS {
+            if *dir_name == name {
+                return Some(Qid::new(*path, 0, qidtype::DIR));
+            }
+        }
+        None
+    }
+}
+
 impl Dev for RootDev {
     fn attach(&mut self, _spec: Option<&str>) -> Result<Chan, Error> {
         // Return the root channel
@@ -593,9 +789,31 @@ impl Dev for RootDev {
         }
     }
 
-    fn walk(&mut self, _ch: &mut Chan, _name: &str) -> Result<Option<Qid>, Error> {
-        // Walk is handled by the mounted file system
-        Err(Error::Enoent)
+    fn walk(&mut self, _ch: &mut Chan, name: &str) -> Result<Option<Qid>, Error> {
+        // Look up standard root directories
+        // The actual navigation is handled by the mounted file system
+        if let Some(qid) = RootDev::lookup_dir(name) {
+            Ok(Some(qid))
+        } else {
+            // Not a standard directory in root
+            // Delegate to mounted filesystem if any
+            if let Some(ref root) = *self.root_chan.lock() {
+                // Root has a channel - try to walk it
+                // This is a simplified implementation
+                let _ = root;
+                Err(Error::Enoent)
+            } else {
+                Err(Error::Enoent)
+            }
+        }
+    }
+
+    fn open(&mut self, ch: &mut Chan, _mode: u8) -> Result<(), Error> {
+        // Can only open directories
+        if !ch.qid.is_dir() {
+            return Err(Error::Enottdir);
+        }
+        Ok(())
     }
 
     fn dev_char(&self) -> char {
@@ -604,6 +822,10 @@ impl Dev for RootDev {
 
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
     }
 }
 
@@ -696,7 +918,7 @@ impl Dev for RamDev {
         }
     }
 
-    fn open(&mut self, ch: &mut Chan, _mode: u8) -> Result<(), Error> {
+    fn open(&mut self, _ch: &mut Chan, _mode: u8) -> Result<(), Error> {
         Ok(())
     }
 
@@ -725,7 +947,7 @@ impl Dev for RamDev {
 impl RamDev {
     /// Read directory entries
     fn readdir(&self, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
-        use core::mem::size_of;
+//         use core::mem::size_of;
 
         let entries = self.entries.lock();
         let entry_size = 64; // Plan 9 dir entry size
@@ -833,7 +1055,7 @@ impl DevTable {
 
     /// Get mutable device by index
     pub fn get_mut(&mut self, index: usize) -> Option<&mut dyn Dev> {
-        self.devices.get_mut(index).and_then(|d| d.as_mut().map(|b| b.as_mut()))
+        self.devices.get_mut(index).and_then(|d| d.as_mut().map(|b| b.as_mut() as &mut dyn Dev))
     }
 
     /// Find device by character
@@ -866,12 +1088,16 @@ impl DevTable {
         self.register(Box::new(NullDev::new()));
         // Register zero device (#z)
         self.register(Box::new(ZeroDev::new()));
+        // Register root device ('/')
+        self.register(Box::new(RootDev::new()));
         // Register console device (#c)
         self.register(Box::new(ConsDev::new()));
         // Register RAM device for /sd
         self.register(Box::new(RamDev::new()));
         // Register kmesg device (#K) - kernel message buffer
         self.register(Box::new(crate::kmesg::KmesgDev::new()));
+        // Register proc device (#p) - process filesystem
+        self.register(Box::new(crate::procfs::ProcFsDev::new()));
         // Register pipe device (#|) - inter-process pipes
         self.register(Box::new(crate::devpipe::PipeDev::new()));
         // Register SD device (#s) - storage/disk
@@ -894,6 +1120,88 @@ impl DevTable {
         self.register(Box::new(crate::devbridge::BridgeDev::new()));
         // Register USB device (#u) - USB host
         self.register(Box::new(crate::devusb::UsbDev::new()));
+        // Register srv device - service access device
+        self.register(Box::new(crate::devsrv::SrvDev::new()));
+    }
+}
+
+// ============================================================================
+// Device Configuration
+// ============================================================================
+
+/// Device configuration structure
+///
+/// Used by the config() method to pass device-specific configuration.
+pub struct DevConf {
+    /// Number of interrupt vectors used
+    pub nirq: u32,
+    /// DMA channel (if any)
+    pub dma: u32,
+    /// Port I/O base address
+    pub portbase: u32,
+    /// Memory-mapped I/O base address
+    pub membase: u32,
+    /// Memory-mapped I/O length
+    pub memlen: u32,
+    /// IRQ number
+    pub irq: u32,
+    /// DMA channel
+    pub dmarq: u32,
+    /// Clock frequency in Hz
+    pub freq: u32,
+    /// Clock divisor
+    pub div: u32,
+    /// Device type (vendor-specific)
+    pub type_: u32,
+    /// Device-specific data
+    pub data: Option<Box<dyn Send + Sync>>,
+}
+
+impl DevConf {
+    /// Create a new device configuration
+    pub fn new() -> Self {
+        Self {
+            nirq: 0,
+            dma: 0,
+            portbase: 0,
+            membase: 0,
+            memlen: 0,
+            irq: 0,
+            dmarq: 0,
+            freq: 0,
+            div: 0,
+            type_: 0,
+            data: None,
+        }
+    }
+}
+
+impl core::fmt::Debug for DevConf {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DevConf")
+            .field("nirq", &self.nirq)
+            .field("dma", &self.dma)
+            .field("portbase", &self.portbase)
+            .field("membase", &self.membase)
+            .field("memlen", &self.memlen)
+            .field("irq", &self.irq)
+            .field("dmarq", &self.dmarq)
+            .field("freq", &self.freq)
+            .field("div", &self.div)
+            .field("type_", &self.type_)
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for Chan {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Chan")
+            .field("dev", &self.dev)
+            .field("qid", &self.qid)
+            .field("mode", &self.mode)
+            .field("flag", &self.flag)
+            .field("offset", &self.offset)
+            .finish_non_exhaustive()
     }
 }
 
@@ -907,7 +1215,7 @@ static DEV_TABLE: AtomicPtr<DevTable> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Initialize device table
 pub fn init_devs() {
-    let table = Box::new(DevTable::new());
+    let mut table = Box::new(DevTable::new());
     table.init_defaults();
     DEV_TABLE.store(Box::into_raw(table), Ordering::SeqCst);
 }
@@ -927,27 +1235,144 @@ pub fn register_device(dev: Box<dyn Dev>) -> Option<usize> {
     devs_mut().register(dev)
 }
 
-/// Set the root device's root channel
+/// Set the root device's root channel.
+///
+/// The device is looked up via `dev_char('/')`. The channel is stored inside
+/// the device's auxiliary data, which is keyed by the `'/'` device character.
+///
+/// In a no-downcast environment we keep a parallel static map of `RootDev`
+/// pointers. The kernel registers the `RootDev` via [`set_root_device`] and
+/// this function pushes the supplied channel into it.
 pub fn set_root_device_chan(chan: Chan) {
-    // Find the root device and set its root
-    if let Some(root_idx) = devs().find_by_char('/') {
-        if let Some(root_dev) = devs_mut().get_mut(root_idx) {
-            // RootDev needs a method to set the root - use aux data
-            // For now, this is a placeholder
+    // Try the per-table slot first: the global table contains a `RootDev`
+    // entry registered via `set_root_device` below.
+    if let Some(idx) = devs().find_by_char('/') {
+        if let Some(dev) = devs().get(idx) {
+            if let Some(root_dev) = dev.as_any().downcast_ref::<RootDev>() {
+                root_dev.set_root(chan);
+                return;
+            }
         }
     }
+    // Fallback: keep a side-table of recently set channels so that
+    // `lookup_root` can find them even before a RootDev is registered.
+    ROOT_CHAN_FALLBACK.lock().replace(chan);
+}
+
+/// Fallback storage for the root channel when no RootDev is registered.
+static ROOT_CHAN_FALLBACK: crate::plan9_common::sync::Mutex<Option<Chan>> =
+    crate::plan9_common::sync::Mutex::new(None);
+
+/// Look up the root channel used for path resolution at `/`.
+///
+/// This returns the channel set via `set_root_device_chan`, opening a fresh
+/// dup of the registered root.
+pub fn lookup_root() -> Result<Chan, Error> {
+    if let Some(idx) = devs().find_by_char('/') {
+        if let Some(dev) = devs().get(idx) {
+            if let Some(root_dev) = dev.as_any().downcast_ref::<RootDev>() {
+                if let Some(c) = root_dev.get_root() {
+                    return Ok(c);
+                }
+            }
+        }
+    }
+    if let Some(c) = ROOT_CHAN_FALLBACK.lock().as_ref() {
+        return Ok(c.dup());
+    }
+    Err(Error::Enoent)
 }
 
 // ============================================================================
 // Device Helper Functions
 // ============================================================================
 
+/// Minimal PCI device description used by devices that want to probe the
+/// PCI bus. This intentionally mirrors the fields of
+/// `plan9_drivers::pci::PciDevice` so the kernel can keep its own
+/// dependency-free view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PciDeviceInfo {
+    /// PCI bus number
+    pub bus: u8,
+    /// PCI device number
+    pub dev: u8,
+    /// PCI function number
+    pub func: u8,
+    /// Vendor ID
+    pub vendor_id: u16,
+    /// Device ID
+    pub device_id: u16,
+    /// Class code (e.g. 0x0C for Serial Bus)
+    pub class_code: u8,
+    /// Subclass (e.g. 0x03 for USB)
+    pub subclass: u8,
+    /// Programming interface (e.g. 0x20 for EHCI)
+    pub prog_if: u8,
+    /// Revision
+    pub revision: u8,
+}
+
+/// A PCI device iterator. The default implementation returns no devices;
+/// drivers that have access to a real PCI bus can install an iterator
+/// via [`set_pci_iterator`].
+pub type PciIterator = alloc::vec::IntoIter<PciDeviceInfo>;
+
+/// Install a custom PCI iterator. Drivers with access to a real PCI bus
+/// should call this once during initialization.
+pub fn set_pci_iterator(iter: Option<alloc::vec::Vec<PciDeviceInfo>>) {
+    if let Some(items) = iter {
+        PCI_BUFFER.lock().replace(items.into_iter());
+    } else {
+        PCI_BUFFER.lock().take();
+    }
+}
+
+/// Iterate over PCI devices known to the kernel.
+pub fn pci_iter() -> PciIteratorGuard {
+    // Pop the current iterator (if any) and return a guard that holds it
+    // for the lifetime of the iteration.
+    let guard = PCI_BUFFER.lock().take();
+    PciIteratorGuard { iter: guard }
+}
+
+/// A guard over a swapped-out PCI iterator. When the guard is dropped the
+/// iterator is restored so the next caller can resume from the start.
+pub struct PciIteratorGuard {
+    iter: Option<alloc::vec::IntoIter<PciDeviceInfo>>,
+}
+
+impl Iterator for PciIteratorGuard {
+    type Item = PciDeviceInfo;
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.iter {
+            Some(it) => it.next(),
+            None => None,
+        }
+    }
+}
+
+impl Drop for PciIteratorGuard {
+    fn drop(&mut self) {
+        if let Some(iter) = self.iter.take() {
+            PCI_BUFFER.lock().replace(iter);
+        }
+    }
+}
+
+static PCI_BUFFER: Mutex<Option<alloc::vec::IntoIter<PciDeviceInfo>>> = Mutex::new(None);
+
+/// Install a fixed list of PCI devices (for tests and stub environments).
+pub fn install_test_pci_devices(devices: alloc::vec::Vec<PciDeviceInfo>) {
+    set_pci_iterator(Some(devices));
+}
+
 /// Open a file on a specific device
 pub fn dev_open(dev_char: char, path: &str, mode: u8) -> Result<Chan, Error> {
-    let dev_idx = devs().find_by_char(dev_char)
+    let dev_idx = devs_mut().find_by_char(dev_char)
         .ok_or(Error::Enoent)?;
 
-    let dev = devs().get(dev_idx)
+    let dev = devs_mut().get_mut(dev_idx)
         .ok_or(Error::Enoent)?;
 
     let mut chan = dev.attach(Some(path))
@@ -962,12 +1387,12 @@ pub fn dev_open(dev_char: char, path: &str, mode: u8) -> Result<Chan, Error> {
 
 /// Read from a device channel
 pub fn dev_read(chan: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
-    let dev = devs().get(chan.dev).ok_or(Error::Enoent)?;
+    let dev = devs_mut().get_mut(chan.dev).ok_or(Error::Enoent)?;
     dev.read(chan, buf, offset)
 }
 
 /// Write to a device channel
 pub fn dev_write(chan: &mut Chan, buf: &[u8], offset: u64) -> Result<usize, Error> {
-    let dev = devs().get(chan.dev).ok_or(Error::Enoent)?;
+    let dev = devs_mut().get_mut(chan.dev).ok_or(Error::Enoent)?;
     dev.write(chan, buf, offset)
 }

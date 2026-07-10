@@ -5,7 +5,7 @@
 
 use alloc::vec::Vec;
 use crate::plan9_common::sync::Spinlock;
-use crate::proc::{Pid, State, curproc};
+use crate::proc::{ Proc, curproc};
 
 /// Semaphore entry for waiting processes
 struct SemaEntry {
@@ -20,7 +20,7 @@ struct SemaEntry {
 /// Semaphore queue - manages waiting processes
 pub struct SemaQueue {
     /// Lock protecting the queue
-    lock: Spinlock,
+    lock: Spinlock<()>,
     /// Entries for waiting processes
     entries: Vec<SemaEntry>,
 }
@@ -29,7 +29,7 @@ impl SemaQueue {
     /// Create a new semaphore queue
     pub fn new() -> Self {
         Self {
-            lock: Spinlock::new(),
+            lock: Spinlock::new(()),
             entries: Vec::new(),
         }
     }
@@ -122,7 +122,8 @@ pub fn semacquire(addr: usize, block: bool) -> Result<bool, ()> {
 
     // Need to block
     let proc = curproc().ok_or(())?;
-    let proc = unsafe { &mut *(proc as *const _ as *mut _) };
+    let proc = core::ptr::addr_of!(*proc) as *mut Proc;
+    let _proc = unsafe { &mut *proc };
 
     // Mark as waiting
     // In a full implementation, this would:

@@ -7,14 +7,15 @@
 //! - Kernel heap allocator
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use crate::plan9_arch::x86_64::paging::{
-    self, PteFlags, PageTableEntry, PageTable,
+    self, PteFlags,
     PageTableIndices, PAGESIZE, PT_ENTRIES, PHYS_MEMORY_VIRT, KERNEL_VIRT_BASE,
-    KERNEL_IMAGE_VIRT, LARGE_PAGE_SIZE, kernel_layout,
 };
 use crate::plan9_common::error::{Error, Result};
-use crate::plan9_common::sync::Mutex;
+// use crate::plan9_common::sync::Mutex;
 use crate::plan9_common::types::{PhysAddr, VirtAddr};
+use crate::serial;
 
 // ============================================================================
 // Physical Frame Allocator
@@ -26,10 +27,10 @@ pub struct FrameAllocator {
     base: PhysAddr,
     /// Total number of frames
     total_frames: usize,
-    /// Bitmap of allocated frames
-    bitmap: &'static mut [u64],
+    /// Bitmap of allocated frames (atomic for safe concurrent access)
+    bitmap: &'static mut [AtomicU64],
     /// Lock for thread safety
-    lock: crate::plan9_common::sync::Spinlock,
+    lock: crate::plan9_common::sync::Spinlock<()>,
 }
 
 impl FrameAllocator {
@@ -39,21 +40,69 @@ impl FrameAllocator {
         let total_frames = size / frame_size;
         let bitmap_words = (total_frames + 63) / 64;
 
-        // Allocate space for the allocator itself (in the managed region)
+        serial::put_bytes(b"[FrameAllocator::new] STEP1: base=");
+        serial::put_hex_u64(base.as_u64());
+        serial::put_bytes(b" size=");
+        serial::put_hex_u64(size as u64);
+        serial::put_hex_u64(total_frames as u64);
+        serial::put_bytes(b" frames bitmap_words=");
+        serial::put_hex_u64(bitmap_words as u64);
+        serial::put_bytes(b"\n");
+
         let allocator_size = core::mem::size_of::<Self>() + bitmap_words * 8;
         let allocator_base = base;
+
+        serial::put_bytes(b"[FrameAllocator::new] STEP2: writing to ");
+        serial::put_hex_u64(allocator_base.as_u64());
+        serial::put_bytes(b"\n");
 
         // We need static mut for the allocator - this is safe because we're
         // initializing it once at boot
         unsafe {
-            let alloc = &mut *(allocator_base.as_u64() as *mut Self);
-            core::ptr::write_bytes(alloc, 0, 1);
-            alloc.base = base;
-            alloc.total_frames = total_frames;
+            let alloc_ptr = allocator_base.as_u64() as *mut Self;
+            serial::put_bytes(b"[FrameAllocator::new] STEP3: got ptr\n");
 
-            let bitmap_ptr = (allocator_base.as_u64() + core::mem::size_of::<Self>()) as *mut u64;
-            alloc.bitmap = core::slice::from_raw_parts_mut(bitmap_ptr, bitmap_words);
-            alloc.bitmap[..bitmap_words].fill(0); // All frames free initially
+            // Create the bitmap as a separate slice of AtomicU64
+            let bitmap_ptr = (allocator_base.as_u64() + core::mem::size_of::<Self>() as u64) as *mut AtomicU64;
+            let bitmap_slice = core::slice::from_raw_parts_mut(bitmap_ptr, bitmap_words);
+
+            // Use write instead of write_bytes to properly initialize the entire struct
+            // including the Spinlock field
+            core::ptr::write(alloc_ptr, Self {
+                base,
+                total_frames,
+                bitmap: bitmap_slice,
+                lock: crate::plan9_common::sync::Spinlock::new(()),
+            });
+            serial::put_bytes(b"[FrameAllocator::new] STEP4: write done\n");
+
+            let alloc = &mut *alloc_ptr;
+            serial::put_bytes(b"[FrameAllocator::new] STEP5: dereferenced\n");
+
+            // Initialize all bitmap words to 0 (all frames free initially)
+            for word in alloc.bitmap.iter() {
+                word.store(0, Ordering::Relaxed);
+            }
+
+            // Reserve the allocator's own memory (self-referencing fix)
+            // The allocator metadata occupies the first `allocator_size` bytes.
+            // Mark these frames as used so they will never be allocated.
+            let reserved_frames = (allocator_size + PAGESIZE - 1) / PAGESIZE;
+            for i in 0..reserved_frames {
+                let word_idx = i / 64;
+                let bit = i % 64;
+                if word_idx < bitmap_words {
+                    alloc.bitmap[word_idx].fetch_or(1u64 << bit, Ordering::Relaxed);
+                }
+            }
+
+            serial::put_bytes(b"[FrameAllocator::new] STEP6: bitmap filled, reserved_frames=");
+            serial::put_hex_u64(reserved_frames as u64);
+            serial::put_bytes(b"\n");
+
+            serial::put_bytes(b"[FrameAllocator::new] alloc_ptr=");
+            serial::put_hex_u64(alloc_ptr as u64);
+            serial::put_bytes(b"\n");
 
             alloc
         }
@@ -63,16 +112,32 @@ impl FrameAllocator {
     pub fn alloc_frame(&mut self) -> Option<PhysAddr> {
         let _guard = self.lock.lock();
 
-        for (word_idx, &word) in self.bitmap.iter().enumerate() {
-            if word != u64::MAX {
-                // Find first free bit
-                let free_bit = word.trailing_ones() as usize;
-                let frame_idx = word_idx * 64 + free_bit;
+        for word_idx in 0..self.bitmap.len() {
+            let old_val = self.bitmap[word_idx].load(Ordering::Acquire);
+            if old_val == u64::MAX {
+                continue;
+            }
+            let free_bit = old_val.trailing_ones() as usize;
+            let new_val = old_val | (1u64 << free_bit);
 
-                if frame_idx < self.total_frames {
-                    // Mark as allocated
-                    self.bitmap[word_idx] |= 1 << free_bit;
-                    return Some(PhysAddr::new(self.base.as_u64() + (frame_idx * PAGESIZE) as u64));
+            // Use compare_exchange to atomically mark the bit
+            match self.bitmap[word_idx].compare_exchange(
+                old_val,
+                new_val,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let frame_idx = word_idx * 64 + free_bit;
+                    if frame_idx < self.total_frames {
+                        return Some(PhysAddr::new(
+                            self.base.as_u64() + (frame_idx * PAGESIZE) as u64,
+                        ));
+                    }
+                }
+                Err(_) => {
+                    // CAS failed, another thread modified this word, retry
+                    continue;
                 }
             }
         }
@@ -88,7 +153,9 @@ impl FrameAllocator {
         let _guard = self.lock.lock();
 
         for word_idx in 0..self.bitmap.len() {
-            let mut current_word = self.bitmap[word_idx];
+            // Snapshot the starting word atomically.
+            let start_word = self.bitmap[word_idx].load(Ordering::Acquire);
+            let mut current_word = start_word;
 
             for bit in 0..64 {
                 if current_word & 1 == 0 {
@@ -104,9 +171,9 @@ impl FrameAllocator {
 
                         while remaining > 0 && check_bit < 64 {
                             let word = if check_word == word_idx {
-                                current_word
+                                start_word
                             } else {
-                                self.bitmap[check_word]
+                                self.bitmap[check_word].load(Ordering::Acquire)
                             };
 
                             let available_in_word = if check_word == word_idx {
@@ -118,7 +185,7 @@ impl FrameAllocator {
                             let needed = remaining.min(available_in_word);
                             let mut check_word_val = word >> check_bit;
 
-                            for i in 0..needed {
+                            for _i in 0..needed {
                                 if check_word_val & 1 != 0 {
                                     can_alloc = false;
                                     break;
@@ -138,13 +205,33 @@ impl FrameAllocator {
                     }
 
                     if can_alloc && remaining == 0 {
-                        // Allocate the frames
+                        // Allocate the frames using atomic CAS for each word
                         let mut rem = count;
                         let mut w = word_idx;
                         let mut b = bit;
 
                         while rem > 0 {
-                            self.bitmap[w] |= 1 << b;
+                            if w >= self.bitmap.len() {
+                                // Should not happen given the check above,
+                                // but bail out safely.
+                                return None;
+                            }
+                            let target_bit = b;
+                            // CAS-loop: set the bit in word w atomically
+                            let mut current = self.bitmap[w].load(Ordering::Acquire);
+                            loop {
+                                let new_val = current | (1u64 << target_bit);
+                                match self.bitmap[w].compare_exchange(
+                                    current,
+                                    new_val,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                ) {
+                                    Ok(_) => break,
+                                    Err(actual) => current = actual,
+                                }
+                            }
+
                             b += 1;
                             rem -= 1;
 
@@ -182,12 +269,23 @@ impl FrameAllocator {
         let word_idx = frame_idx / 64;
         let bit = frame_idx % 64;
 
-        if self.bitmap[word_idx] & (1 << bit) == 0 {
-            return Err(Error::Eperm); // Not allocated
+        // Atomically clear the bit (CAS-loop to handle concurrent modifications)
+        loop {
+            let current = self.bitmap[word_idx].load(Ordering::Acquire);
+            if current & (1u64 << bit) == 0 {
+                return Err(Error::Eperm); // Not allocated
+            }
+            let new_val = current & !(1u64 << bit);
+            match self.bitmap[word_idx].compare_exchange(
+                current,
+                new_val,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(_) => continue, // Retry on contention
+            }
         }
-
-        self.bitmap[word_idx] &= !(1 << bit);
-        Ok(())
     }
 
     /// Get total number of frames
@@ -199,8 +297,9 @@ impl FrameAllocator {
     pub fn free_frames(&self) -> usize {
         let _guard = self.lock.lock();
         let mut used = 0;
-        for &word in self.bitmap.iter() {
-            used += word.count_ones() as usize;
+        for word in self.bitmap.iter() {
+            let val = word.load(Ordering::Acquire);
+            used += val.count_ones() as usize;
         }
         self.total_frames - used
     }
@@ -240,7 +339,6 @@ impl VmManager {
         phys: PhysAddr,
         flags: PteFlags,
     ) -> Result<()> {
-        debug_assert!(virt.is_kernel(), "Only kernel mapping supported");
         debug_assert!(phys.is_aligned(), "Physical address must be page-aligned");
 
         // Walk the page table, creating entries as needed
@@ -310,9 +408,20 @@ impl VmManager {
         let pt_virt = VirtAddr::new(KERNEL_VIRT_BASE | pt_phys.as_u64());
         let pt_entry_ptr = pt_virt.as_u64() + (indices.pt * 8) as u64;
 
-        unsafe {
-            core::ptr::write(pt_entry_ptr as *mut u64, phys.as_u64() | flags.bits());
+        // Set the final PT entry. Ensure PRESENT is set; for user mappings,
+        // also force the USER bit so the page is accessible from CPL3.
+        let mut entry_flags = flags;
+        if !entry_flags.is_present() {
+            entry_flags = entry_flags.with_present();
         }
+        if !virt.is_kernel() {
+            entry_flags = entry_flags.with_user();
+        }
+        unsafe {
+            core::ptr::write(pt_entry_ptr as *mut u64, phys.as_u64() | entry_flags.bits());
+            core::arch::asm!("sfence", options(nostack, preserves_flags));
+        }
+        invalidate_tlb(virt);
 
         Ok(())
     }
@@ -348,17 +457,23 @@ impl VmManager {
         }
 
         // Clear the entry
-        unsafe { core::ptr::write(pt_entry_ptr as *mut u64, 0) };
+        unsafe {
+            core::ptr::write(pt_entry_ptr as *mut u64, 0);
+            core::arch::asm!("sfence", options(nostack, preserves_flags));
+        }
+        invalidate_tlb(virt);
 
         Ok(())
     }
 
     /// Get the physical address for a virtual address
     pub fn virt_to_phys(&self, virt: VirtAddr) -> Option<PhysAddr> {
-        let entry = paging::walk_page_table_entry(
-            PhysAddr::new(self.pml4_virt.as_u64() - KERNEL_VIRT_BASE),
-            virt
-        )?;
+        let pml4_phys = if self.pml4_virt.as_u64() >= KERNEL_VIRT_BASE {
+            PhysAddr::new(self.pml4_virt.as_u64() - KERNEL_VIRT_BASE)
+        } else {
+            PhysAddr::new(self.pml4_virt.as_u64())
+        };
+        let entry = paging::walk_page_table_entry(pml4_phys, virt)?;
 
         if entry.is_large() {
             // For large pages, the offset is only 21 bits
@@ -391,7 +506,10 @@ impl VmManager {
     /// Allocate and map a new frame
     pub fn alloc_map(&mut self, virt: VirtAddr, flags: PteFlags) -> Result<PhysAddr> {
         let phys = self.frame_alloc.alloc_frame().ok_or(Error::Enomem)?;
-        self.map_frame(virt, phys, flags)?;
+        // Ensure at least PRESENT is set so the frame is actually addressable
+        // after mapping; map_frame will additionally set USER for user mappings.
+        let map_flags = if flags.is_present() { flags } else { flags.with_present() };
+        self.map_frame(virt, phys, map_flags)?;
         Ok(phys)
     }
 }
@@ -417,7 +535,7 @@ pub struct KernelHeap {
     /// Heap size limit
     limit: u64,
     /// Lock
-    lock: crate::plan9_common::sync::Spinlock,
+    lock: crate::plan9_common::sync::Spinlock<()>,
     /// Free list for deallocated blocks
     free_list: Option<*mut FreeBlock>,
 }
@@ -429,7 +547,7 @@ impl KernelHeap {
             end: start + size as u64,
             current: start,
             limit: start + size as u64,
-            lock: crate::plan9_common::sync::Spinlock::new(),
+            lock: crate::plan9_common::sync::Spinlock::new(()),
             free_list: None,
         }
     }
@@ -437,8 +555,6 @@ impl KernelHeap {
     /// Allocate memory from the kernel heap
     /// Uses best-fit strategy from the free list, falls back to bump allocation
     pub fn alloc(&mut self, size: usize, align: usize) -> Option<u64> {
-        let _guard = self.lock.lock();
-
         let aligned_size = (size + 7) & !7; // 8-byte alignment
         let align_mask = if align > 8 { !(align - 1) } else { !7 };
 
@@ -459,12 +575,12 @@ impl KernelHeap {
 
     /// Try to allocate from the free list using best-fit strategy
     fn alloc_from_free_list(&mut self, size: usize, _align_mask: usize) -> Option<u64> {
+        // Get the free list pointer
+        let mut current = self.free_list;
         let mut prev: Option<*mut FreeBlock> = None;
         let mut best_fit: Option<*mut FreeBlock> = None;
         let mut best_prev: Option<*mut FreeBlock> = None;
         let mut best_size = usize::MAX;
-
-        let mut current = self.free_list;
 
         while let Some(block_ptr) = current {
             unsafe {
@@ -480,31 +596,31 @@ impl KernelHeap {
         }
 
         if let Some(block_ptr) = best_fit {
-            unsafe {
-                // Remove from free list
-                let block = &*block_ptr;
-                if let Some(bp) = best_prev {
-                    (&mut *bp).next = block.next;
-                } else {
-                    self.free_list = block.next;
+            // Update free list to remove the allocated block
+            if let Some(bp) = best_prev {
+                unsafe {
+                    (&mut *bp).next = (&*block_ptr).next;
                 }
+            } else {
+                self.free_list = unsafe { (&*block_ptr).next };
+            }
 
-                // If block is much larger than needed, split it
-                let remaining = block.size - size;
-                if remaining >= core::mem::size_of::<FreeBlock>() + 8 {
-                    let new_block_ptr = (block_ptr as *mut u8).add(size) as *mut FreeBlock;
+            // If block is much larger than needed, split it
+            let remaining = unsafe { (&*block_ptr).size - size };
+            if remaining >= core::mem::size_of::<FreeBlock>() + 8 {
+                let new_block_ptr = unsafe { (block_ptr as *mut u64).add(size) as *mut FreeBlock };
+                unsafe {
                     (&mut *new_block_ptr).size = remaining;
                     (&mut *new_block_ptr).next = self.free_list;
-                    self.free_list = Some(new_block_ptr);
                 }
-
-                // Return the block (skip header)
-                let data_ptr = (block_ptr as *mut u8).add(core::mem::size_of::<FreeBlock>()) as u64;
-                return Some(data_ptr);
+                self.free_list = Some(new_block_ptr);
             }
-        }
 
-        None
+            // Return the block (skip header)
+            Some(unsafe { (block_ptr as *mut u64).add(core::mem::size_of::<FreeBlock>()) as u64 })
+        } else {
+            None
+        }
     }
 
     /// Deallocate memory back to the heap
@@ -514,12 +630,10 @@ impl KernelHeap {
             return;
         }
 
-        let _guard = self.lock.lock();
-
         let aligned_size = (size + 7) & !7;
 
         // Create a new free block
-        let block_ptr = (ptr as *mut u8).sub(core::mem::size_of::<FreeBlock>()) as *mut FreeBlock;
+        let block_ptr = unsafe { (ptr as *mut u64).sub(core::mem::size_of::<FreeBlock>()) as *mut FreeBlock };
 
         unsafe {
             (&mut *block_ptr).size = aligned_size;
@@ -532,29 +646,61 @@ impl KernelHeap {
     }
 
     /// Coalesce adjacent free blocks
+    /// Collects all blocks, sorts by address, then merges adjacent blocks
     fn coalesce(&mut self) {
-        let mut current = match self.free_list {
-            Some(c) => c,
-            None => return,
-        };
+        if self.free_list.is_none() {
+            return;
+        }
 
-        loop {
+        // Collect all blocks and sort by address
+        let mut blocks: Vec<(*mut FreeBlock, usize)> = Vec::new();
+        let mut current = self.free_list;
+        while let Some(ptr) = current {
             unsafe {
-                let next = match (&*current).next {
-                    Some(n) => n,
-                    None => break,
-                };
+                blocks.push((ptr, (&*ptr).size));
+                current = (&*ptr).next;
+            }
+        }
 
-                // Check if current and next are adjacent
-                let current_end = (current as *mut u8).add((&*current).size) as *mut FreeBlock;
-                if current_end == next {
-                    // Merge the blocks
-                    (&mut *current).size += (&*next).size;
-                    (&mut *current).next = (&*next).next;
+        if blocks.is_empty() {
+            return;
+        }
+
+        // Sort by address
+        blocks.sort_by_key(|k| k.0 as usize);
+
+        // Merge adjacent blocks
+        let mut i = 0;
+        while i < blocks.len() {
+            let (mut ptr, mut size) = blocks[i];
+            let mut j = i + 1;
+
+            while j < blocks.len() {
+                let (next_ptr, next_size) = blocks[j];
+                let block_end = (ptr as usize + size) as *mut FreeBlock;
+
+                if block_end == next_ptr {
+                    // Merge next into current
+                    size += next_size;
+                    j += 1;
                 } else {
-                    current = next;
+                    break;
                 }
             }
+
+            unsafe {
+                (&mut *ptr).size = size;
+                if j < blocks.len() {
+                    (&mut *ptr).next = Some(blocks[j].0);
+                } else {
+                    (&mut *ptr).next = None;
+                }
+            }
+
+            if i == 0 {
+                self.free_list = Some(ptr);
+            }
+            i = j;
         }
     }
 
@@ -563,9 +709,9 @@ impl KernelHeap {
         (self.current - (self.end - self.limit)) as usize
     }
 
-    /// Get remaining heap space
+    /// Get remaining heap space (sum of free list blocks only)
     pub fn available(&self) -> usize {
-        // Sum up all free blocks plus bump allocator space
+        // Only sum the free list blocks - bump allocator space is already "used"
         let mut free_size = 0usize;
         let mut current = self.free_list;
         while let Some(block_ptr) = current {
@@ -574,12 +720,258 @@ impl KernelHeap {
                 current = (&*block_ptr).next;
             }
         }
-        free_size + (self.end - self.current) as usize
+        free_size
     }
 
     /// Expand heap (can only grow, never shrinks)
     pub fn expand(&mut self, additional: usize) {
         self.end += additional as u64;
+    }
+}
+
+// ============================================================================
+// Slab Allocator
+// ============================================================================
+
+/// Slab cache for objects of a specific size
+/// 
+/// A slab allocator pre-allocates memory and divides it into equal-sized
+/// objects, reducing allocation overhead and memory fragmentation.
+pub struct SlabCache {
+    /// Name of this cache (for debugging)
+    name: &'static str,
+    /// Size of each object in this cache
+    object_size: usize,
+    /// Number of objects per slab (pages)
+    objects_per_slab: usize,
+    /// List of free objects
+    free_list: Option<*mut u8>,
+    /// Number of free objects available
+    free_count: usize,
+    /// Total objects in this cache
+    total_objects: usize,
+}
+
+impl SlabCache {
+    /// Create a new slab cache
+    pub fn new(name: &'static str, object_size: usize) -> Self {
+        // Align object size to at least 8 bytes
+        let object_size = if object_size < 8 { 8 } else { (object_size + 7) & !7 };
+
+        // Calculate objects per slab (each slab is one page)
+        // For objects larger than a page, we can only fit 1 per slab
+        let objects_per_slab = if object_size > 4096 {
+            1
+        } else {
+            (4096 / object_size).max(1)
+        };
+
+        Self {
+            name,
+            object_size,
+            objects_per_slab,
+            free_list: None,
+            free_count: 0,
+            total_objects: 0,
+        }
+    }
+    
+    /// Allocate an object from this cache
+    pub fn alloc(&mut self) -> Option<*mut u8> {
+        // Try to get from free list first
+        if let Some(ptr) = self.free_list.take() {
+            self.free_count -= 1;
+            
+            // Read the next pointer from the object
+            unsafe {
+                let next = core::ptr::read(ptr as *const *mut u8);
+                self.free_list = Some(next);
+            }
+            return Some(ptr);
+        }
+        
+        // Need to allocate a new slab
+        self.allocate_slab()?;
+        
+        // Should have free objects now, recurse
+        self.alloc()
+    }
+    
+    /// Allocate a new slab page and add its objects to the free list
+    fn allocate_slab(&mut self) -> Option<()> {
+        // Allocate a physical frame
+        let frame = crate::vm::alloc_frame()?;
+
+        // Convert to virtual address
+        let slab_base = crate::vm::phys_to_virt(frame);
+        let ptr = slab_base.as_mut_ptr::<u8>();
+
+        // Chain all objects in the slab
+        for i in 0..self.objects_per_slab {
+            let current = unsafe { ptr.add(i * self.object_size) };
+            let next = if i < self.objects_per_slab - 1 {
+                unsafe { ptr.add((i + 1) * self.object_size) }
+            } else {
+                // Last object points to old free list
+                self.free_list.unwrap_or(core::ptr::null_mut())
+            };
+
+            unsafe {
+                core::ptr::write(current as *mut *mut u8, next);
+            }
+        }
+
+        // Update free list to first object
+        self.free_list = Some(ptr);
+        self.free_count += self.objects_per_slab;
+        self.total_objects += self.objects_per_slab;
+
+        Some(())
+    }
+    
+    /// Free an object back to this cache
+    pub fn free(&mut self, ptr: *mut u8) {
+        if ptr.is_null() {
+            return;
+        }
+        
+        // Chain the object to the free list
+        unsafe {
+            core::ptr::write(ptr as *mut *mut u8, self.free_list.unwrap_or(core::ptr::null_mut()));
+        }
+        self.free_list = Some(ptr);
+        self.free_count += 1;
+    }
+    
+    /// Get cache statistics
+    pub fn stats(&self) -> SlabStats {
+        SlabStats {
+            name: self.name,
+            object_size: self.object_size,
+            free_count: self.free_count,
+            total_objects: self.total_objects,
+        }
+    }
+}
+
+/// Statistics for a slab cache
+pub struct SlabStats {
+    pub name: &'static str,
+    pub object_size: usize,
+    pub free_count: usize,
+    pub total_objects: usize,
+}
+
+/// Global slab caches for common kernel objects
+pub struct SlabCaches {
+    /// Cache for small objects (16 bytes)
+    pub cache_16: SlabCache,
+    /// Cache for small objects (32 bytes)
+    pub cache_32: SlabCache,
+    /// Cache for small objects (64 bytes)
+    pub cache_64: SlabCache,
+    /// Cache for small objects (128 bytes)
+    pub cache_128: SlabCache,
+    /// Cache for small objects (256 bytes)
+    pub cache_256: SlabCache,
+    /// Cache for small objects (512 bytes)
+    pub cache_512: SlabCache,
+    /// Cache for medium objects (1024 bytes)
+    pub cache_1024: SlabCache,
+    /// Cache for medium objects (2048 bytes)
+    pub cache_2048: SlabCache,
+    /// Cache for larger objects (4096 bytes)
+    pub cache_4096: SlabCache,
+}
+
+impl SlabCaches {
+    /// Create all slab caches
+    pub fn new() -> Self {
+        Self {
+            cache_16: SlabCache::new("kmem-16", 16),
+            cache_32: SlabCache::new("kmem-32", 32),
+            cache_64: SlabCache::new("kmem-64", 64),
+            cache_128: SlabCache::new("kmem-128", 128),
+            cache_256: SlabCache::new("kmem-256", 256),
+            cache_512: SlabCache::new("kmem-512", 512),
+            cache_1024: SlabCache::new("kmem-1024", 1024),
+            cache_2048: SlabCache::new("kmem-2048", 2048),
+            cache_4096: SlabCache::new("kmem-4096", 4096),
+        }
+    }
+
+    /// Allocate from the appropriate cache based on size
+    pub fn alloc(&mut self, size: usize) -> Option<*mut u8> {
+        if size <= 16 {
+            self.cache_16.alloc()
+        } else if size <= 32 {
+            self.cache_32.alloc()
+        } else if size <= 64 {
+            self.cache_64.alloc()
+        } else if size <= 128 {
+            self.cache_128.alloc()
+        } else if size <= 256 {
+            self.cache_256.alloc()
+        } else if size <= 512 {
+            self.cache_512.alloc()
+        } else if size <= 1024 {
+            self.cache_1024.alloc()
+        } else if size <= 2048 {
+            self.cache_2048.alloc()
+        } else if size <= 4096 {
+            self.cache_4096.alloc()
+        } else {
+            None // Too large for slab
+        }
+    }
+
+    /// Free to the appropriate cache based on size
+    pub fn free(&mut self, ptr: *mut u8, size: usize) {
+        if ptr.is_null() {
+            return;
+        }
+
+        if size <= 16 {
+            self.cache_16.free(ptr);
+        } else if size <= 32 {
+            self.cache_32.free(ptr);
+        } else if size <= 64 {
+            self.cache_64.free(ptr);
+        } else if size <= 128 {
+            self.cache_128.free(ptr);
+        } else if size <= 256 {
+            self.cache_256.free(ptr);
+        } else if size <= 512 {
+            self.cache_512.free(ptr);
+        } else if size <= 1024 {
+            self.cache_1024.free(ptr);
+        } else if size <= 2048 {
+            self.cache_2048.free(ptr);
+        } else if size <= 4096 {
+            self.cache_4096.free(ptr);
+        }
+        // If size > 4096, caller should use a different allocator
+    }
+
+    /// Get statistics for all caches
+    pub fn stats(&self) -> [SlabStats; 9] {
+        [
+            self.cache_16.stats(),
+            self.cache_32.stats(),
+            self.cache_64.stats(),
+            self.cache_128.stats(),
+            self.cache_256.stats(),
+            self.cache_512.stats(),
+            self.cache_1024.stats(),
+            self.cache_2048.stats(),
+            self.cache_4096.stats(),
+        ]
+    }
+}
+
+impl Default for SlabCaches {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -651,10 +1043,8 @@ impl VmaFlags {
 pub struct AddressSpace {
     /// Pointer to the PML4 table (physical address)
     pml4: PhysAddr,
-    /// Virtual memory areas
-    vmas: [Option<Vma>; 16],
-    /// Number of VMAs
-    vma_count: usize,
+    /// Virtual memory areas (dynamically grown under a mutex)
+    vmas: crate::plan9_common::sync::Mutex<Vec<Vma>>,
     /// Memory regions
     memory_regions: crate::plan9_common::sync::Mutex<Vec<Vma>>,
 }
@@ -664,9 +1054,8 @@ impl AddressSpace {
     pub fn new() -> Self {
         Self {
             pml4: PhysAddr::null(),
-            vmas: [const { None }; 16],
-            vma_count: 0,
-            memory_regions: crate::plan9_common::sync::Spinlock::new(Vec::new()),
+            vmas: crate::plan9_common::sync::Mutex::new(Vec::new()),
+            memory_regions: crate::plan9_common::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -681,53 +1070,61 @@ impl AddressSpace {
     }
 
     /// Add a VMA
-    pub fn add_vma(&mut self, vma: Vma) -> Result<()> {
-        if self.vma_count >= 16 {
-            return Err(Error::Enomem);
-        }
+    pub fn add_vma(&self, vma: Vma) -> Result<()> {
+        let mut vmas = self.vmas.lock();
 
-        // Check for overlap
-        for i in 0..self.vma_count {
-            if let Some(existing) = &self.vmas[i] {
-                if vma.start.as_u64() < existing.end.as_u64()
-                    && vma.end.as_u64() > existing.start.as_u64()
-                {
-                    return Err(Error::Ebusy); // Overlap
-                }
+        // Check for overlap with existing VMAs
+        for existing in vmas.iter() {
+            if vma.start.as_u64() < existing.end.as_u64()
+                && vma.end.as_u64() > existing.start.as_u64()
+            {
+                return Err(Error::Ebusy);
             }
         }
 
-        self.vmas[self.vma_count] = Some(vma);
-        self.vma_count += 1;
+        vmas.push(vma);
         Ok(())
     }
 
     /// Find VMA containing an address
-    pub fn find_vma(&self, addr: VirtAddr) -> Option<&Vma> {
-        for i in 0..self.vma_count {
-            if let Some(vma) = &self.vmas[i] {
-                if vma.contains(addr) {
-                    return Some(vma);
-                }
-            }
-        }
-        None
+    pub fn find_vma(&self, addr: VirtAddr) -> Option<Vma> {
+        let vmas = self.vmas.lock();
+        vmas.iter().find(|v| v.contains(addr)).copied()
     }
 
     /// Map a region
     pub fn mmap(
-        &mut self,
+        &self,
         addr: Option<VirtAddr>,
         size: usize,
         flags: VmaFlags,
         _fd: Option<i32>,
         _offset: usize,
     ) -> Result<VirtAddr> {
-        let start = addr.unwrap_or_else(|| {
-            // Anonymous mapping - find a free region
-            // For simplicity, return kernel space address
-            VirtAddr::new(kernel_layout::heap_start())
-        });
+        let start = if let Some(a) = addr {
+            a
+        } else {
+            // Find a free region in user space
+            const USER_REGION_BASE: u64 = 0x4000_0000;
+            const USER_REGION_END: u64 = 0x0000_7FFF_FFFF_FFFF;
+            let mut current = USER_REGION_BASE;
+            let vmas = self.vmas.lock();
+            // Sort vmas by start address so we can scan for gaps
+            let mut sorted: Vec<Vma> = vmas.iter().copied().collect();
+            sorted.sort_by_key(|v| v.start.as_u64());
+            for vma in sorted.iter() {
+                if current + size as u64 <= vma.start.as_u64() {
+                    break;
+                }
+                if vma.end.as_u64() > current {
+                    current = vma.end.as_u64();
+                }
+            }
+            if current + size as u64 > USER_REGION_END {
+                return Err(Error::Enomem);
+            }
+            VirtAddr::new(current)
+        };
 
         let vma = Vma::new(start, VirtAddr::new(start.as_u64() + size as u64), flags, "anon");
         self.add_vma(vma)?;
@@ -735,17 +1132,47 @@ impl AddressSpace {
         Ok(start)
     }
 
-    /// Unmap a region
-    pub fn munmap(&mut self, addr: VirtAddr, size: usize) -> Result<()> {
-        for i in 0..self.vma_count {
-            if let Some(vma) = &self.vmas[i] {
-                if vma.start == addr && vma.size() == size {
-                    self.vmas[i] = None;
-                    return Ok(());
+    /// Unmap a region (supports partial unmaps, splitting VMAs as needed)
+    pub fn munmap(&self, addr: VirtAddr, size: usize) -> Result<()> {
+        let mut vmas = self.vmas.lock();
+        let target_end = addr.as_u64() + size as u64;
+        let mut new_vmas: Vec<Vma> = Vec::with_capacity(vmas.len());
+        let mut modified = false;
+
+        for vma in vmas.iter() {
+            let vma_start = vma.start.as_u64();
+            let vma_end = vma.end.as_u64();
+            if vma_end <= addr.as_u64() || vma_start >= target_end {
+                // No overlap - keep as-is
+                new_vmas.push(*vma);
+            } else {
+                modified = true;
+                // Partial overlap - keep the unaffected portions
+                if vma_start < addr.as_u64() {
+                    new_vmas.push(Vma::new(
+                        vma.start,
+                        addr,
+                        vma.flags,
+                        vma.name,
+                    ));
+                }
+                if vma_end > target_end {
+                    new_vmas.push(Vma::new(
+                        VirtAddr::new(target_end),
+                        vma.end,
+                        vma.flags,
+                        vma.name,
+                    ));
                 }
             }
         }
-        Err(Error::Enoent)
+
+        if !modified {
+            return Err(Error::Enoent);
+        }
+
+        *vmas = new_vmas;
+        Ok(())
     }
 }
 
@@ -786,10 +1213,345 @@ pub fn write_volatile<T>(ptr: *mut T, val: T) {
 }
 
 // ============================================================================
+// User Page Table Management
+// ============================================================================
+
+/// User page table manager for creating and managing user address spaces
+pub struct UserPageTable {
+    /// PML4 physical address
+    pml4_phys: PhysAddr,
+    /// Reference to the frame allocator
+    frame_alloc: &'static mut FrameAllocator,
+}
+
+impl UserPageTable {
+    /// Create a new user page table
+    ///
+    /// This allocates a new PML4 table and sets up the required identity
+    /// mappings for kernel access (so the kernel can still access its memory).
+    pub fn new(frame_alloc: &'static mut FrameAllocator) -> Option<Self> {
+        // Allocate a frame for the PML4 table
+        let pml4_phys = frame_alloc.alloc_frame()?;
+
+        // Get kernel virtual address to access the PML4
+        let pml4_virt = VirtAddr::new(PHYS_MEMORY_VIRT | pml4_phys.as_u64());
+
+        // Clear the PML4 (all entries to 0)
+        unsafe {
+            core::ptr::write_bytes(pml4_virt.as_mut_ptr::<u64>(), 0, PT_ENTRIES);
+        }
+
+        // In a full implementation, we would:
+        // 1. Copy kernel mappings from the boot page table
+        // 2. Set up identity mapping for kernel access
+        // For now, just return the empty table
+
+        Some(Self { pml4_phys, frame_alloc })
+    }
+
+    /// Get the PML4 physical address
+    pub fn pml4_phys(&self) -> PhysAddr {
+        self.pml4_phys
+    }
+
+    /// Map a user virtual address to a physical frame
+    ///
+    /// This walks the page table hierarchy and creates the necessary
+    /// intermediate page tables, then maps the virtual address to the
+    /// given physical frame with the specified flags.
+    pub fn map(&mut self, virt: VirtAddr, phys: PhysAddr, flags: PteFlags) -> Result<()> {
+        // User addresses must be in the lower half
+        if virt.as_u64() >= KERNEL_VIRT_BASE {
+            return Err(Error::Einval);
+        }
+
+        let indices = PageTableIndices::from_virt(virt);
+
+        // Get kernel virtual address for PML4
+        let pml4_virt = VirtAddr::new(PHYS_MEMORY_VIRT | self.pml4_phys.as_u64());
+
+        // Read PML4 entry
+        let pml4_entry_ptr = pml4_virt.as_u64() + (indices.pml4 * 8) as u64;
+        let pml4_entry = unsafe { &mut *(pml4_entry_ptr as *mut u64) };
+
+        // Allocate PDPT if needed
+        if *pml4_entry == 0 {
+            let pdpt_phys = self.frame_alloc.alloc_frame().ok_or(Error::Enomem)?;
+            let pdpt_virt = VirtAddr::new(PHYS_MEMORY_VIRT | pdpt_phys.as_u64());
+
+            unsafe {
+                core::ptr::write_bytes(pdpt_virt.as_mut_ptr::<u64>(), 0, PT_ENTRIES);
+            }
+
+            *pml4_entry = pdpt_phys.as_u64() | PteFlags::PAGE_TABLE.bits();
+        }
+
+        // Read PDPT entry
+        let pdpt_phys = PhysAddr::new(*pml4_entry & 0x000_FFFF_FFFF_F000);
+        let pdpt_virt = VirtAddr::new(PHYS_MEMORY_VIRT | pdpt_phys.as_u64());
+        let pdpt_entry_ptr = pdpt_virt.as_u64() + (indices.pdpt * 8) as u64;
+        let pdpt_entry = unsafe { &mut *(pdpt_entry_ptr as *mut u64) };
+
+        // Allocate PD if needed
+        if *pdpt_entry == 0 {
+            let pd_phys = self.frame_alloc.alloc_frame().ok_or(Error::Enomem)?;
+            let pd_virt = VirtAddr::new(PHYS_MEMORY_VIRT | pd_phys.as_u64());
+
+            unsafe {
+                core::ptr::write_bytes(pd_virt.as_mut_ptr::<u64>(), 0, PT_ENTRIES);
+            }
+
+            *pdpt_entry = pd_phys.as_u64() | PteFlags::PAGE_TABLE.bits();
+        }
+
+        // Read PD entry
+        let pd_phys = PhysAddr::new(*pdpt_entry & 0x000_FFFF_FFFF_F000);
+        let pd_virt = VirtAddr::new(PHYS_MEMORY_VIRT | pd_phys.as_u64());
+        let pd_entry_ptr = pd_virt.as_u64() + (indices.pd * 8) as u64;
+        let pd_entry = unsafe { &mut *(pd_entry_ptr as *mut u64) };
+
+        // Allocate PT if needed
+        if *pd_entry == 0 {
+            let pt_phys = self.frame_alloc.alloc_frame().ok_or(Error::Enomem)?;
+            let pt_virt = VirtAddr::new(PHYS_MEMORY_VIRT | pt_phys.as_u64());
+
+            unsafe {
+                core::ptr::write_bytes(pt_virt.as_mut_ptr::<u64>(), 0, PT_ENTRIES);
+            }
+
+            *pd_entry = pt_phys.as_u64() | PteFlags::PAGE_TABLE.bits();
+        }
+
+        // Read PT entry
+        let pt_phys = PhysAddr::new(*pd_entry & 0x000_FFFF_FFFF_F000);
+        let pt_virt = VirtAddr::new(PHYS_MEMORY_VIRT | pt_phys.as_u64());
+        let pt_entry_ptr = pt_virt.as_u64() + (indices.pt * 8) as u64;
+
+        // Set the final PTE
+        let user_flags = flags | PteFlags::USER;
+        unsafe {
+            core::ptr::write(pt_entry_ptr as *mut u64, phys.as_u64() | user_flags.bits());
+            // sfence to ensure the PTE write is committed before TLB flush
+            core::arch::asm!("sfence", options(nostack, preserves_flags));
+        }
+
+        // Invalidate TLB for this address
+        invalidate_tlb(virt);
+
+        Ok(())
+    }
+
+    /// Unmap a user virtual address
+    pub fn unmap(&mut self, virt: VirtAddr) -> Result<()> {
+        if virt.as_u64() >= KERNEL_VIRT_BASE {
+            return Err(Error::Einval);
+        }
+
+        let indices = PageTableIndices::from_virt(virt);
+        let pml4_virt = VirtAddr::new(PHYS_MEMORY_VIRT | self.pml4_phys.as_u64());
+
+        // Walk down to find the PTE
+        let pml4_entry_ptr = pml4_virt.as_u64() + (indices.pml4 * 8) as u64;
+        let pml4_entry = unsafe { &mut *(pml4_entry_ptr as *mut u64) };
+
+        if *pml4_entry == 0 {
+            return Err(Error::Enoent);
+        }
+
+        let pdpt_phys = PhysAddr::new(*pml4_entry & 0x000_FFFF_FFFF_F000);
+        let pdpt_virt = VirtAddr::new(PHYS_MEMORY_VIRT | pdpt_phys.as_u64());
+        let pdpt_entry_ptr = pdpt_virt.as_u64() + (indices.pdpt * 8) as u64;
+        let pdpt_entry = unsafe { &mut *(pdpt_entry_ptr as *mut u64) };
+
+        if *pdpt_entry == 0 {
+            return Err(Error::Enoent);
+        }
+
+        let pd_phys = PhysAddr::new(*pdpt_entry & 0x000_FFFF_FFFF_F000);
+        let pd_virt = VirtAddr::new(PHYS_MEMORY_VIRT | pd_phys.as_u64());
+        let pd_entry_ptr = pd_virt.as_u64() + (indices.pd * 8) as u64;
+        let pd_entry = unsafe { &mut *(pd_entry_ptr as *mut u64) };
+
+        if *pd_entry == 0 {
+            return Err(Error::Enoent);
+        }
+
+        let pt_phys = PhysAddr::new(*pd_entry & 0x000_FFFF_FFFF_F000);
+        let pt_virt = VirtAddr::new(PHYS_MEMORY_VIRT | pt_phys.as_u64());
+        let pt_entry_ptr = pt_virt.as_u64() + (indices.pt * 8) as u64;
+        let pt_entry = unsafe { &mut *(pt_entry_ptr as *mut u64) };
+
+        if *pt_entry == 0 {
+            return Err(Error::Enoent);
+        }
+
+        // Clear the PTE
+        unsafe {
+            core::ptr::write(pt_entry_ptr as *mut u64, 0);
+        }
+
+        // Invalidate TLB
+        invalidate_tlb(virt);
+
+        Ok(())
+    }
+
+    /// Free all page tables associated with this user address space
+    pub fn destroy(&mut self) {
+        // Walk through all PML4 entries and free the page tables
+        let pml4_virt = VirtAddr::new(PHYS_MEMORY_VIRT | self.pml4_phys.as_u64());
+
+        for i in 0..PT_ENTRIES {
+            let entry_ptr = pml4_virt.as_u64() + (i * 8) as u64;
+            let entry = unsafe { core::ptr::read(entry_ptr as *const u64) };
+
+            if entry != 0 {
+                // This is a PDPT, walk through and free it
+                let pdpt_phys = PhysAddr::new(entry & 0x000_FFFF_FFFF_F000);
+
+                // We don't free nested tables in this simplified implementation
+                // A full implementation would recursively free all tables
+
+                // Free the PDPT frame
+                let _ = self.frame_alloc.free_frame(pdpt_phys);
+            }
+        }
+
+        // Free the PML4 frame
+        let _ = self.frame_alloc.free_frame(self.pml4_phys);
+    }
+}
+
+/// Map a physical address range into kernel virtual memory using 2MB huge pages.
+///
+/// Walks the existing PML4 (set up by `early_paging_init`) and installs new
+/// PDPT and PD tables as needed. Returns the kernel virtual address where
+/// the range starts. Uses a fixed mapping window at `0xFFFF_C000_0000_0000`
+/// plus the physical address offset, so different physical bases get
+/// different virtual bases.
+///
+/// Uses PRESENT | WRITABLE | NX | GLOBAL | PS (2MB huge page) flags.
+///
+/// # Safety
+/// Must be called after `early_paging_init`. The mapping window is fixed
+/// and must not collide with existing critical mappings.
+pub unsafe fn map_phys_range(phys: u64, size: u64) -> *mut u8 {
+    use crate::plan9_arch::x86_64::paging::PAGE_SHIFT;
+
+    serial::put_bytes(b"[map_phys_range] phys=");
+    serial::put_hex_u64(phys);
+    serial::put_bytes(b" size=");
+    serial::put_hex_u64(size);
+    serial::put_bytes(b"\n");
+
+    let page_size: u64 = 1u64 << PAGE_SHIFT;
+    let phys_aligned = phys & !(page_size - 1);
+    let end = (phys + size + page_size - 1) & !(page_size - 1);
+    let total = end - phys_aligned;
+    let pages = total / page_size;
+
+    let phys_offset = phys_aligned & 0x0FFF_FFFF; // 28 bits = 256 MiB window
+    let base_virt = 0xFFFF_9000_0000_0000u64 | phys_offset;
+
+    let old_cr3: u64;
+    core::arch::asm!("mov {0}, cr3", out(reg) old_cr3, options(nostack));
+    serial::put_bytes(b"[map_phys_range] CR3=0x");
+    serial::put_hex_u64(old_cr3);
+    serial::put_bytes(b"\n");
+
+    serial::put_bytes(b"[map_phys_range] pages=");
+    serial::put_hex_u64(pages as u64);
+    serial::put_bytes(b" base_virt=");
+    serial::put_hex_u64(base_virt);
+    serial::put_bytes(b"\n");
+
+    static mut SCRATCH_TOP: u64 = 0x380000;
+    let _scratch_ptr = SCRATCH_TOP as *mut u8;
+
+    let pml4_phys = old_cr3;
+    let mut page_idx: u64 = 0;
+    while page_idx < pages {
+        let cur_phys = phys_aligned + page_idx * page_size;
+        let cur_virt = base_virt + page_idx * page_size;
+        let indices = crate::plan9_arch::x86_64::paging::PageTableIndices::from_virt(
+            plan9_common::types::VirtAddr::new(cur_virt)
+        );
+
+        let pml4_entry_ptr = (pml4_phys as *mut u64).add(indices.pml4);
+        let pml4_entry = core::ptr::read_volatile(pml4_entry_ptr);
+        let pdpt_phys = if (pml4_entry & 1) == 0 {
+            let new_pdpt_phys = SCRATCH_TOP;
+            SCRATCH_TOP += page_size;
+            core::ptr::write_bytes(new_pdpt_phys as *mut u8, 0, page_size as usize);
+            let new_entry = new_pdpt_phys | 0x3u64;
+            core::ptr::write_volatile(pml4_entry_ptr, new_entry);
+            new_pdpt_phys
+        } else {
+            pml4_entry & 0x000_FFFF_FFFF_F000
+        };
+
+        let pdpt_entry_ptr = (pdpt_phys as *mut u64).add(indices.pdpt);
+        let pdpt_entry = core::ptr::read_volatile(pdpt_entry_ptr);
+        let pd_phys = if (pdpt_entry & 1) == 0 {
+            let new_pd_phys = SCRATCH_TOP;
+            SCRATCH_TOP += page_size;
+            core::ptr::write_bytes(new_pd_phys as *mut u8, 0, page_size as usize);
+            let new_entry = new_pd_phys | 0x3u64;
+            core::ptr::write_volatile(pdpt_entry_ptr, new_entry);
+            new_pd_phys
+        } else {
+            pdpt_entry & 0x000_FFFF_FFFF_F000
+        };
+
+        let pd_entry_ptr = (pd_phys as *mut u64).add(indices.pd);
+        // For huge pages (PS=1) the address bits 51:21 are honoured;
+        // bits 20:0 are reserved for flags. Drop the low bits of the
+        // physical address so the resulting PTE only carries an
+        // aligned base.
+        let cur_phys_aligned = cur_phys & !0x1F_FFFFu64;
+        let pd_flags: u64 = 1u64 | (1u64 << 1) | (1u64 << 7) | (1u64 << 8) | (1u64 << 63);
+        let new_pd_entry = cur_phys_aligned | pd_flags;
+        core::ptr::write_volatile(pd_entry_ptr, new_pd_entry);
+        // sfence: order page-table stores vs. the CR3 reload that follows.
+        core::arch::asm!("sfence", options(nostack, preserves_flags));
+        // Invalidate any cached translation for this address, then
+        // globally flush the TLB by reloading CR3.
+        core::arch::asm!(
+            "invlpg [{}]",
+            in(reg) cur_virt,
+            options(nostack),
+        );
+        core::arch::asm!(
+            "mov cr3, {0}",
+            in(reg) old_cr3,
+            options(nostack),
+        );
+
+        page_idx += 1;
+    }
+
+    let result_virt = base_virt + (phys - phys_aligned);
+    serial::put_bytes(b"[map_phys_range] DONE, virt=");
+    serial::put_hex_u64(result_virt);
+    serial::put_bytes(b" scratch_top=");
+    serial::put_hex_u64(SCRATCH_TOP);
+    serial::put_bytes(b"\n");
+    result_virt as *mut u8
+}
+
+/// Invalidate TLB entry for a specific virtual address
+fn invalidate_tlb(virt: VirtAddr) {
+    unsafe {
+        // Use INVLPG instruction on x86_64
+        core::arch::asm!("invlpg [{}]", in(reg) virt.as_u64(), options(nostack));
+    }
+}
+
+// ============================================================================
 // Global Frame Allocator
 // ============================================================================
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::AtomicPtr;
 use crate::plan9_common::types::PhysAddr as CommonPhysAddr;
 
 static FRAME_ALLOCATOR_INSTANCE: AtomicPtr<FrameAllocator> = AtomicPtr::new(core::ptr::null_mut());
@@ -797,9 +1559,19 @@ static FRAME_ALLOCATOR_INSTANCE: AtomicPtr<FrameAllocator> = AtomicPtr::new(core
 /// Initialize the global frame allocator
 /// Called during kernel initialization
 pub fn init_allocator(base: CommonPhysAddr, size: usize) {
+    serial::put_bytes(b"[vm::init_allocator] STEP1: calling FrameAllocator::new\n");
+    // FrameAllocator::new() writes to the managed memory region at `base`
+    // and returns a reference pointing to that memory.
+    // We take its address to store in the global.
     let alloc = FrameAllocator::new(base, size);
-    let ptr = alloc as *mut FrameAllocator;
-    FRAME_ALLOCATOR_INSTANCE.store(ptr, Ordering::SeqCst);
+    serial::put_bytes(b"[vm::init_allocator] STEP2: FrameAllocator::new returned\n");
+    let alloc_ptr = alloc as *const FrameAllocator as *mut FrameAllocator;
+    serial::put_bytes(b"[vm::init_allocator] STEP3: storing ptr\n");
+    FRAME_ALLOCATOR_INSTANCE.store(alloc_ptr, Ordering::SeqCst);
+    serial::put_bytes(b"[vm::init_allocator] STEP4: ptr stored\n");
+    serial::put_bytes(b"[vm] allocator stored at ptr=");
+    serial::put_hex_u64(alloc_ptr as u64);
+    serial::put_bytes(b"\n");
 }
 
 /// Get mutable reference to global frame allocator
@@ -810,6 +1582,27 @@ pub fn frame_allocator() -> &'static mut FrameAllocator {
 /// Allocate a physical frame
 pub fn alloc_frame() -> Option<PhysAddr> {
     frame_allocator().alloc_frame()
+}
+
+/// Allocate a physical frame. Alias used by the new `frame_alloc` module.
+#[inline(always)]
+pub fn frame_alloc_one() -> Option<PhysAddr> {
+    alloc_frame()
+}
+
+/// Allocate a physical frame and zero it.
+pub fn alloc_frame_zeroed() -> Option<PhysAddr> {
+    let paddr = alloc_frame()?;
+    // SAFETY: the returned frame is owned by the caller and has just been
+    // allocated, so it cannot be aliased elsewhere.
+    unsafe {
+        core::ptr::write_bytes(
+            crate::plan9_arch::x86_64::paging::phys_to_virt(paddr).as_mut_ptr::<u8>(),
+            0,
+            PAGESIZE,
+        );
+    }
+    Some(paddr)
 }
 
 /// Allocate multiple physical frames
@@ -830,4 +1623,22 @@ pub fn total_frames() -> usize {
 /// Get number of free frames
 pub fn free_frames() -> usize {
     frame_allocator().free_frames()
+}
+
+/// Create a new user page table for a process
+///
+/// This allocates a new PML4 table and sets up the necessary
+/// kernel identity mappings so the kernel can still access memory.
+pub fn create_user_page_table() -> Option<PhysAddr> {
+    let table = UserPageTable::new(frame_allocator())?;
+    Some(table.pml4_phys())
+}
+
+/// Switch to user page table
+///
+/// This loads the new CR3 value to switch address spaces.
+/// Note: This should only be called from kernel context.
+pub fn switch_to_user_page_table(pml4_phys: PhysAddr) {
+    use crate::plan9_arch::x86_64::mmu::cr3_write;
+    cr3_write(pml4_phys);
 }

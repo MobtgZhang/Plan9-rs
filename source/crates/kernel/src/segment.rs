@@ -7,9 +7,7 @@
 //! - COW (Copy-on-Write) support
 
 use alloc::boxed::Box;
-use crate::proc::SegType;
-use crate::plan9_common::sync::{Spinlock, Mutex};
-
+use crate::plan9_common::sync::{ Mutex };
 // ============================================================================
 // Constants
 // ============================================================================
@@ -83,6 +81,9 @@ impl SegFlags {
         self.0
     }
 }
+
+// Re-export ProcSegment for backward compatibility
+pub use crate::proc::ProcSegment;
 
 // ============================================================================
 // Page Table Entry
@@ -225,7 +226,7 @@ impl Segment {
             flen: size,
             mlen: size,
             flags,
-            refcount: Spinlock::new(1),
+            refcount: Mutex::new(1),
             image: None,
         }
     }
@@ -435,15 +436,16 @@ impl CowPage {
     pub fn new(phys: u64) -> Self {
         Self {
             phys,
-            refcount: Spinlock::new(2), // Initial: parent + child
+            refcount: Mutex::new(2), // Initial: parent + child
         }
     }
 
     /// Copy the page (allocate new physical page)
     pub fn copy(&self) -> u64 {
-        // This would allocate a new physical page and copy data
-        // Return new physical address
-        0 // Placeholder
+        match crate::vm::alloc_frame() {
+            Some(frame) => frame.as_u64(),
+            None => 0,
+        }
     }
 
     /// Increment reference
@@ -496,4 +498,69 @@ pub fn page_offset(addr: u64) -> u64 {
 /// Convert virtual page number to index in page table level
 pub fn pte_index(vpn: u64, level: usize) -> usize {
     (vpn >> (9 * level)) as usize & 0x1FF
+}
+
+// ============================================================================
+// TLB Management
+// ============================================================================
+
+/// Flush TLB for a range of addresses
+pub fn tlb_flush_range(_start: u64, _count: u64) {
+    // In a real implementation, this would use INVLPG or flush entire TLB
+    // For now, we rely on the architecture-level implementation
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Use the architecture module
+        crate::plan9_arch::x86_64::mmu::flush_tlb();
+    }
+}
+
+/// Increment reference count for a page
+pub fn inc_ref(_page: u64) {
+    // In a real implementation, this would update page reference counts
+}
+
+/// Get page reference count
+pub fn page_ref(_page: u64) -> u32 {
+    // In a real implementation, this would return the actual reference count
+    1
+}
+
+// ============================================================================
+// Segment Permissions
+// ============================================================================
+
+/// Segment permissions structure
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcSegmentPerm {
+    /// Read permission
+    pub read: bool,
+    /// Write permission
+    pub write: bool,
+    /// Execute permission
+    pub exec: bool,
+    /// User mode permission
+    pub user: bool,
+}
+
+impl ProcSegmentPerm {
+    /// Create permissions from flags
+    pub fn from_flags(flags: u32) -> Self {
+        Self {
+            read: (flags & 0x01) != 0,
+            write: (flags & 0x02) != 0,
+            exec: (flags & 0x04) != 0,
+            user: (flags & 0x40) != 0,
+        }
+    }
+
+    /// Convert to flags
+    pub fn to_flags(&self) -> u32 {
+        let mut flags = 0u32;
+        if self.read { flags |= 0x01; }
+        if self.write { flags |= 0x02; }
+        if self.exec { flags |= 0x04; }
+        if self.user { flags |= 0x40; }
+        flags
+    }
 }

@@ -1,3 +1,4 @@
+
 //! Mnt Device Implementation
 //!
 //! Implements the Plan 9 mount device (#M) for 9P filesystem mounting.
@@ -15,12 +16,13 @@
 //!     └── ctl         (mount configuration)
 //! ```
 
-use crate::dev::{self, Dev, Chan, Qid, DirEntry, Error as DevError, qidtype};
-use crate::plan9_common::sync::{Spinlock, Mutex};
-use alloc::vec::Vec;
-use alloc::string::String;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+extern crate alloc;
 
+use crate::dev::{self, Dev, Chan, Qid, DirEntry, Error as DevError, qidtype};
+use crate::plan9_common::sync::{ Spinlock };use alloc::vec::Vec;
+use alloc::format;
+use alloc::string::String;
+use core::sync::atomic::{ AtomicU64, Ordering };
 /// Maximum number of mount points
 const MNT_MAX_MOUNTS: usize = 16;
 
@@ -37,7 +39,7 @@ mod mnt_qid {
 
 /// Mount information
 #[derive(Debug, Clone)]
-struct MountInfo {
+pub struct MountInfo {
     /// Mount ID
     id: usize,
     /// Server address
@@ -80,10 +82,10 @@ impl MntDev {
         
         let info = MountInfo {
             id,
-            address: address.to_string(),
-            path: path.to_string(),
+            address: alloc::string::String::from(address),
+            path: alloc::string::String::from(path),
             mounted: false,
-            version: "9P2000".to_string(),
+            version: alloc::string::String::from("9P2000"),
         };
         
         // Ensure vector is large enough
@@ -116,7 +118,7 @@ impl MntDev {
             }
             mount.mounted = true;
             if !version.is_empty() {
-                mount.version = version.to_string();
+                mount.version = alloc::string::String::from(version);
             }
             Ok(())
         } else {
@@ -144,7 +146,7 @@ impl Dev for MntDev {
         Ok(Chan::new(
             dev::devtype::MNT,
             Qid::new(mnt_qid::QDIR, 0, qidtype::DIR),
-            0oOREAD,
+            0,
         ))
     }
 
@@ -185,7 +187,7 @@ impl Dev for MntDev {
         Ok(())
     }
 
-    fn create(&mut self, ch: &mut Chan, name: &str, _mode: u8, _perm: u32) -> Result<(), DevError> {
+    fn create(&mut self, _ch: &mut Chan, _name: &str, _mode: u8, _perm: u32) -> Result<(), DevError> {
         // Can't create files in mnt device
         Err(DevError::Eperm)
     }
@@ -242,7 +244,7 @@ impl Dev for MntDev {
     }
 
     fn write(&mut self, ch: &mut Chan, buf: &[u8], _offset: u64) -> Result<usize, DevError> {
-        let qid = ch.qid.path;
+        let _qid =ch.qid.path;
         
         // Parse command
         let cmd = String::from_utf8_lossy(buf);
@@ -285,7 +287,7 @@ impl Dev for MntDev {
     fn stat(&mut self, ch: &mut Chan) -> Result<DirEntry, DevError> {
         let qid = ch.qid.path;
         
-        let (name, mode, qtype) = if qid == mnt_qid::QDIR {
+        let (name, mode, _qtype) = if qid == mnt_qid::QDIR {
             (b"mnt".to_vec(), 0o555 | 0o40000, qidtype::DIR)
         } else {
             (b"ctl".to_vec(), 0o666, 0)

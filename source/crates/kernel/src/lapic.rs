@@ -4,7 +4,7 @@
 //! which handles timer interrupts and inter-processor interrupts.
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
+// use alloc::vec::Vec;
 use crate::plan9_common::types::PhysAddr;
 
 // ============================================================================
@@ -47,7 +47,7 @@ mod lapic_regs {
 const LAPIC_BASE_DEFAULT: u64 = 0xFEE00000;
 
 /// Spurious vector for LAPIC
-const LAPIC_SPURIOUS_VECTOR: u8 = 0xFF;
+const LAPIC_SPURIOUS_VECTOR: u32 = 0xFF;
 
 /// LAPIC timer mode
 #[derive(Debug, Clone, Copy)]
@@ -228,6 +228,7 @@ pub fn lapic() -> &'static Lapic {
 }
 
 /// Send EOI to the LAPIC
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub fn eoi() {
     // LAPIC is at a fixed address, so we can use a simple inline function
@@ -239,11 +240,19 @@ pub fn eoi() {
     }
 }
 
+/// Stub EOI for non-x86_64 architectures
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+pub fn eoi() {
+    // No LAPIC on non-x86_64 architectures
+}
+
 // ============================================================================
 // Legacy PIC (8259A) Functions (for compatibility)
 // ============================================================================
 
 /// Initialize the legacy 8259A PIC
+#[cfg(target_arch = "x86_64")]
 pub fn pic_init() {
     // Mask all interrupts on the PIC
     unsafe {
@@ -298,7 +307,14 @@ pub fn pic_init() {
     }
 }
 
+/// Stub PIC init for non-x86_64 architectures
+#[cfg(not(target_arch = "x86_64"))]
+pub fn pic_init() {
+    // No legacy PIC on non-x86_64 architectures
+}
+
 /// Send EOI to the legacy PIC
+#[cfg(target_arch = "x86_64")]
 pub fn pic_eoi(irq: u8) {
     if irq >= 8 {
         // End interrupt on PIC2
@@ -320,41 +336,162 @@ pub fn pic_eoi(irq: u8) {
     }
 }
 
+/// Stub PIC EOI for non-x86_64 architectures
+#[cfg(not(target_arch = "x86_64"))]
+pub fn pic_eoi(_irq: u8) {
+    // No legacy PIC on non-x86_64 architectures
+}
+
 /// Enable an IRQ on the PIC
+///
+/// This function enables a specific IRQ line on the 8259 PIC.
+/// The IRQ number must be between 0 and 15 (IRQ0-IRQ15).
+///
+/// On the master PIC (IRQ 0-7), the corresponding bit in port 0x21 is cleared.
+/// On the slave PIC (IRQ 8-15), the corresponding bit in port 0xA1 is cleared.
+#[cfg(target_arch = "x86_64")]
 pub fn pic_enable_irq(irq: u8) {
-    let port = if irq >= 8 { 0xA1 } else { 0x21 };
-    let mask = if irq >= 8 { 0x08 } else { 0x04 };
-    let irq_bit = 1 << (irq % 8);
+    if irq > 15 {
+        return;
+    }
+
+    let irqbit: u8;
+    let port: u16;
+
+    if irq < 8 {
+        // Master PIC (IRQ 0-7)
+        irqbit = 1 << irq;
+        port = 0x21;
+    } else {
+        // Slave PIC (IRQ 8-15)
+        irqbit = 1 << (irq - 8);
+        port = 0xA1;
+    }
 
     unsafe {
+        let port_val = port as u32;
+        let mask_val = irqbit;
         core::arch::asm!(
             "in al, dx",
-            // Mask out the bit for this IRQ
-            "mov ah, 1",
-            "shl ah, cl",
-            "not ah",
-            "and al, ah",
+            "not al",
+            "and al, {mask}",
+            "not al",
             "out dx, al",
-            in("dx") port,
-            in("cl") irq % 8,
+            in("dx") port_val,
+            mask = in(reg_byte) mask_val,
             options(nostack, preserves_flags)
         );
     }
 }
 
 /// Disable an IRQ on the PIC
+///
+/// This function disables a specific IRQ line on the 8259 PIC.
+/// The IRQ number must be between 0 and 15 (IRQ0-IRQ15).
+///
+/// On the master PIC (IRQ 0-7), the corresponding bit in port 0x21 is set.
+/// On the slave PIC (IRQ 8-15), the corresponding bit in port 0xA1 is set.
+#[cfg(target_arch = "x86_64")]
 pub fn pic_disable_irq(irq: u8) {
-    let port = if irq >= 8 { 0xA1 } else { 0x21 };
-    let irq_bit = 1 << (irq % 8);
+    if irq > 15 {
+        return;
+    }
+
+    let irqbit: u8;
+    let port: u16;
+
+    if irq < 8 {
+        // Master PIC (IRQ 0-7)
+        irqbit = 1 << irq;
+        port = 0x21;
+    } else {
+        // Slave PIC (IRQ 8-15)
+        irqbit = 1 << (irq - 8);
+        port = 0xA1;
+    }
 
     unsafe {
+        let port_val = port as u32;
+        let mask_val = irqbit;
         core::arch::asm!(
             "in al, dx",
-            "or al, bh",
+            "or al, {mask}",
             "out dx, al",
-            in("dx") port,
-            in("bh") irq_bit,
+            in("dx") port_val,
+            mask = in(reg_byte) mask_val,
             options(nostack, preserves_flags)
         );
     }
+}
+
+/// Get the current PIC interrupt mask
+///
+/// Returns a 16-bit mask representing the current state of both PICs:
+/// - Bits 0-7: Master PIC (IRQ0-IRQ7), 1 = masked, 0 = enabled
+/// - Bits 8-15: Slave PIC (IRQ8-IRQ15), 1 = masked, 0 = enabled
+#[cfg(target_arch = "x86_64")]
+pub fn pic_get_mask() -> u16 {
+    let master: u8;
+    let slave: u8;
+
+    unsafe {
+        core::arch::asm!(
+            "in al, 0x21",
+            "mov {master}, al",
+            "in al, 0xA1",
+            "mov {slave}, al",
+            master = out(reg_byte) master,
+            slave = out(reg_byte) slave,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    (master as u16) | ((slave as u16) << 8)
+}
+
+/// Set the PIC interrupt mask directly
+///
+/// Takes a 16-bit mask representing the desired state of both PICs:
+/// - Bits 0-7: Master PIC (IRQ0-IRQ7), 1 = masked, 0 = enabled
+/// - Bits 8-15: Slave PIC (IRQ8-IRQ15), 1 = masked, 0 = enabled
+#[cfg(target_arch = "x86_64")]
+pub fn pic_set_mask(mask: u16) {
+    let low = (mask & 0xFF) as u8;
+    let high = ((mask >> 8) & 0xFF) as u8;
+
+    unsafe {
+        core::arch::asm!(
+            "mov al, {low}",
+            "out 0x21, al",
+            "mov al, {high}",
+            "out 0xA1, al",
+            low = in(reg_byte) low,
+            high = in(reg_byte) high,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Stub PIC enable_irq for non-x86_64 architectures
+#[cfg(not(target_arch = "x86_64"))]
+pub fn pic_enable_irq(_irq: u8) {
+    // No legacy PIC on non-x86_64 architectures
+}
+
+/// Stub PIC disable_irq for non-x86_64 architectures
+#[cfg(not(target_arch = "x86_64"))]
+pub fn pic_disable_irq(_irq: u8) {
+    // No legacy PIC on non-x86_64 architectures
+}
+
+/// Stub PIC get_mask for non-x86_64 architectures
+#[cfg(not(target_arch = "x86_64"))]
+pub fn pic_get_mask() -> u16 {
+    0xFFFF // All masked
+}
+
+/// Stub PIC set_mask for non-x86_64 architectures
+#[cfg(not(target_arch = "x86_64"))]
+pub fn pic_set_mask(_mask: u16) {
+    // No legacy PIC on non-x86_64 architectures
 }
