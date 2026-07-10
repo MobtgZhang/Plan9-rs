@@ -1,7 +1,28 @@
 [workspace]
 resolver = "2"
 members = [
-    "source",
+    "source/crates/*",
+]
+# Default to building only the host-target crates (userspace + libs).
+# Kernel and init are no_std freestanding binaries that require
+# `cargo build --target x86_64-unknown-none` from their own directories,
+# which is what `make kernel` / `make all` does.
+default-members = [
+    "source/crates/arch",
+    "source/crates/common",
+    "source/crates/bootloader",
+    "source/crates/drivers",
+    "source/crates/ipc",
+    "source/crates/net",
+    "source/crates/libregexp",
+    "source/crates/libdraw",
+    "source/crates/libplumb",
+    "source/crates/libsys",
+    "source/crates/security",
+    "source/crates/libventi",
+    "source/crates/fs",
+    "source/crates/servers",
+    "source/crates/userspace",
 ]
 
 [profile.release]

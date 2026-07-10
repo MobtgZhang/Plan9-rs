@@ -2,13 +2,22 @@
 resolver = "2"
 members = [
     "crates/*",
+    "crates/grub-cfg",
+    "build_tool",
 ]
+
+[workspace.dependencies]
+tempfile = "3.10"
+
+# Default: panic=abort so that no_std crates don't need a panic handler.
+# The nightly compiler precompiles core with panic=unwind; without this setting
+# the kernel's #[panic_handler] conflicts with the precompiled core lang item.
+[profile.dev]
+panic = "abort"
+opt-level = 0
 
 [profile.release]
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
-
-[profile.dev]
-panic = "abort"

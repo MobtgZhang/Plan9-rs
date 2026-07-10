@@ -1,8 +1,5 @@
-[profile.dev]
-opt-level = 0
-debug = true
+# Workspace-level .cargo/config.toml
+# These settings apply to all workspace members unless overridden.
 
-[profile.release]
-opt-level = "s"
-lto = true
-codegen-units = 1
+[target.x86_64-unknown-none]
+runner = "none"
