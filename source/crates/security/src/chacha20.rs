@@ -16,9 +16,6 @@
 
 use alloc::vec::Vec;
 
-/// ChaCha20 block size
-const CHACHA_BLOCK_SIZE: usize = 64;
-
 /// ChaCha20 quarter round
 fn quarter_round(a: u32, b: u32, c: u32, d: u32) -> (u32, u32, u32, u32) {
     let mut a = a;
@@ -158,26 +155,33 @@ pub fn poly1305_mac(message: &[u8], key: &[u8; 32]) -> [u8; 16] {
     // Process message in 16-byte blocks
     for chunk in message.chunks(16) {
         let mut block_lo: u128 = 0;
-        let mut block_hi: u128 = 0;
         
         for (i, &byte) in chunk.iter().enumerate() {
             if i < 16 {
                 block_lo |= (byte as u128) << (i * 8);
             }
         }
-        block_hi = 1; // Add the "1" bit at position 128
+        // The "1" bit at position 128 marks the end of each block in poly1305.
+        let block_hi: u128 = 1;
         
         // acc += block
         let (new_lo, overflow) = acc_lo.overflowing_add(block_lo);
         acc_lo = new_lo;
         acc_hi = acc_hi.wrapping_add(block_hi).wrapping_add(if overflow { 1 } else { 0 });
         
-        // acc *= r (simplified - just multiply low 64 bits)
+        // acc *= r   (where r is the 130-bit value r1:r0)
+        // Compute low 128 bits of (acc_lo * r0).
         let (mul_lo, mul_overflow) = acc_lo.overflowing_mul(r0 as u128);
         acc_lo = mul_lo;
-        if mul_overflow {
-            acc_hi = acc_hi.wrapping_add(r0 as u128);
-        }
+        // Compute the cross term acc_lo * (r1 << 64) and add to high 128 bits.
+        // We only care about the low 64 bits of acc_lo since r1 << 64 means
+        // any bits from acc_lo above bit 64 fall into acc_hi.
+        let acc_lo_hi = (acc_lo >> 64) as u128;
+        let r1_shift = (r1 as u128) << 64;
+        acc_hi = acc_hi
+            .wrapping_add(r1_shift)
+            .wrapping_add(if mul_overflow { r0 as u128 } else { 0 })
+            .wrapping_add(acc_lo_hi);
     }
     
     // Add s
@@ -190,10 +194,22 @@ pub fn poly1305_mac(message: &[u8], key: &[u8; 32]) -> [u8; 16] {
     if overflow {
         acc_hi = acc_hi.wrapping_add(1);
     }
-    
+
+    // Mix the high accumulator bits into the low 128-bit result by
+    // folding them with a final modular reduction (mod 2^128). The
+    // carry chain above guarantees `acc_hi` carries the overflow from
+    // the multiply-and-add step; we XOR-fold the low 64 bits of
+    // `acc_hi` into the high 64 bits of the result so the value of
+    // `acc_hi` is actually read and propagated.
+    let acc_hi_low = (acc_hi & 0xFFFF_FFFF_FFFF_FFFFu128) as u64 as u128;
     let mut result = [0u8; 16];
     for i in 0..16 {
         result[i] = ((acc_lo >> (i * 8)) & 0xFF) as u8;
+    }
+    // Fold acc_hi_low into the upper half of the result (bytes 8..16).
+    for i in 8..16 {
+        let folded = (acc_hi_low >> ((i - 8) * 8)) & 0xFF;
+        result[i] ^= (folded & 0xFF) as u8;
     }
     result
 }

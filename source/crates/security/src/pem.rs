@@ -116,7 +116,7 @@ fn base64_encode(data: &[u8]) -> String {
         let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
         let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
         
-        result.push(TABLE[(b0 >> 2)] as char);
+        result.push(TABLE[b0 >> 2] as char);
         result.push(TABLE[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
         
         if chunk.len() > 1 {

@@ -27,8 +27,9 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use alloc::format;
+use alloc::string::{String, ToString};
 use core::cmp::Ordering;
-use core::ops::{Add, Sub, Mul};
 
 /// Digit size for internal representation (32 bits)
 const DIGIT_BITS: usize = 32;
@@ -74,62 +75,6 @@ impl BigInt {
         } else {
             Self::from_u64(value as u64)
         }
-    }
-
-    /// Create a BigInt from bytes (big-endian)
-    pub fn from_bytes_be(data: &[u8]) -> Self {
-        if data.is_empty() {
-            return Self::zero();
-        }
-
-        let mut digits = Vec::new();
-        let mut i = data.len();
-
-        // Process 4 bytes at a time from the end
-        while i >= 4 {
-            i -= 4;
-            let word = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-            digits.push(word);
-        }
-
-        // Handle remaining bytes
-        if i > 0 {
-            let mut word = 0u32;
-            for j in 0..i {
-                word = (word << 8) | (data[j] as u32);
-            }
-            digits.push(word);
-        }
-
-        Self::normalize(Self { sign: 1, digits })
-    }
-
-    /// Create a BigInt from bytes (little-endian)
-    pub fn from_bytes_le(data: &[u8]) -> Self {
-        if data.is_empty() {
-            return Self::zero();
-        }
-
-        let mut digits = Vec::new();
-        let mut i = 0;
-
-        // Process 4 bytes at a time from the start
-        while i + 4 <= data.len() {
-            let word = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-            digits.push(word);
-            i += 4;
-        }
-
-        // Handle remaining bytes
-        if i < data.len() {
-            let mut word = 0u32;
-            for j in i..data.len() {
-                word |= (data[j] as u32) << (8 * (j - i));
-            }
-            digits.push(word);
-        }
-
-        Self::normalize(Self { sign: 1, digits })
     }
 
     /// Create a BigInt from a single digit
@@ -1047,5 +992,694 @@ impl BigInt {
             }
         }
         lo
+    }
+}
+
+/// Parse error for string conversion
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseBigIntError {
+    pub message: String,
+}
+
+impl core::fmt::Display for ParseBigIntError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "ParseBigIntError: {}", self.message)
+    }
+}
+
+impl BigInt {
+    /// Parse a string into a BigInt
+    ///
+    /// Supports bases 2-36 (digits 0-9, a-z, A-Z).
+    ///
+    /// # Arguments
+    /// * `s` - String to parse
+    /// * `radix` - Number base (2-36)
+    ///
+    /// # Example
+    /// ```
+    /// use plan9_security::bigint::BigInt;
+    /// let n = BigInt::from_str("12345", 10).unwrap();
+    /// ```
+    pub fn from_str(s: &str, radix: u32) -> Result<Self, ParseBigIntError> {
+        if radix < 2 || radix > 36 {
+            return Err(ParseBigIntError {
+                message: format!("radix {} out of range (2-36)", radix),
+            });
+        }
+
+        let s = s.trim();
+
+        if s.is_empty() {
+            return Err(ParseBigIntError {
+                message: "empty string".to_string(),
+            });
+        }
+
+        let mut chars = s.chars().peekable();
+
+        // Check for sign
+        let mut sign = 1i8;
+        let first_char = chars.peek().copied();
+        if first_char == Some('-') {
+            sign = -1;
+            chars.next();
+        } else if first_char == Some('+') {
+            chars.next();
+        }
+
+        // Handle radix prefix (0x, 0b, 0o)
+        let mut radix = radix;
+        let remaining: String = chars.collect();
+
+        // Check for hex, binary, octal prefix
+        if remaining.starts_with("0x") || remaining.starts_with("0X") {
+            if radix == 10 {
+                radix = 16;
+            }
+        } else if remaining.starts_with("0b") || remaining.starts_with("0B") {
+            if radix == 10 {
+                radix = 2;
+            }
+        } else if remaining.starts_with("0o") || remaining.starts_with("0O") {
+            if radix == 10 {
+                radix = 8;
+            }
+        }
+
+        // Strip prefix if present
+        let digits_start = if remaining.starts_with("0x") || remaining.starts_with("0X") {
+            2
+        } else if remaining.starts_with("0b") || remaining.starts_with("0B") ||
+                  remaining.starts_with("0o") || remaining.starts_with("0O") {
+            2
+        } else {
+            0
+        };
+
+        let digits = &remaining[digits_start..];
+
+        if digits.is_empty() {
+            return Err(ParseBigIntError {
+                message: "no digits found".to_string(),
+            });
+        }
+
+        // Parse digits
+        let mut result = Self::zero();
+
+        for c in digits.chars() {
+            let digit = char_to_digit(c, radix)?;
+            result = result.mul(&Self::from_u32(radix));
+            result = result.add(&Self::from_u32(digit));
+        }
+
+        if sign < 0 {
+            result.sign = -1;
+        }
+
+        Ok(result)
+    }
+
+    /// Convert to u64 (if it fits)
+    pub fn try_to_u64(&self) -> Option<u64> {
+        if self.is_zero() {
+            return Some(0);
+        }
+
+        if self.sign < 0 {
+            return None;
+        }
+
+        if self.digits.len() > 2 {
+            return None;
+        }
+
+        let mut result = 0u64;
+        for (i, &digit) in self.digits.iter().enumerate() {
+            result |= (digit as u64) << (i * 32);
+        }
+
+        Some(result)
+    }
+
+    /// Convert to i64 (if it fits)
+    pub fn to_i64(&self) -> Option<i64> {
+        if self.sign < 0 {
+            self.abs().try_to_u64().map(|v| -(v as i64))
+        } else {
+            self.try_to_u64().map(|v| v as i64)
+        }
+    }
+
+    /// Create from slice of bytes (big-endian)
+    pub fn from_bytes_be(data: &[u8]) -> Self {
+        if data.is_empty() {
+            return Self::zero();
+        }
+
+        let mut digits = Vec::new();
+        let mut i = data.len();
+
+        // Process 4 bytes at a time from the end
+        while i >= 4 {
+            i -= 4;
+            let word = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+            digits.push(word);
+        }
+
+        // Handle remaining bytes
+        if i > 0 {
+            let mut word = 0u32;
+            for j in 0..i {
+                word = (word << 8) | (data[j] as u32);
+            }
+            digits.push(word);
+        }
+
+        Self::normalize(Self { sign: 1, digits })
+    }
+
+    /// Create from slice of bytes (little-endian)
+    pub fn from_bytes_le(data: &[u8]) -> Self {
+        if data.is_empty() {
+            return Self::zero();
+        }
+
+        let mut digits = Vec::new();
+        let mut i = 0;
+
+        // Process 4 bytes at a time from the start
+        while i + 4 <= data.len() {
+            let word = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+            digits.push(word);
+            i += 4;
+        }
+
+        // Handle remaining bytes
+        if i < data.len() {
+            let mut word = 0u32;
+            for j in i..data.len() {
+                word |= (data[j] as u32) << (8 * (j - i));
+            }
+            digits.push(word);
+        }
+
+        Self::normalize(Self { sign: 1, digits })
+    }
+
+    /// Convert BigInt to a string in the given radix
+    ///
+    /// # Arguments
+    /// * `radix` - Number base (2-36)
+    ///
+    /// # Example
+    /// ```
+    /// use plan9_security::bigint::BigInt;
+    /// let n = BigInt::from_u64(255);
+    /// assert_eq!(n.to_str(16), "ff");
+    /// ```
+    pub fn to_str(&self, radix: u32) -> String {
+        if radix < 2 || radix > 36 {
+            return String::new();
+        }
+
+        if self.is_zero() {
+            return "0".to_string();
+        }
+
+        let mut result = Vec::new();
+        let mut n = self.abs();
+
+        while !n.is_zero() {
+            let (q, r) = n.divmod_digit(&32, 1); // Use 32-bit digits
+            let digit = r.digits.get(0).copied().unwrap_or(0) as u32;
+            result.push(digit_to_char((digit % radix) as u32));
+            n = q;
+        }
+
+        // Handle negative numbers
+        if self.sign < 0 {
+            result.push('-');
+        }
+
+        // Reverse and convert to string
+        result.reverse();
+        let digits_str: String = result.iter().map(|&d| d).collect();
+        digits_str
+    }
+
+    /// Alias for to_str
+    pub fn to_string_radix(&self, radix: u32) -> String {
+        self.to_str(radix)
+    }
+}
+
+/// Convert a character to its digit value
+fn char_to_digit(c: char, radix: u32) -> Result<u32, ParseBigIntError> {
+    let digit = if c.is_ascii_digit() {
+        c.to_digit(10).unwrap()
+    } else if c.is_ascii_hexdigit() {
+        c.to_digit(16).unwrap()
+    } else {
+        return Err(ParseBigIntError {
+            message: format!("invalid character: {}", c),
+        });
+    };
+
+    if digit >= radix {
+        return Err(ParseBigIntError {
+            message: format!("digit {} out of range for radix {}", digit, radix),
+        });
+    }
+
+    Ok(digit)
+}
+
+/// Convert a digit (0-35) to its character representation
+fn digit_to_char(digit: u32) -> char {
+    match digit {
+        0..=9 => (b'0' + digit as u8) as char,
+        10..=35 => (b'a' + (digit - 10) as u8) as char,
+        _ => '?',
+    }
+}
+
+// =========================================================================
+// Native Integer Conversions
+// =========================================================================
+
+impl BigInt {
+    /// Create a BigInt from i32
+    pub fn from_i32(value: i32) -> Self {
+        Self::from_i64(value as i64)
+    }
+
+    /// Convert BigInt to i32
+    pub fn to_i32(&self) -> Option<i32> {
+        self.to_i64().and_then(|v| v.try_into().ok())
+    }
+
+    /// Create a BigInt from u32
+    pub fn from_u32(value: u32) -> Self {
+        Self::from_u64(value as u64)
+    }
+
+    /// Create a BigInt from vlong (i64)
+    pub fn from_vlong(value: i64) -> Self {
+        Self::from_i64(value)
+    }
+
+    /// Convert BigInt to vlong (i64)
+    pub fn to_vlong(&self) -> Option<i64> {
+        self.to_i64()
+    }
+
+    /// Create a BigInt from uvlong (u64)
+    pub fn from_uvlong(value: u64) -> Self {
+        Self::from_u64(value)
+    }
+
+    /// Convert BigInt to uvlong (u64)
+    pub fn to_uvlong(&self) -> Option<u64> {
+        self.try_to_u64()
+    }
+
+    /// Create a BigInt from i128
+    pub fn from_i128(value: i128) -> Self {
+        if value < 0 {
+            let mut n = Self::from_u128(value.unsigned_abs());
+            n.sign = -1;
+            n
+        } else {
+            Self::from_u128(value as u128)
+        }
+    }
+
+    /// Convert BigInt to i128
+    pub fn to_i128(&self) -> Option<i128> {
+        if self.sign < 0 {
+            self.to_u128().map(|v| -(v as i128))
+        } else {
+            self.to_u128().map(|v| v as i128)
+        }
+    }
+
+    /// Create a BigInt from u128
+    pub fn from_u128(value: u128) -> Self {
+        if value == 0 {
+            return Self::zero();
+        }
+
+        let mut digits = Vec::new();
+        let mut remaining = value;
+
+        while remaining > 0 {
+            digits.push((remaining & 0xFFFFFFFF) as u32);
+            remaining >>= 32;
+        }
+
+        Self::normalize(Self { sign: 1, digits })
+    }
+
+    /// Convert BigInt to u128
+    pub fn to_u128(&self) -> Option<u128> {
+        if self.is_zero() {
+            return Some(0);
+        }
+
+        // Check if it fits in u128
+        if self.bit_length() > 128 {
+            return None;
+        }
+
+        let mut result = 0u128;
+        for (i, digit) in self.digits.iter().enumerate() {
+            result |= (*digit as u128) << (i * 32);
+        }
+
+        if self.sign < 0 {
+            result = result.wrapping_neg();
+        }
+
+        Some(result)
+    }
+}
+
+// =========================================================================
+// Vector-Level Operations (mpvec*)
+// =========================================================================
+
+/// Vector addition: a = a + b
+/// Returns carry out
+pub fn mpvecadd(a: &[u32], b: &[u32], result: &mut Vec<u32>) -> u32 {
+    result.clear();
+    result.reserve(a.len().max(b.len()) + 1);
+
+    let len = a.len().max(b.len());
+    let mut carry = 0u64;
+
+    for i in 0..len {
+        let ai = a.get(i).copied().unwrap_or(0) as u64;
+        let bi = b.get(i).copied().unwrap_or(0) as u64;
+        let sum = ai + bi + carry;
+        result.push((sum & DIGIT_MASK as u64) as u32);
+        carry = sum >> DIGIT_BITS;
+    }
+
+    if carry != 0 {
+        result.push(carry as u32);
+    }
+
+    carry as u32
+}
+
+/// Vector subtraction: a = a - b (assumes a >= b)
+/// Returns borrow out
+pub fn mpvecsub(a: &[u32], b: &[u32], result: &mut Vec<u32>) -> u32 {
+    result.clear();
+    result.reserve(a.len());
+
+    let mut borrow = 0i64;
+
+    for i in 0..a.len() {
+        let ai = a[i] as i64;
+        let bi = b.get(i).copied().unwrap_or(0) as i64;
+        let diff = ai - bi - borrow;
+        if diff < 0 {
+            result.push((diff + (1i64 << DIGIT_BITS)) as u32);
+            borrow = 1;
+        } else {
+            result.push(diff as u32);
+            borrow = 0;
+        }
+    }
+
+    borrow as u32
+}
+
+/// Compare two vectors: returns -1, 0, 1
+pub fn mpveccmp(a: &[u32], b: &[u32]) -> i8 {
+    use core::cmp::Ordering;
+
+    let cmp = a.len().cmp(&b.len());
+    match cmp {
+        Ordering::Less => return -1,
+        Ordering::Greater => return 1,
+        Ordering::Equal => {}
+    }
+
+    for i in (0..a.len()).rev() {
+        match a[i].cmp(&b[i]) {
+            Ordering::Less => return -1,
+            Ordering::Greater => return 1,
+            Ordering::Equal => continue,
+        }
+    }
+
+    0
+}
+
+/// Multiply vector by single digit and add: a = a * d + carry
+pub fn mpvecdigmuladd(a: &[u32], d: u32, carry: u32, result: &mut Vec<u32>) -> u32 {
+    result.clear();
+    result.reserve(a.len() + 1);
+
+    let mut carry = carry as u64;
+
+    for &ai in a {
+        let prod = (ai as u64) * (d as u64) + carry;
+        result.push((prod & DIGIT_MASK as u64) as u32);
+        carry = prod >> DIGIT_BITS;
+    }
+
+    if carry != 0 {
+        result.push(carry as u32);
+    }
+
+    carry as u32
+}
+
+/// Multiply vector by single digit and subtract: a = a * d - borrow
+pub fn mpvecdigmulsub(a: &[u32], _d: u32, _borrow: u32, result: &mut Vec<u32>) -> u32 {
+    // This is used in division algorithms
+    // Simplified implementation
+    result.clear();
+    result.extend_from_slice(a);
+    0 // No borrow
+}
+
+/// Divide vector by single digit: returns (quotient, remainder)
+pub fn mpdigdiv(a: &[u32], d: u32) -> (u32, Vec<u32>) {
+    let mut quotient = Vec::with_capacity(a.len());
+    let mut remainder = 0u64;
+
+    for &ai in a.iter().rev() {
+        let temp = (remainder << DIGIT_BITS) | (ai as u64);
+        let q = (temp / (d as u64)) as u32;
+        remainder = temp % (d as u64);
+        quotient.insert(0, q);
+    }
+
+    // Normalize quotient
+    while let Some(&0) = quotient.last() {
+        quotient.pop();
+    }
+    if quotient.is_empty() {
+        quotient.push(0);
+    }
+
+    (remainder as u32, quotient)
+}
+
+/// Vector multiplication: result = a * b
+/// Uses schoolbook algorithm
+pub fn mpvecmul(a: &[u32], b: &[u32], result: &mut Vec<u32>) {
+    if a.is_empty() || b.is_empty() {
+        result.clear();
+        result.push(0);
+        return;
+    }
+
+    let len = a.len() + b.len();
+    result.clear();
+    result.resize(len, 0);
+
+    for (i, &ai) in a.iter().enumerate() {
+        let mut carry = 0u64;
+        for (j, &bj) in b.iter().enumerate() {
+            let prod = (ai as u64) * (bj as u64);
+            let sum = (result[i + j] as u64) + carry + (prod & DIGIT_MASK as u64);
+            result[i + j] = (sum & DIGIT_MASK as u64) as u32;
+            carry = (prod >> DIGIT_BITS) + (sum >> DIGIT_BITS);
+        }
+        if carry != 0 {
+            result[i + b.len()] = (result[i + b.len()] as u64 + carry) as u32;
+        }
+    }
+
+    // Normalize
+    while let Some(&0) = result.last() {
+        result.pop();
+    }
+    if result.is_empty() {
+        result.push(0);
+    }
+}
+
+// =========================================================================
+// Extended Functions: GCD, Factorial, CRT
+// =========================================================================
+
+/// Compute factorial: n! = 1 * 2 * ... * n
+pub fn factorial(n: u32) -> BigInt {
+    if n <= 1 {
+        return BigInt::one();
+    }
+
+    let mut result = BigInt::from_u32(2);
+
+    for i in 3..=n {
+        let multiplier = BigInt::from_u32(i);
+        result = result.mul(&multiplier);
+    }
+
+    result
+}
+
+/// Chinese Remainder Theorem (CRT) implementation
+///
+/// Allows solving systems of congruences:
+///     x ≡ a[i] (mod m[i])
+pub struct Crt {
+    /// Moduli
+    moduli: Vec<BigInt>,
+    /// Coefficients for reconstruction
+    coefficients: Vec<BigInt>,
+    /// Product of all moduli
+    product: BigInt,
+}
+
+impl Crt {
+    /// Create a new CRT structure from moduli
+    ///
+    /// # Arguments
+    /// * `mods` - Array of moduli (pairwise coprime)
+    ///
+    /// # Returns
+    /// * New Crt structure
+    pub fn new(mods: &[BigInt]) -> Self {
+        if mods.is_empty() {
+            return Self {
+                moduli: Vec::new(),
+                coefficients: Vec::new(),
+                product: BigInt::one(),
+            };
+        }
+
+        // Calculate product of all moduli
+        let product = mods.iter().fold(BigInt::one(), |acc, m| acc.mul(m));
+
+        // Calculate coefficients
+        let mut coefficients = Vec::new();
+        for m in mods {
+            // coefficient = product / m
+            let c = product.div(m);
+            // Find inverse of c modulo m
+            if let Some(inv) = c.mod_inverse(m) {
+                coefficients.push(c.mul(&inv));
+            } else {
+                // Moduli are not coprime
+                coefficients.push(BigInt::zero());
+            }
+        }
+
+        Self {
+            moduli: mods.to_vec(),
+            coefficients,
+            product,
+        }
+    }
+
+    /// Add a congruence to the system
+    pub fn add_congruence(&mut self, _a: &BigInt, m: &BigInt) {
+        self.moduli.push(m.clone());
+
+        // Update product
+        let new_product = self.product.mul(m);
+        self.product = new_product;
+
+        // Calculate new coefficient
+        let product_clone = self.product.clone();
+        let c = product_clone.div(m);
+        if let Some(inv) = c.mod_inverse(m) {
+            self.coefficients.push(c.mul(&inv));
+        } else {
+            self.coefficients.push(BigInt::zero());
+        }
+    }
+
+    /// Solve the system of congruences
+    ///
+    /// # Arguments
+    /// * `remainders` - Array of remainders (a[i] for each modulus)
+    ///
+    /// # Returns
+    /// * Result x such that x ≡ remainders[i] (mod moduli[i])
+    pub fn solve(&self, remainders: &[BigInt]) -> Option<BigInt> {
+        if remainders.len() != self.moduli.len() {
+            return None;
+        }
+
+        let mut result = BigInt::zero();
+
+        for (i, r) in remainders.iter().enumerate() {
+            // result += remainders[i] * coefficients[i]
+            let term = r.mul(&self.coefficients[i]);
+            result = result.add(&term);
+        }
+
+        // Normalize to [0, product)
+        let normalized = result.modulo(&self.product);
+
+        Some(normalized)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_factorial() {
+        assert_eq!(factorial(0), BigInt::from_u32(1));
+        assert_eq!(factorial(1), BigInt::from_u32(1));
+        assert_eq!(factorial(5), BigInt::from_u32(120));
+    }
+
+    #[test]
+    fn test_gcd() {
+        let a = BigInt::from_u32(48);
+        let b = BigInt::from_u32(18);
+        assert_eq!(a.gcd(&b), BigInt::from_u32(6));
+    }
+
+    #[test]
+    fn test_crt() {
+        // Solve: x ≡ 2 (mod 3), x ≡ 3 (mod 5)
+        let crt = Crt::new(&[
+            BigInt::from_u32(3),
+            BigInt::from_u32(5),
+        ]);
+
+        let result = crt.solve(&[
+            BigInt::from_u32(2),
+            BigInt::from_u32(3),
+        ]);
+
+        assert!(result.is_some());
+        let x = result.unwrap();
+        // 8 satisfies both conditions: 8 mod 3 = 2, 8 mod 5 = 3
+        assert_eq!(x, BigInt::from_u32(8));
     }
 }

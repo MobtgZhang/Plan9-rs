@@ -28,9 +28,7 @@
 //! All existing APIs (`fill`, `fill_secure`, `u32`, `u64`, `usize`) are preserved.
 
 use crate::SecurityError;
-
-/// ChaCha20 block size in bytes
-const CHACHA_BLOCK_SIZE: usize = 64;
+use plan9_common::sync::Spinlock;
 
 /// Seed size in bytes (256-bit)
 const SEED_SIZE: usize = 32;
@@ -209,9 +207,11 @@ impl Csprng {
             
             if to_copy < self.leftover_len {
                 // Move remaining leftover to front
-                self.leftover[..self.leftover_len - to_copy]
-                    .copy_from_slice(&self.leftover[to_copy..self.leftover_len]);
-                self.leftover_len -= to_copy;
+                let remaining_len = self.leftover_len - to_copy;
+                let mut temp = [0u8; 64];
+                temp[..remaining_len].copy_from_slice(&self.leftover[to_copy..self.leftover_len]);
+                self.leftover[..remaining_len].copy_from_slice(&temp[..remaining_len]);
+                self.leftover_len = remaining_len;
             } else {
                 self.leftover_len = 0;
             }
@@ -228,9 +228,10 @@ impl Csprng {
             
             if to_copy < 64 {
                 self.leftover_len = 64 - to_copy;
-                // Move remaining bytes to front
-                self.leftover[..self.leftover_len]
-                    .copy_from_slice(&self.leftover[to_copy..64]);
+                // Move remaining bytes to front using temp buffer
+                let mut temp = [0u8; 64];
+                temp[..self.leftover_len].copy_from_slice(&self.leftover[to_copy..64]);
+                self.leftover[..self.leftover_len].copy_from_slice(&temp[..self.leftover_len]);
             }
             
             offset += to_copy;

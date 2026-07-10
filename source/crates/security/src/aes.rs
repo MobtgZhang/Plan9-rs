@@ -267,8 +267,9 @@ impl<A> AesCbc<A> {
         Ok(result)
     }
 
-    /// Encrypt a single block
-    fn encrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
+    /// Encrypt a single block (public for use by CMAC and other modes
+    /// that need raw AES without CBC).
+    pub fn encrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
         let mut state = *block;
         
         // Initial round key addition
@@ -499,4 +500,16 @@ fn key_expansion(round_keys: &mut Vec<[u8; 16]>, key: &[u8], rounds: usize) {
         }
         round_keys.push(rk);
     }
+}
+
+/// Encrypt a single 16-byte block with AES-128 using the given 16-byte
+/// key. This is the raw block primitive required by modes such as CMAC,
+/// which need to feed back exactly the previous ciphertext block.
+pub fn aes128_encrypt_block(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
+    // Construct a throwaway ECB context. AesCbc stores the IV but
+    // `encrypt_block` does not consume it, so this works regardless of
+    // the IV contents.
+    let cipher = AesCbc::<Aes128>::new(key, &[0u8; 16])
+        .expect("AES-128 key length is always 16 bytes");
+    cipher.encrypt_block(block)
 }

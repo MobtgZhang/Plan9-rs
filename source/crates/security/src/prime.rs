@@ -19,9 +19,7 @@
 //! let safe_prime = generate_safe_prime(1024);
 //! ```
 
-use alloc::vec::Vec;
 use crate::bigint::BigInt;
-use crate::random::fill;
 
 /// Generate a random probable prime with the specified number of bits.
 /// Uses Miller-Rabin primality testing with the specified accuracy.

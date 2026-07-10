@@ -26,15 +26,12 @@
 
 use alloc::vec::Vec;
 use crate::hash::{sha256, sha512};
-use crate::sha1;
 use crate::SecurityError;
 
 /// Block size for HMAC (SHA-256 block size)
 const SHA256_BLOCK_SIZE: usize = 64;
 /// Block size for HMAC (SHA-512 block size)
 const SHA512_BLOCK_SIZE: usize = 128;
-/// Block size for HMAC (SHA-1 block size)
-const SHA1_BLOCK_SIZE: usize = 64;
 
 /// Compute HMAC-SHA1
 /// 
@@ -46,94 +43,15 @@ const SHA1_BLOCK_SIZE: usize = 64;
 /// # Returns
 /// 
 /// 20-byte authentication code
-pub fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
-    // Process key to get K' (padded or hashed to block size)
-    let mut k = [0u8; SHA1_BLOCK_SIZE];
-    
-    if key.len() > SHA1_BLOCK_SIZE {
-        // If key is longer than block size, hash it
-        let hash = sha1::hash(key);
-        k[..20].copy_from_slice(&hash);
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-
-    // XOR key with ipad (0x36)
-    let mut ipad = [0x36u8; SHA1_BLOCK_SIZE];
-    for (i, byte) in ipad.iter_mut().enumerate() {
-        *byte ^= k[i];
-    }
-
-    // XOR key with opad (0x5C)
-    let mut opad = [0x5Cu8; SHA1_BLOCK_SIZE];
-    for (i, byte) in opad.iter_mut().enumerate() {
-        *byte ^= k[i];
-    }
-
-    // Inner hash: H(K' ^ ipad || message)
-    let mut inner_data = Vec::with_capacity(SHA1_BLOCK_SIZE + message.len());
-    inner_data.extend_from_slice(&ipad);
-    inner_data.extend_from_slice(message);
-    let inner_hash = sha1::hash(&inner_data);
-
-    // Outer hash: H(K' ^ opad || inner_hash)
-    let mut outer_data = Vec::with_capacity(SHA1_BLOCK_SIZE + 20);
-    outer_data.extend_from_slice(&opad);
-    outer_data.extend_from_slice(&inner_hash);
-    
-    sha1::hash(&outer_data)
-}
+// (hmac_sha1 removed: SHA-1 is deprecated; use hmac_sha256 instead.)
 
 /// Verify HMAC-SHA1
 /// 
 /// Performs constant-time comparison to prevent timing attacks.
-pub fn verify_hmac_sha1(key: &[u8], message: &[u8], expected: &[u8; 20]) -> Result<(), SecurityError> {
-    let computed = hmac_sha1(key, message);
-    
-    // Constant-time comparison
-    let mut diff = 0u8;
-    for (a, b) in computed.iter().zip(expected.iter()) {
-        diff |= a ^ b;
-    }
-    
-    if diff == 0 {
-        Ok(())
-    } else {
-        Err(SecurityError::AuthenticationFailed)
-    }
-}
+// (verify_hmac_sha1 removed: SHA-1 is deprecated; use verify_hmac_sha256 instead.)
 
 /// HMAC-SHA1 incremental hasher
-pub struct HmacSha1 {
-    key: [u8; SHA1_BLOCK_SIZE],
-    data: Vec<u8>,
-}
-
-impl HmacSha1 {
-    /// Create new HMAC-SHA1 context
-    pub fn new(key: &[u8]) -> Self {
-        let mut k = [0u8; SHA1_BLOCK_SIZE];
-        
-        if key.len() > SHA1_BLOCK_SIZE {
-            let hash = sha1::hash(key);
-            k[..20].copy_from_slice(&hash);
-        } else {
-            k[..key.len()].copy_from_slice(key);
-        }
-
-        Self { key: k, data: Vec::new() }
-    }
-
-    /// Update with more data
-    pub fn update(&mut self, data: &[u8]) {
-        self.data.extend_from_slice(data);
-    }
-
-    /// Finalize and return HMAC
-    pub fn finalize(self) -> [u8; 20] {
-        hmac_sha1(&self.key, &self.data)
-    }
-}
+// (HmacSha1 removed: SHA-1 is deprecated; use HmacSha256 instead.)
 
 /// Compute HMAC-SHA256
 /// 

@@ -13,9 +13,7 @@
 //! let valid = public.verify(hash, &signature);
 //! ```
 
-use alloc::vec::Vec;
 use crate::bigint::BigInt;
-use crate::prime::generate_prime;
 use crate::random::u32 as rand_u32;
 
 /// DSA parameters

@@ -164,7 +164,7 @@ impl DesCipher {
             d = ((d << shift) | (d >> (28 - shift))) & 0x0FFFFFFF;
 
             // Combine and apply PC-2
-            let mut cd = (c << 28) | d;
+            let cd = (c << 28) | d;
             let mut round_key = 0u64;
             for j in 0..48 {
                 let bit = (cd >> (63 - PC2[j])) & 1;
@@ -207,7 +207,7 @@ impl DesCipher {
         }
 
         // Combine (R first, then L)
-        let mut combined = (r << 32) | l;
+        let combined = (r << 32) | l;
 
         // Apply final permutation
         for i in 0..64 {
@@ -334,7 +334,7 @@ impl TripleDes {
 
         // Add PKCS#7 padding
         let pad_len = DES_BLOCK_SIZE - (data.len() % DES_BLOCK_SIZE);
-        let padding = vec![pad_len as u8; pad_len];
+        let _padding = vec![pad_len as u8; pad_len];
         let last_block = data.chunks(DES_BLOCK_SIZE).last().unwrap_or(&[]);
         let mut block = [0u8; DES_BLOCK_SIZE];
         block[..last_block.len()].copy_from_slice(last_block);

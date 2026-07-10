@@ -20,7 +20,6 @@
 //! let decrypted = cipher.decrypt_block(&ciphertext);
 //! ```
 
-use alloc::vec::Vec;
 
 /// Blowfish block size (64 bits)
 pub const BLOWFISH_BLOCK_SIZE: usize = 8;
@@ -156,24 +155,33 @@ impl Blowfish {
 
         // Process P-array and S-boxes
         for i in (0..18).step_by(2) {
-            l ^= self.encrypt_word(l, r);
-            r ^= self.encrypt_word(l, r);
+            let block = self.encrypt_word(l, r);
+            let new_l = (block >> 32) as u32;
+            let new_r = (block & 0xFFFF_FFFF) as u32;
+            l ^= new_l;
+            r ^= new_r;
             self.p[i] = l;
             self.p[i + 1] = r;
         }
 
         for i in 0..4 {
             for j in (0..256).step_by(2) {
-                l ^= self.encrypt_word(l, r);
-                r ^= self.encrypt_word(l, r);
+                let block = self.encrypt_word(l, r);
+                let new_l = (block >> 32) as u32;
+                let new_r = (block & 0xFFFF_FFFF) as u32;
+                l ^= new_l;
+                r ^= new_r;
                 self.s[i][j] = l;
                 self.s[i][j + 1] = r;
             }
         }
     }
 
-    /// Encrypt a single word (helper for key setup)
-    fn encrypt_word(&self, l: u32, r: u32) -> u32 {
+    /// Encrypt a single 64-bit block (helper for key setup).
+    /// The Blowfish key schedule runs the Feistel cipher on `(l, r)`
+    /// and returns the resulting pair concatenated into a 64-bit word
+    /// (`(new_l << 32) | new_r`).
+    fn encrypt_word(&self, l: u32, r: u32) -> u64 {
         let mut xl = l;
         let mut xr = r;
 
@@ -186,7 +194,7 @@ impl Blowfish {
         xr ^= self.p[16];
         xl ^= self.p[17];
 
-        (xl << 32) | xr
+        (u64::from(xl) << 32) | u64::from(xr)
     }
 
     /// F function: S-box lookup and mixing

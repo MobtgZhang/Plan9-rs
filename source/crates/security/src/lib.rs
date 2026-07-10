@@ -55,6 +55,8 @@ pub mod rc4;  // Deprecated: use chacha20 instead
 
 pub mod chacha20;
 pub mod cmac;
+pub mod hkdf;
+pub mod ecc;
 
 /// Cryptographically secure random number generation
 pub mod random;
@@ -67,6 +69,18 @@ pub mod elgamal;
 pub mod asn1;
 pub mod x509;
 pub mod pem;
+
+/// MD5 hash (for TLS compatibility, cryptographically broken)
+pub mod md5;
+
+/// MD4 hash (for NTLM authentication compatibility, cryptographically broken)
+pub mod md4;
+
+/// Safe prime generation for DH/ElGamal
+pub mod safeprime;
+
+/// TLS protocol implementation
+pub mod tls;
 
 pub use crate::bigint::BigInt;
 pub use crate::random::{Csprng, fill, fill_secure, u32, u64, usize, init, add_entropy, rand_bound};

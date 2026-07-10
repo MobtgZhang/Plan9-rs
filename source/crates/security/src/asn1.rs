@@ -3,7 +3,6 @@
 //! Implements Basic Encoding Rules (BER) and Distinguished Encoding Rules (DER)
 //! for ASN.1 data structures.
 
-use alloc::vec;
 use alloc::vec::Vec;
 use alloc::string::String;
 use crate::bigint::BigInt;

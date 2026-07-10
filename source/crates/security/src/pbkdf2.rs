@@ -13,7 +13,6 @@
 //! ```
 
 use alloc::vec::Vec;
-use crate::hash::sha256;
 use crate::hmac::hmac_sha256;
 
 /// PBKDF2-HMAC-SHA256 key derivation
