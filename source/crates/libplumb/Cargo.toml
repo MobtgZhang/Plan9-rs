@@ -1,0 +1,12 @@
+[package]
+name = "plan9_libplumb"
+version = "0.1.0"
+edition = "2021"
+description = "Plan 9 Plumb message library"
+
+[features]
+default = ["alloc"]
+alloc = []
+
+[dependencies]
+plan9-common = { path = "../common", features = ["alloc"] }
