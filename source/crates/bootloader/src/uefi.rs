@@ -2,9 +2,11 @@
 //!
 //! Implements UEFI boot environment detection and setup for the kernel.
 
-#![no_std]
 
 extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
 
 // ============================================================================
 // UEFI Constants
@@ -12,7 +14,7 @@ extern crate alloc;
 
 /// UEFI GUIDs
 pub mod guid {
-    use super::*;
+    
 
     /// Global unique identifier
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +43,7 @@ pub mod guid {
         pub const TEXT_OUTPUT: Guid = Guid(0x387477C2, 0x69C7, 0x11D2, [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]);
 
         /// EFI Simple Text Input Protocol
-        pub const TEXT_INPUT: Guid = Guid(0x387477C1, 0x69C7, 0x11D2, 0x8E, 0x39, [0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]);
+        pub const TEXT_INPUT: Guid = Guid(0x387477C1, 0x69C7, 0x11D2, [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]);
 
         /// EFI Graphics Output Protocol
         pub const GRAPHICS_OUTPUT: Guid = Guid(0x9042A9DE, 0x23DC, 0x4A38, [0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A]);
@@ -60,7 +62,6 @@ pub mod guid {
     }
 }
 
-use guid::Guid;
 
 // ============================================================================
 // UEFI Types
