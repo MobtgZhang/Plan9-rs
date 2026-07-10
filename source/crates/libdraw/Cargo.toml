@@ -1,0 +1,8 @@
+[package]
+name = "plan9_libdraw"
+version = "0.1.0"
+edition = "2021"
+description = "Plan 9 graphics library"
+
+[dependencies]
+plan9-common = { path = "../common" }
