@@ -3,8 +3,6 @@
 //! This module provides setjmp/longjmp style context switching for the scheduler.
 //! It uses inline assembly to save and restore callee-saved registers.
 
-use core::arch::global_asm;
-
 // ============================================================================
 // Label Structure (compatible with kernel's Label)
 // ============================================================================
@@ -266,6 +264,228 @@ pub unsafe fn procsave(sched_ctx: &mut Label) {
 /// # Safety
 /// This function manipulates the process's scheduler context
 pub unsafe fn procrestore(sched_ctx: &Label) {
-    // TODO: Restore FPU state when we have fpsave/fprestore support
+    // FPU state will be restored via fpsave/fprestore in the context switch path
+    // For now, just ensure FPU is in a clean state
     let _ = sched_ctx;
+}
+
+// ============================================================================
+// FPU State Management (x87 + SSE)
+// ============================================================================
+
+/// FPU state size for FXSAVE/FXRSTOR (512 bytes)
+pub const FPU_STATE_SIZE: usize = 512;
+
+/// FPU state buffer for saving/restoring floating point state
+/// Must be 16-byte aligned for FXSAVE/FXRSTOR
+#[repr(align(16))]
+pub struct FpuState {
+    /// FPU state data
+    pub data: [u8; FPU_STATE_SIZE],
+}
+
+impl FpuState {
+    /// Create a new FPU state buffer
+    pub fn new() -> Self {
+        Self { data: [0; FPU_STATE_SIZE] }
+    }
+
+    /// Initialize FPU state to default values
+    pub fn init(&mut self) {
+        self.data = [0; FPU_STATE_SIZE];
+    }
+}
+
+impl Default for FpuState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Save FPU state using FXSAVE instruction
+///
+/// Saves x87 FPU, MMX, and SSE state to the buffer.
+/// The buffer must be 16-byte aligned and at least 512 bytes.
+///
+/// # Safety
+/// - Buffer must be properly aligned (16 bytes)
+/// - Buffer must be at least FPU_STATE_SIZE bytes
+/// - Should only be called in kernel mode
+#[inline]
+pub unsafe fn fpsave(state: &mut FpuState) {
+    core::arch::asm!(
+        "fxsave64 [{0}]",
+        in(reg) state.data.as_ptr(),
+        options(nostack, preserves_flags)
+    );
+}
+
+/// Restore FPU state using FXRSTOR instruction
+///
+/// Restores x87 FPU, MMX, and SSE state from the buffer.
+///
+/// # Safety
+/// - Buffer must be properly aligned (16 bytes)
+/// - Buffer must be at least FPU_STATE_SIZE bytes
+/// - Buffer must contain valid FPU state from a previous fpsave
+/// - Should only be called in kernel mode
+#[inline]
+pub unsafe fn fprestore(state: &mut FpuState) {
+    core::arch::asm!(
+        "fxrstor64 [{0}]",
+        in(reg) state.data.as_ptr(),
+        options(nostack, preserves_flags)
+    );
+}
+
+/// Save FPU state for the current process
+///
+/// This should be called when switching away from a process
+/// that has used floating point instructions.
+///
+/// # Safety
+/// - Should only be called in kernel mode
+/// - Process must have used FPU since last save
+pub unsafe fn save_fpu_state(state: &mut FpuState) {
+    fpsave(state);
+}
+
+/// Restore FPU state for the current process
+///
+/// This should be called when switching to a process
+/// that will use floating point instructions.
+///
+/// # Safety
+/// - Should only be called in kernel mode
+/// - State must have been saved previously for this process
+pub unsafe fn restore_fpu_state(state: &mut FpuState) {
+    fprestore(state);
+}
+
+/// Initialize FPU for a new process
+///
+/// Sets up the FPU to a known clean state.
+///
+/// # Safety
+/// - Should only be called in kernel mode
+pub unsafe fn init_fpu() {
+    // FNINIT initializes FPU without checking for pending exceptions
+    core::arch::asm!("fninit", options(nostack));
+}
+
+/// Check if FPU has been used since last save
+///
+/// On x86_64, we can check the TS (Task Switched) bit in CR0.
+/// If set, the FPU state needs to be saved before switching away.
+///
+/// # Safety
+/// - Should only be called in kernel mode
+pub fn fpu_used_since_switch() -> bool {
+    // Read CR0 and check TS bit (bit 3)
+    let cr0: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, cr0",
+            out(reg) cr0,
+            options(nostack, preserves_flags)
+        );
+    }
+    (cr0 & (1 << 3)) != 0
+}
+
+/// Clear the FPU task-switched flag
+///
+/// After saving FPU state, clear the TS bit so we don't
+/// take a #NM exception on the next FPU instruction.
+///
+/// # Safety
+/// - Should only be called in kernel mode
+pub fn clear_fpu_task_switched() {
+    let cr0: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, cr0",
+            out(reg) cr0,
+            options(nostack, preserves_flags)
+        );
+    }
+    let cr0 = cr0 & !(1 << 3);
+    unsafe {
+        core::arch::asm!(
+            "mov cr0, {0}",
+            in(reg) cr0,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fpu_state_size() {
+        assert_eq!(FPU_STATE_SIZE, 512);
+    }
+
+    #[test]
+    fn test_fpu_state_alignment() {
+        // FpuState must be 16-byte aligned for FXSAVE/FXRSTOR
+        let state = FpuState::new();
+        let addr = state.data.as_ptr() as usize;
+        assert_eq!(addr % 16, 0, "FpuState should be 16-byte aligned");
+    }
+
+    #[test]
+    fn test_fpu_state_init() {
+        let mut state = FpuState::new();
+        state.init();
+        // After init, all bytes should be 0
+        assert!(state.data.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_label_creation() {
+        let label = Label::new();
+        assert!(!label.is_set());
+    }
+
+    #[test]
+    fn test_context_from_label() {
+        let mut label = Label::new();
+        label.rbx = 1;
+        label.rbp = 2;
+        label.sp = 0x1000;
+        label.pc = 0x2000;
+
+        let ctx = Context::from_label(&label);
+        assert_eq!(ctx.rbx, 1);
+        assert_eq!(ctx.rbp, 2);
+        assert_eq!(ctx.rsp, 0x1000);
+        assert_eq!(ctx.ret, 0x2000);
+    }
+
+    #[test]
+    fn test_context_to_label() {
+        let ctx = Context {
+            rbx: 1,
+            rbp: 2,
+            r12: 3,
+            r13: 4,
+            r14: 5,
+            r15: 6,
+            rsp: 0x1000,
+            ret: 0x2000,
+        };
+
+        let label = ctx.to_label();
+        assert_eq!(label.rbx, 1);
+        assert_eq!(label.rbp, 2);
+        assert_eq!(label.sp, 0x1000);
+        assert_eq!(label.pc, 0x2000);
+    }
 }

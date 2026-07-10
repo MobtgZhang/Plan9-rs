@@ -5,7 +5,7 @@
 
 extern crate plan9_common;
 
-use plan9_common::error::{Error, Result};
+use plan9_common::error::Error;
 use plan9_common::types::{PhysAddr, VirtAddr};
 
 // ============================================================================
@@ -74,9 +74,21 @@ impl PteFlags {
     pub const PCD: Self = Self(1 << 4);         // Cache disable
     pub const ACCESSED: Self = Self(1 << 5);
     pub const DIRTY: Self = Self(1 << 6);
-    pub const PAT: Self = Self(1 << 7);
+    /// Page Size flag (PS) - bit 7 of a PTE.
+    ///
+    /// Note: At the PT level, bit 7 is PAT. At the PD level it indicates a 2MB
+    /// large page, and at the PDPT level it indicates a 1GB huge page. The
+    /// hardware interprets this bit differently based on the page-table level,
+    /// so callers must ensure `PS` is only set in PD or PDPT entries.
+    pub const PS: Self = Self(1 << 7);
     pub const GLOBAL: Self = Self(1 << 8);
     pub const NX: Self = Self(1 << 63);         // No-execute
+
+    /// Alias for `Self::PS`, preserved for backwards compatibility with code
+    /// that referred to the bit as PAT. Prefer `Self::PS` for new code; the
+    /// two constants are intentionally identical because the underlying
+    /// hardware bit is the same.
+    pub const PAT: Self = Self::PS;
 
     pub const fn new(bits: u64) -> Self { Self(bits) }
     pub fn bits(self) -> u64 { self.0 }
@@ -95,6 +107,24 @@ impl PteFlags {
     pub fn is_no_exec(self) -> bool { (self.0 & Self::NX.0) != 0 }
     pub fn is_accessed(self) -> bool { (self.0 & Self::ACCESSED.0) != 0 }
     pub fn is_dirty(self) -> bool { (self.0 & Self::DIRTY.0) != 0 }
+
+    /// Check if the PS bit is set.
+    ///
+    /// This bit indicates a 2MB large page when present in a PD entry and a
+    /// 1GB huge page when present in a PDPT entry. It shares the bit position
+    /// with PAT at the PT level; callers are responsible for context.
+    pub fn is_large_page(self) -> bool {
+        (self.0 & Self::PS.0) != 0
+    }
+
+    /// Check if this entry represents a 1GB huge page.
+    ///
+    /// This is semantically the same check as `is_large_page` because the
+    /// hardware uses the same PS bit; the distinction is purely about which
+    /// page-table level the entry resides in (PDPT for huge pages).
+    pub fn is_huge_page(self) -> bool {
+        (self.0 & Self::PS.0) != 0
+    }
 }
 
 /// Common flag combinations
@@ -156,9 +186,13 @@ impl PageTableEntry {
         self.flags().is_present()
     }
 
-    /// Check if this entry maps to a large page
+    /// Check if this entry maps to a large or huge page.
+    ///
+    /// The hardware uses the same PS bit (bit 7) at both the PD level (2MB)
+    /// and the PDPT level (1GB). The actual page size depends on which
+    /// page-table level this entry lives in.
     pub fn is_large(&self) -> bool {
-        (self.0 & (1 << 7)) != 0
+        self.flags().is_large_page()
     }
 
     /// Clear this entry
@@ -264,12 +298,28 @@ impl PageTableIndices {
         }
     }
 
+    /// Extract indices for a 1GB huge page.
+    ///
+    /// A 1GB huge page mapping is established by a single PDPT entry with the
+    /// PS bit set, so the PD and PT indices are unused. The offset is the
+    /// intra-1GB address (`addr & 0x3FFF_FFFF`).
+    pub fn from_virt_huge(virt: VirtAddr) -> Self {
+        let addr = virt.as_u64();
+        Self {
+            pml4: ((addr >> PML4_INDEX_SHIFT) & 0x1FF) as usize,
+            pdpt: ((addr >> PDPT_INDEX_SHIFT) & 0x1FF) as usize,
+            pd: 0,
+            pt: 0,
+            offset: addr & 0x3FFF_FFFF, // 1GB - 1 = 0x3FFF_FFFF
+        }
+    }
+
     /// Get the page frame number for 4KB pages
     pub fn page_frame_number(&self) -> u64 {
         let mut pfn = (self.pml4 as u64) << (PML4_INDEX_SHIFT - 12);
         pfn |= (self.pdpt as u64) << (PDPT_INDEX_SHIFT - 12);
         pfn |= (self.pd as u64) << (PD_INDEX_SHIFT - 12);
-        pfn |= (self.pt as u64);
+        pfn |= self.pt as u64;
         pfn
     }
 
@@ -481,6 +531,11 @@ pub fn walk_page_table_entry(pml4: PhysAddr, virt: VirtAddr) -> Option<PageTable
         return None;
     }
 
+    // Check for 1GB huge page at the PDPT level.
+    if pdpt_entry.flags().is_huge_page() {
+        return Some(pdpt_entry);
+    }
+
     // Read PD entry
     let pd_phys = pdpt_entry.addr();
     let pd_virt = VirtAddr::new(KERNEL_VIRT_BASE | pd_phys.as_u64());
@@ -491,7 +546,7 @@ pub fn walk_page_table_entry(pml4: PhysAddr, virt: VirtAddr) -> Option<PageTable
     }
 
     // Check for large page
-    if pd_entry.is_large() {
+    if pd_entry.flags().is_large_page() {
         return Some(pd_entry);
     }
 
@@ -510,6 +565,112 @@ fn read_page_table_entry(table_virt: VirtAddr, index: usize) -> Option<PageTable
     // Safety: In practice this requires the memory to be mapped
     let value = unsafe { *entry_ptr };
     Some(PageTableEntry(value))
+}
+
+/// Read a page table entry from a virtual address without bounds checking.
+unsafe fn read_page_table_entry_unchecked(table_virt: VirtAddr, index: usize) -> u64 {
+    let entry_ptr = (table_virt.as_u64() + (index as u64) * 8) as *const u64;
+    core::ptr::read_volatile(entry_ptr)
+}
+
+/// Write a page table entry at the given virtual address and index.
+unsafe fn write_page_table_entry(table_virt: VirtAddr, index: usize, value: u64) {
+    let entry_ptr = (table_virt.as_u64() + (index as u64) * 8) as *mut u64;
+    core::ptr::write_volatile(entry_ptr, value);
+}
+
+/// Flush a single TLB entry for the given virtual address.
+#[inline(always)]
+pub fn invlpg(virt: VirtAddr) {
+    unsafe {
+        core::arch::asm!("invlpg [{}]", in(reg) virt.as_u64(), options(nostack, preserves_flags));
+    }
+}
+
+/// Memory fence for page-table writes, ensuring stores are observed before any
+/// subsequent TLB invalidation or page-table walk.
+#[inline(always)]
+pub fn paging_sfence() {
+    unsafe {
+        core::arch::asm!("sfence", options(nostack, preserves_flags));
+    }
+}
+
+/// Map a 1GB huge page at a given virtual address.
+///
+/// The PDPT entry corresponding to `virt` is overwritten with a 1GB huge-page
+/// entry: `(phys & !0x3FFF_FFFF) | flags | PS`. The PDPT must already exist;
+/// if no PML4/PDPT entry is present for `virt` this function returns
+/// `Error::Enoent` because in this low-level paging module there is no
+/// frame allocator available to create a new PDPT on demand. Callers that
+/// need to allocate missing PDPTs must do so at a higher layer and ensure
+/// the PDPT physical address is reachable via the higher-half direct map
+/// (`KERNEL_VIRT_BASE | phys`).
+///
+/// `flags` should include `PteFlags::PRESENT`; `PteFlags::PS` is added
+/// automatically. The physical address is forced to 1GB alignment as
+/// required by the architecture.
+pub fn map_huge_page(
+    pml4: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PteFlags,
+) -> Result<(), Error> {
+    let indices = PageTableIndices::from_virt_huge(virt);
+
+    // Resolve PDPT from the PML4 entry.
+    let pml4_virt = VirtAddr::new(KERNEL_VIRT_BASE | pml4.as_u64());
+    let pml4_entry = unsafe { read_page_table_entry_unchecked(pml4_virt, indices.pml4) };
+
+    if pml4_entry & PteFlags::PRESENT.bits() == 0 {
+        // The PDPT for this region does not exist. Without a frame allocator
+        // in this module we cannot create it here.
+        return Err(Error::Enoent);
+    }
+
+    let pdpt_phys = PhysAddr::new(pml4_entry & 0x000_FFFF_FFFF_F000);
+    let pdpt_virt = VirtAddr::new(KERNEL_VIRT_BASE | pdpt_phys.as_u64());
+
+    // 1GB huge pages require the physical base to be 1GB-aligned.
+    let phys_aligned = PhysAddr::new(phys.as_u64() & !0x3FFF_FFFF);
+
+    // Build the PDPT entry: physical base | caller flags | PS.
+    let entry = phys_aligned.as_u64() | flags.bits() | PteFlags::PS.bits();
+
+    unsafe {
+        write_page_table_entry(pdpt_virt, indices.pdpt, entry);
+        paging_sfence();
+        invlpg(virt);
+    }
+
+    Ok(())
+}
+
+/// Unmap a 1GB huge page at the given virtual address.
+///
+/// The corresponding PDPT entry is cleared and the TLB is flushed for the
+/// affected virtual address. Returns `Error::Enoent` if no PDPT entry exists
+/// for the address.
+pub fn unmap_huge_page(pml4: PhysAddr, virt: VirtAddr) -> Result<(), Error> {
+    let indices = PageTableIndices::from_virt_huge(virt);
+
+    let pml4_virt = VirtAddr::new(KERNEL_VIRT_BASE | pml4.as_u64());
+    let pml4_entry = unsafe { read_page_table_entry_unchecked(pml4_virt, indices.pml4) };
+
+    if pml4_entry & PteFlags::PRESENT.bits() == 0 {
+        return Err(Error::Enoent);
+    }
+
+    let pdpt_phys = PhysAddr::new(pml4_entry & 0x000_FFFF_FFFF_F000);
+    let pdpt_virt = VirtAddr::new(KERNEL_VIRT_BASE | pdpt_phys.as_u64());
+
+    unsafe {
+        write_page_table_entry(pdpt_virt, indices.pdpt, 0);
+        paging_sfence();
+        invlpg(virt);
+    }
+
+    Ok(())
 }
 
 /// Calculate identity mapped virtual address for a physical address

@@ -117,11 +117,9 @@ pub fn invlpg(addr: VirtAddr) {
 /// Invalidate the entire TLB (flush all entries)
 /// This is slower than invlpg but simpler
 pub fn flush_tlb() {
-    unsafe {
-        // Writing to CR3 automatically flushes the TLB
-        let cr3 = cr3_read();
-        cr3_write(cr3);
-    }
+    // Writing to CR3 automatically flushes the TLB
+    let cr3 = cr3_read();
+    cr3_write(cr3);
 }
 
 /// Invalidate TLB for a specific address range
@@ -349,7 +347,7 @@ use plan9_common::sync::Spinlock;
 
 /// Lock for page table switching
 /// Prevents concurrent page table modifications
-static PAGE_TABLE_LOCK: Spinlock = Spinlock::new();
+static PAGE_TABLE_LOCK: Spinlock<()> = Spinlock::new(());
 
 /// Switch to a new page table with lock protection
 ///
