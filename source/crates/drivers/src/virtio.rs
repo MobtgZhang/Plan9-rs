@@ -16,8 +16,7 @@
 extern crate alloc;
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU8, Ordering};
-
+use core::sync::atomic::{ AtomicU16, AtomicU32, AtomicU8 };
 // ============================================================================
 // VirtIO Constants
 // ============================================================================
@@ -42,7 +41,6 @@ pub enum VirtIODeviceType {
 
 /// VirtIO status flags
 #[derive(Debug, Clone, Copy, Default)]
-#[repr(u8)]
 pub struct VirtIOStatus {
     pub bits: u8,
 }
@@ -74,7 +72,7 @@ impl VirtIOStatus {
 }
 
 /// VirtIO configuration space
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 #[repr(C)]
 pub struct VirtIOConfig {
     pub device_status: AtomicU8,
@@ -90,7 +88,7 @@ pub struct VirtIOConfig {
 // ============================================================================
 
 /// VirtIO PCI capability
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 #[repr(C)]
 pub struct VirtIOCapability {
     pub cap_vendor: u8,      // 0x09 for VirtIO
@@ -112,7 +110,7 @@ pub mod cfg_type {
 }
 
 /// VirtIO common configuration registers
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 #[repr(C)]
 pub struct VirtIOCommonConfig {
     pub device_feature_select: AtomicU32,
@@ -159,7 +157,7 @@ pub const VIRTQ_DESC_F_WRITE: u16 = 2;
 pub const VIRTQ_DESC_F_INDIRECT: u16 = 4;
 
 /// VirtIO available ring entry
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 #[repr(C)]
 pub struct VirtQAvail {
     pub flags: u16,
@@ -168,7 +166,7 @@ pub struct VirtQAvail {
 }
 
 /// VirtIO used ring entry
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 #[repr(C)]
 pub struct VirtQUsed {
     pub flags: u16,
@@ -185,6 +183,7 @@ pub struct VirtQUsedElem {
 }
 
 /// VirtIO queue
+#[derive(Copy, Clone)]
 pub struct VirtQueue {
     /// Queue index
     pub index: u16,
@@ -197,9 +196,9 @@ pub struct VirtQueue {
     /// Descriptor count
     pub size: u16,
     /// Index of next available descriptor
-    free_head: AtomicU16,
+    free_head: u16,
     /// Index of last used descriptor
-    last_used_idx: AtomicU16,
+    last_used_idx: u16,
 }
 
 impl VirtQueue {
@@ -211,8 +210,8 @@ impl VirtQueue {
             avail: core::ptr::null_mut(),
             used: core::ptr::null_mut(),
             size,
-            free_head: AtomicU16::new(0),
-            last_used_idx: AtomicU16::new(0),
+            free_head: 0,
+            last_used_idx: 0,
         }
     }
     
@@ -221,13 +220,13 @@ impl VirtQueue {
         self.desc = desc;
         self.avail = avail;
         self.used = used;
-        self.free_head = AtomicU16::new(0);
-        self.last_used_idx = AtomicU16::new(0);
+        self.free_head = 0;
+        self.last_used_idx = 0;
     }
     
     /// Add a descriptor to the queue
     pub fn add_desc(&self, addr: u64, len: u32, flags: u16, next: u16) -> Option<u16> {
-        let idx = self.free_head.load(Ordering::Acquire);
+        let idx = self.free_head;
         
         if idx >= self.size {
             return None;

@@ -2,10 +2,10 @@
 //!
 //! Implements network device abstraction and common NIC drivers.
 
-#![no_std]
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use plan9_common::error::{Error, Result};
 use plan9_common::types::PhysAddr;
 
@@ -244,21 +244,21 @@ impl E1000 {
         unsafe { core::ptr::write_volatile(addr.add(offset / 4), val) }
     }
 
-    /// Read a register using I/O port (for legacy mode)
-    ///
-    /// Some E1000 devices use I/O ports instead of MMIO.
-    fn read_reg_io(&self, offset: u16) -> u32 {
-        // In real implementation, would use inl/outl instructions
-        // unsafe { llvm_asm!("inl $1, $0" : "=a"(val) : "d"(port)) }
-        0
-    }
+/// Read a register using I/O port (for legacy mode)
+///
+/// Some E1000 devices use I/O ports instead of MMIO.
+pub fn read_reg_io(&self, _offset: u16) -> u32 {
+    // In real implementation, would use inl/outl instructions
+    // unsafe { llvm_asm!("inl $1, $0" : "=a"(val) : "d"(port)) }
+    0
+}
 
-    /// Write a register using I/O port
-    fn write_reg_io(&self, offset: u16, val: u32) {
-        // unsafe { llvm_asm!("outl $0, $1" : : "a"(val), "d"(port)) }
-        let _ = offset;
-        let _ = val;
-    }
+/// Write a register using I/O port
+pub fn write_reg_io(&self, offset: u16, val: u32) {
+    // unsafe { llvm_asm!("outl $0, $1" : : "a"(val), "d"(port)) }
+    let _ = offset;
+    let _ = val;
+}
 
     /// Initialize the device
     pub fn init(&mut self) -> Result<()> {
@@ -328,7 +328,7 @@ impl E1000 {
     }
 
     /// Receive a packet
-    pub fn receive(&mut self, buffer: &mut [u8]) -> Result<usize> {
+    pub fn receive(&mut self, _buffer: &mut [u8]) -> Result<usize> {
         // In real implementation, would:
         // 1. Check if received packet is ready (status DD bit)
         // 2. Copy packet from receive buffer
@@ -426,7 +426,7 @@ impl VirtioNet {
     }
 
     /// Receive a packet
-    pub fn receive(&mut self, buffer: &mut [u8]) -> Result<usize> {
+    pub fn receive(&mut self, _buffer: &mut [u8]) -> Result<usize> {
         // In real implementation, would use RX virtqueue
         Ok(0)
     }
@@ -495,8 +495,8 @@ impl NetManager {
     }
 
     /// Get mutable device by index
-    pub fn get_device_mut(&mut self, index: usize) -> Option<&mut dyn NetDevice> {
-        self.devices.get_mut(index).and_then(|d| d.as_mut().map(|b| b.as_mut()))
+    pub fn get_device_mut(&mut self, index: usize) -> Option<&mut Box<dyn NetDevice>> {
+        self.devices.get_mut(index).and_then(|d| d.as_mut())
     }
 }
 

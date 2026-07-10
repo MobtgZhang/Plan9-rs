@@ -9,11 +9,13 @@
 //! - Keyboard state management (shift, ctrl, alt)
 //! - Interrupt handling
 
-#![allow(dead_code)]
 
+extern crate alloc;
+extern crate plan9_common;
+
+use alloc::boxed::Box;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-
+use core::sync::atomic::{ AtomicBool, AtomicUsize, Ordering };
 // ============================================================================
 // I/O Ports and Constants
 // ============================================================================
@@ -26,6 +28,78 @@ pub mod ports {
     pub const KBD_STATUS: u16 = 0x64;
     /// Keyboard control register
     pub const KBD_CTRL: u16 = 0x64;
+}
+
+/// PS/2 Controller status bits
+pub mod ctrl_status {
+    /// Input buffer full (cpu -> controller)
+    pub const IBF: u8 = 0x02;
+    /// Output buffer full (controller -> cpu)
+    pub const OBF: u8 = 0x01;
+    /// System flag (set on successful POST)
+    pub const SYSF: u8 = 0x04;
+    /// Command/data (0=data, 1=command)
+    pub const CMD: u8 = 0x08;
+    /// Keyboard inhibited
+    pub const INH: u8 = 0x10;
+    /// Mouse buffer full
+    pub const MOUSE_OBF: u8 = 0x20;
+    /// Timeout error
+    pub const TIMEOUT: u8 = 0x40;
+    /// Parity error
+    pub const PARITY: u8 = 0x80;
+}
+
+/// PS/2 Controller commands
+pub mod ctrl_cmd {
+    /// Read controller command byte
+    pub const READ_CMD: u8 = 0x20;
+    /// Write controller command byte
+    pub const WRITE_CMD: u8 = 0x60;
+    /// Disable keyboard
+    pub const DISABLE_KBD: u8 = 0xAD;
+    /// Enable keyboard
+    pub const ENABLE_KBD: u8 = 0xAE;
+    /// Disable auxiliary device
+    pub const DISABLE_AUX: u8 = 0xA7;
+    /// Enable auxiliary device
+    pub const ENABLE_AUX: u8 = 0xA8;
+    /// Test controller
+    pub const TEST: u8 = 0xAA;
+    /// Test keyboard
+    pub const TEST_KBD: u8 = 0xAB;
+    /// Diagnostic dump
+    pub const DUMP: u8 = 0xAC;
+    /// Disable keyboard
+    pub const KBD_DISABLE: u8 = 0xAD;
+    /// Enable keyboard
+    pub const KBD_ENABLE: u8 = 0xAE;
+    /// Write to keyboard output buffer
+    pub const WRITE_KBD: u8 = 0xD2;
+    /// Write to mouse output buffer
+    pub const WRITE_MOUSE: u8 = 0xD3;
+    /// Write to mouse
+    pub const WRITE_TO_MOUSE: u8 = 0xD4;
+    /// Disable mouse
+    pub const MOUSE_DISABLE: u8 = 0xA7;
+    /// Enable mouse
+    pub const MOUSE_ENABLE: u8 = 0xA8;
+}
+
+/// Controller command byte bits
+pub mod ccb_bits {
+    /// Interrupt on output buffer full (keyboard)
+    pub const KBD_INT: u8 = 0x01;
+    /// Interrupt on output buffer full (mouse)
+    pub const MOUSE_INT: u8 = 0x02;
+    /// System flag (must be set)
+    pub const SYSF: u8 = 0x04;
+    /// Keyboard clock (0=enabled, 1=disabled)
+    pub const KBD_CLK: u8 = 0x10;
+    /// Mouse clock (0=enabled, 1=disabled)
+    pub const MOUSE_CLK: u8 = 0x20;
+    /// Translation mode (0=PC mode, 1=Translation)
+    pub const TRANS: u8 = 0x40;
 }
 
 /// PS/2 Keyboard Commands
@@ -48,7 +122,6 @@ pub enum KbdCommand {
 
 /// PS/2 Keyboard Responses
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum KbdResponse {
     /// ACK
     Ack = 0xFA,
@@ -60,7 +133,6 @@ pub enum KbdResponse {
 
 /// LED states
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u8)]
 pub struct KbdLeds {
     bits: u8,
 }
@@ -312,19 +384,114 @@ impl KbdDevice {
         }
     }
 
-    /// Initialize the keyboard
+    /// Initialize the keyboard controller (8042 PS/2)
+    ///
+    /// Implements the full initialization sequence from Plan 9 kbd.c:
+    /// 1. Wait for controller to be quiescent
+    /// 2. Disable keyboard interface
+    /// 3. Clear input buffer
+    /// 4. Read and update controller command byte (CCB)
+    /// 5. Reset keyboard with BAT (Basic Assurance Test)
+    /// 6. Enable keyboard interface
     pub fn init(&self) -> Result<(), KbdError> {
+        self.init_with_io::<SimulatedPort>()
+    }
+
+    /// Initialize the keyboard with custom I/O implementation
+    /// Used for testing or real hardware access
+    pub fn init_with_io<IO: PortIo>(&self) -> Result<(), KbdError> {
         let state = unsafe { &mut *self.state.get() };
         state.reset();
-        
-        // TODO: Send initialization commands to keyboard controller
-        // 1. Disable keyboard
-        // 2. Clear buffers
-        // 3. Set scan code set
-        // 4. Enable keyboard
-        
+
+        // Step 1: Wait for controller to be quiescent (no bytes pending)
+        // Poll the status register until both IBF and OBF are clear
+        for _ in 0..500 {
+            let status = IO::inp(ports::KBD_STATUS);
+            if (status & (ctrl_status::IBF | ctrl_status::OBF)) == 0 {
+                break;
+            }
+            // Drain any pending data
+            if (status & ctrl_status::OBF) != 0 {
+                let _ = IO::inp(ports::KBD_DATA);
+            }
+        }
+
+        // Step 2: Disable keyboard interface
+        send_controller_cmd::<IO>(ctrl_cmd::DISABLE_KBD)?;
+
+        // Step 3: Drain any pending bytes
+        drain_kbd_buffer::<IO>();
+
+        // Step 4: Read current controller command byte
+        let mut ccb = read_controller_ccb::<IO>()?;
+
+        // Step 5: Update CCB
+        // Enable keyboard clock, disable translation mode
+        // Keep interrupts as they are (will be enabled later)
+        ccb &= !(ccb_bits::KBD_CLK | ccb_bits::TRANS);
+        // Ensure system flag is set (required for proper operation)
+        ccb |= ccb_bits::SYSF;
+        write_controller_ccb::<IO>(ccb)?;
+
+        // Step 6: Disable mouse/auxiliary device during keyboard init
+        send_controller_cmd::<IO>(ctrl_cmd::DISABLE_AUX)?;
+
+        // Step 7: Clear output buffer again
+        drain_kbd_buffer::<IO>();
+
+        // Step 8: Enable keyboard interface
+        send_controller_cmd::<IO>(ctrl_cmd::KBD_ENABLE)?;
+
+        // Step 9: Reset keyboard with BAT (Basic Assurance Test)
+        // This also sets the default scan code set
+        for attempt in 0..3 {
+            send_kbd_data::<IO>(KbdCommand::Reset as u8)?;
+            let response = wait_for_ack::<IO>()?;
+
+            if response == KbdResponse::Ack as u8 {
+                // BAT passed - keyboard should respond 0xAA, 0x00
+                let bat_result = read_kbd_data::<IO>();
+                if bat_result == 0xAA {
+                    // BAT successful
+                    break;
+                } else if bat_result == 0xFC || bat_result == 0xFD {
+                    // BAT failed - keyboard error
+                    if attempt == 2 {
+                        return Err(KbdError::SelfTestFailed);
+                    }
+                }
+            } else if response == KbdResponse::Resend as u8 {
+                // Request resend
+                if attempt == 2 {
+                    return Err(KbdError::Timeout);
+                }
+                continue;
+            } else {
+                if attempt == 2 {
+                    return Err(KbdError::InvalidResponse);
+                }
+            }
+        }
+
+        // Step 10: Set scan code set to 1 (standard PC format)
+        send_kbd_data::<IO>(KbdCommand::ScanCodeSet as u8)?;
+        let _ = wait_for_ack::<IO>()?;
+        send_kbd_data::<IO>(1)?;  // Request scan code set 1
+        let _ = wait_for_ack::<IO>()?;
+
+        // Step 11: Enable keyboard scanning
+        send_kbd_data::<IO>(KbdCommand::EnableScanning as u8)?;
+        let _ = wait_for_ack::<IO>()?;
+
+        // Step 12: Drain any pending data
+        drain_kbd_buffer::<IO>();
+
+        // Step 13: Re-enable auxiliary device
+        send_controller_cmd::<IO>(ctrl_cmd::ENABLE_AUX)?;
+
+        // Step 14: Mark as enabled
         state.enabled.store(true, Ordering::SeqCst);
-        
+
         Ok(())
     }
 
@@ -440,10 +607,39 @@ impl KbdDevice {
     }
 
     /// Set keyboard LEDs
-    pub fn set_leds(&self, leds: KbdLeds) {
+    ///
+    /// Sends the LED state to the keyboard controller.
+    /// LED bits: [scroll][num][caps][reserved]
+    pub fn set_leds(&self) -> Result<(), KbdError> {
+        self.set_leds_with_io::<SimulatedPort>()
+    }
+
+    /// Set keyboard LEDs with custom I/O implementation
+    pub fn set_leds_with_io<IO: PortIo>(&self) -> Result<(), KbdError> {
         let state = unsafe { &mut *self.state.get() };
-        state.leds = leds;
-        // TODO: Send LED command to keyboard
+
+        // Step 1: Send Set LEDs command (0xED)
+        send_kbd_data::<IO>(0xED)?;
+
+        // Step 2: Wait for ACK
+        let response = wait_for_ack::<IO>()?;
+        if response != KbdResponse::Ack as u8 {
+            return Err(KbdError::InvalidResponse);
+        }
+
+        // Step 3: Send LED status byte
+        // Format: [scroll lock][num lock][caps lock][reserved]
+        // Bit 0: Scroll Lock
+        // Bit 1: Num Lock
+        // Bit 2: Caps Lock
+        // Bits 3-7: Reserved (must be 0)
+        send_kbd_data::<IO>(state.leds.bits())?;
+
+        // Step 4: Wait for ACK (keyboard doesn't respond to LED command with data)
+        // Just drain any pending response
+        let _ = read_kbd_data::<IO>();
+
+        Ok(())
     }
 
     /// Get keyboard state
@@ -468,22 +664,161 @@ pub enum KbdError {
     Timeout,
     InvalidResponse,
     ControllerError,
+    SelfTestFailed,
+    KeyboardNotResponding,
+}
+
+// ============================================================================
+// I/O Port Abstraction (for no_std environment)
+// ============================================================================
+
+/// Trait for I/O port operations
+/// In real hardware mode, these would use inline assembly
+pub trait PortIo {
+    /// Read a byte from an I/O port
+    fn inp(port: u16) -> u8;
+    /// Write a byte to an I/O port
+    fn outp(port: u16, value: u8);
+}
+
+/// Default no-op port I/O implementation for simulation/testing
+/// In real kernel mode, this would be replaced with actual I/O
+pub struct SimulatedPort;
+
+impl PortIo for SimulatedPort {
+    fn inp(_port: u16) -> u8 {
+        // Simulated read - in real implementation, use inb instruction
+        0
+    }
+
+    fn outp(_port: u16, _value: u8) {
+        // Simulated write - in real implementation, use outb instruction
+    }
+}
+
+// ============================================================================
+// 8042 Keyboard Controller I/O Utilities
+// ============================================================================
+
+/// Timeout for waiting on controller (in iterations)
+const I8042_TIMEOUT: usize = 100_000;
+
+/// Wait for input buffer to be empty (CPU -> controller)
+fn wait_for_input_empty<IO: PortIo>() -> bool {
+    for _ in 0..I8042_TIMEOUT {
+        // Read status register and check if IBF (bit 1) is clear
+        let status = IO::inp(ports::KBD_STATUS);
+        if (status & ctrl_status::IBF) == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Wait for output buffer to be full (controller -> CPU)
+fn wait_for_output_full<IO: PortIo>() -> bool {
+    for _ in 0..I8042_TIMEOUT {
+        let status = IO::inp(ports::KBD_STATUS);
+        if (status & ctrl_status::OBF) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Read data from keyboard (from data port)
+fn read_kbd_data<IO: PortIo>() -> u8 {
+    // Wait for output buffer to be full
+    let _ = wait_for_output_full::<IO>();
+    IO::inp(ports::KBD_DATA)
+}
+
+/// Send command to 8042 controller
+fn send_controller_cmd<IO: PortIo>(cmd: u8) -> Result<(), KbdError> {
+    if !wait_for_input_empty::<IO>() {
+        return Err(KbdError::Timeout);
+    }
+    IO::outp(ports::KBD_STATUS, cmd);
+    Ok(())
+}
+
+/// Send data to keyboard
+fn send_kbd_data<IO: PortIo>(data: u8) -> Result<(), KbdError> {
+    if !wait_for_input_empty::<IO>() {
+        return Err(KbdError::Timeout);
+    }
+    IO::outp(ports::KBD_DATA, data);
+    Ok(())
+}
+
+/// Read controller command byte
+fn read_controller_ccb<IO: PortIo>() -> Result<u8, KbdError> {
+    send_controller_cmd::<IO>(ctrl_cmd::READ_CMD)?;
+    // Read response from data port
+    let response = read_kbd_data::<IO>();
+    Ok(response)
+}
+
+/// Write controller command byte
+fn write_controller_ccb<IO: PortIo>(ccb: u8) -> Result<(), KbdError> {
+    send_controller_cmd::<IO>(ctrl_cmd::WRITE_CMD)?;
+    send_kbd_data::<IO>(ccb)?;
+    Ok(())
+}
+
+/// Wait for keyboard ACK with retry
+fn wait_for_ack<IO: PortIo>() -> Result<u8, KbdError> {
+    for _ in 0..3 {
+        let response = read_kbd_data::<IO>();
+        match response {
+            r if r == KbdResponse::Ack as u8 => return Ok(response),
+            r if r == KbdResponse::Resend as u8 => {
+                // Keyboard requesting resend - will retry
+                continue;
+            }
+            r if r == KbdResponse::Error as u8 => {
+                return Err(KbdError::InvalidResponse);
+            }
+            _ => {
+                // Unexpected response, but could be data
+                return Ok(response);
+            }
+        }
+    }
+    Err(KbdError::Timeout)
+}
+
+/// Drain any pending data from keyboard
+fn drain_kbd_buffer<IO: PortIo>() {
+    for _ in 0..16 {
+        let status = IO::inp(ports::KBD_STATUS);
+        if (status & ctrl_status::OBF) == 0 {
+            break;
+        }
+        // Read and discard
+        let _ = IO::inp(ports::KBD_DATA);
+    }
 }
 
 // ============================================================================
 // Global Keyboard Instance
 // ============================================================================
 
-static KEYBOARD: KbdDevice = KbdDevice::new();
+use core::sync::atomic::AtomicPtr;
+
+static KEYBOARD: AtomicPtr<KbdDevice> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Get the global keyboard instance
 pub fn keyboard() -> &'static KbdDevice {
-    &KEYBOARD
+    unsafe { &*KEYBOARD.load(core::sync::atomic::Ordering::Relaxed) }
 }
 
 /// Initialize the keyboard
 pub fn kbd_init() -> Result<(), KbdError> {
-    KEYBOARD.init()
+    let dev = Box::new(KbdDevice::new());
+    let ptr = Box::into_raw(dev);
+    KEYBOARD.store(ptr, core::sync::atomic::Ordering::Relaxed);
+    unsafe { &*ptr }.init()
 }
 
 /// Keyboard interrupt handler
@@ -494,6 +829,8 @@ pub fn i8042intr() {
 }
 
 /// Set keyboard LEDs
-pub fn setleds(leds: KbdLeds) {
-    KEYBOARD.set_leds(leds);
+pub fn setleds(leds: KbdLeds) -> Result<(), KbdError> {
+    let dev = unsafe { &mut *KEYBOARD.load(core::sync::atomic::Ordering::Relaxed) };
+    dev.state.get_mut().leds = leds;
+    dev.set_leds()
 }

@@ -2,8 +2,84 @@
 //!
 //! Implements storage device abstraction and ATA/IDE driver.
 
+#![allow(dead_code)]
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
 use plan9_common::error::{Error, Result};
 use plan9_common::types::PhysAddr;
+
+// ============================================================================
+// Storage Error Types
+// ============================================================================
+
+/// Storage operation errors
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdError {
+    /// Device not found
+    NotFound,
+    /// No device present
+    NoDevice,
+    /// Invalid sector number
+    InvalidSector,
+    /// Invalid parameter
+    Invalid,
+    /// Read failure
+    ReadError,
+    /// Write failure
+    WriteError,
+    /// Device timeout
+    Timeout,
+    /// Device busy
+    Busy,
+    /// I/O error
+    IoError,
+    /// General error
+    General,
+}
+
+impl core::fmt::Display for SdError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SdError::NotFound => write!(f, "device not found"),
+            SdError::NoDevice => write!(f, "no device present"),
+            SdError::InvalidSector => write!(f, "invalid sector"),
+            SdError::Invalid => write!(f, "invalid parameter"),
+            SdError::ReadError => write!(f, "read error"),
+            SdError::WriteError => write!(f, "write error"),
+            SdError::Timeout => write!(f, "device timeout"),
+            SdError::Busy => write!(f, "device busy"),
+            SdError::IoError => write!(f, "I/O error"),
+            SdError::General => write!(f, "general error"),
+        }
+    }
+}
+
+/// Storage operation result
+pub type SdResult<T> = core::result::Result<T, SdError>;
+
+/// Storage backend trait for block devices
+pub trait StorageBackend: Send + Sync {
+    /// Read sectors
+    fn read_sectors(&mut self, lba: u64, count: u16, buffer: &mut [u8]) -> SdResult<()>;
+    /// Write sectors
+    fn write_sectors(&mut self, lba: u64, count: u16, buffer: &[u8]) -> SdResult<()>;
+    /// Flush caches
+    fn flush(&mut self) -> SdResult<()>;
+    /// Get device capacity in bytes
+    fn capacity(&self) -> u64;
+    /// Get block size
+    fn block_size(&self) -> usize;
+    /// Check if device is online
+    fn is_online(&self) -> bool;
+    /// Get device model name
+    fn model(&self) -> [u8; 40];
+    /// Get device serial number
+    fn serial(&self) -> [u8; 20];
+}
 
 // ============================================================================
 // Block Device Interface
@@ -118,7 +194,7 @@ pub struct AtaChannel {
     pub base: u16,
     pub ctrl: u16,
     pub bmide: u16,
-    pub nIEN: bool,
+    pub n_ien: bool,
     pub devices: [AtaDevice; 2],
     /// Bus lock for channel access serialization
     bus_locked: bool,
@@ -133,7 +209,7 @@ impl AtaChannel {
             base: ata_reg::ATA_DATA,
             ctrl: ata_reg::ATA_CTRL,
             bmide: 0,
-            nIEN: false,
+            n_ien: false,
             devices: [AtaDevice::default(), AtaDevice::default()],
             bus_locked: false,
             selected_slave: false,
@@ -143,15 +219,24 @@ impl AtaChannel {
     /// Get shared instance of primary channel
     pub fn get_primary() -> &'static mut Self {
         use core::sync::atomic::{AtomicPtr, Ordering};
-        static mut PRIMARY_CHANNEL: AtomicPtr<AtaChannel> = AtomicPtr::new(core::ptr::null_mut());
-        
+        // AtomicPtr is the safe primitive for a global mutable pointer;
+        // wrap it in an `unsafe impl Sync` container so that `static` (not
+        // `static mut`) can hold it and we avoid the
+        // `static_mut_refs` lint entirely.
+        struct SyncPtr<T>(AtomicPtr<T>);
+        unsafe impl<T> Sync for SyncPtr<T> {}
+        static PRIMARY_CHANNEL: SyncPtr<AtaChannel> = SyncPtr(AtomicPtr::new(core::ptr::null_mut()));
+
         unsafe {
-            if PRIMARY_CHANNEL.load(Ordering::SeqCst).is_null() {
+            let ptr = PRIMARY_CHANNEL.0.load(Ordering::SeqCst);
+            if ptr.is_null() {
                 let channel = Box::new(Self::primary());
-                let ptr = Box::into_raw(channel);
-                PRIMARY_CHANNEL.store(ptr, Ordering::SeqCst);
+                let raw = Box::into_raw(channel);
+                PRIMARY_CHANNEL.0.store(raw, Ordering::SeqCst);
+                &mut *raw
+            } else {
+                &mut *ptr
             }
-            &mut *PRIMARY_CHANNEL.load(Ordering::SeqCst)
         }
     }
 
@@ -175,9 +260,8 @@ impl AtaChannel {
 
     /// Wait for ATA device to be ready
     pub fn wait_ready(&self, timeout_ms: usize) -> Result<()> {
-        let start = crate::common::types::MSec(0); // TODO: proper timing
-        let _ = start;
-
+        // Use the kernel's timer if available, otherwise just loop
+        // The actual timing would use clock_gettime or similar
         for _ in 0..timeout_ms {
             let status = self.alt_status();
             if status & ata_reg::ATA_SR_BSY == 0 && status & ata_reg::ATA_SR_DRQ != 0 {
@@ -232,7 +316,7 @@ impl AtaChannel {
             ..Default::default()
         };
 
-        let identify_data = self.read_buffer::<u16>(256);
+        let identify_data = self.read_buffer(256);
         device.block_size = 512;
         device.sectors = u64::from(identify_data[60]) | (u64::from(identify_data[61]) << 16);
 
@@ -268,7 +352,7 @@ impl AtaChannel {
     }
 
     /// Read data buffer from ATA
-    fn read_buffer<T>(&self, count: usize) -> Vec<T> {
+    fn read_buffer(&self, count: usize) -> Vec<u16> {
         let mut buf = vec![0u16; count];
         let ptr = buf.as_mut_ptr();
         for i in 0..count {
@@ -276,8 +360,7 @@ impl AtaChannel {
                 core::ptr::write(ptr.add(i), plan9_arch::x86_64::inw(self.base));
             }
         }
-        // Convert from little-endian u16 to native T
-        buf.iter().map(|&w| core::mem::transmute(w)).collect()
+        buf
     }
 
     /// Read sectors using PIO
@@ -319,7 +402,7 @@ impl AtaChannel {
             self.wait_ready(5000)?;
 
             // Read 256 words (512 bytes)
-            for i in 0..256 {
+            for _i in 0..256 {
                 let word = plan9_arch::x86_64::inw(self.base);
                 if total + 2 <= buffer.len() {
                     buffer[total] = (word & 0xFF) as u8;
@@ -370,7 +453,7 @@ impl AtaChannel {
             self.poll_not_busy(5000)?;
 
             // Write 256 words (512 bytes)
-            for i in 0..256 {
+            for _i in 0..256 {
                 let word = (buffer[total + 1] as u16) << 8 | buffer[total] as u16;
                 plan9_arch::x86_64::outw(self.base, word);
                 total += 2;
@@ -494,8 +577,8 @@ impl StorageManager {
     }
 
     /// Get mutable device by index
-    pub fn get_device_mut(&mut self, index: usize) -> Option<&mut dyn BlockDevice> {
-        self.devices.get_mut(index).and_then(|d| d.as_mut().map(|b| b.as_mut()))
+    pub fn get_device_mut(&mut self, index: usize) -> Option<&mut Box<dyn BlockDevice>> {
+        self.devices.get_mut(index).and_then(|d| d.as_mut())
     }
 }
 

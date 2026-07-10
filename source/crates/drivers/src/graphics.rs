@@ -6,7 +6,13 @@
 //! This module provides framebuffer management, basic drawing primitives,
 //! and cursor support for the graphics subsystem.
 
-#![allow(dead_code)]
+
+extern crate alloc;
+extern crate plan9_common;
+
+// use alloc::boxed::Box;
+// use alloc::vec;
+// use alloc::vec::Vec;
 
 // ============================================================================
 // Framebuffer Types
@@ -328,29 +334,50 @@ impl Framebuffer {
     
     /// Copy area from one location to another
     pub fn copy_rect(&mut self, src: Rect, dest_x: i32, dest_y: i32) {
-        // Handle overlap correctly
+        // Handle overlap correctly - copy in the right direction
         let up = dest_y < src.y as i32;
         let left = dest_x < src.x;
+
+        // Determine iteration ranges
+        let dy_start: i32;
+        let dy_end: i32;
+        let dy_step: i32;
         
-        let dy_range: Box<dyn Iterator<Item = i32>> = if up {
-            Box::new(0..src.height as i32)
+        if up {
+            dy_start = 0;
+            dy_end = src.height as i32;
+            dy_step = 1;
         } else {
-            Box::new((src.height as i32 - 1..=0))
-        };
+            dy_start = src.height as i32 - 1;
+            dy_end = -1;
+            dy_step = -1;
+        }
         
-        let dx_range: Box<dyn Iterator<Item = i32>> = if left {
-            Box::new(0..src.width as i32)
+        let dx_start: i32;
+        let dx_end: i32;
+        let dx_step: i32;
+        
+        if left {
+            dx_start = 0;
+            dx_end = src.width as i32;
+            dx_step = 1;
         } else {
-            Box::new((src.width as i32 - 1..=0))
-        };
+            dx_start = src.width as i32 - 1;
+            dx_end = -1;
+            dx_step = -1;
+        }
         
-        for dy in dy_range {
-            for dx in dx_range.clone() {
+        let mut dy = dy_start;
+        while dy != dy_end {
+            let mut dx = dx_start;
+            while dx != dx_end {
                 let src_x = src.x + dx;
                 let src_y = src.y + dy;
                 let color = self.read_pixel(src_x as u32, src_y as u32);
                 self.write_pixel(dest_x + dx, dest_y + dy, color);
+                dx += dx_step;
             }
+            dy += dy_step;
         }
     }
     
