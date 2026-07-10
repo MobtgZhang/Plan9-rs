@@ -60,6 +60,11 @@ pub mod ipv6;
 pub mod protocol;
 pub mod tcp;
 pub mod udp;
+pub mod socket;
+pub mod dhcp;
+pub mod dns;
+pub mod ipsec;
+pub mod netstack;
 
 // ============================================================================
 // Re-exports from Ethernet
@@ -257,6 +262,64 @@ pub use icmpv6::{
 // Re-exports from 9P Protocol
 // ============================================================================
 pub use protocol::{P9Client, P9Codec, P9Msg, P9Server};
+
+// ============================================================================
+// Re-exports from Socket API
+// ============================================================================
+pub use socket::{
+    // Socket functions
+    socket,
+    bind,
+    listen,
+    accept,
+    connect,
+    close,
+    setsockopt,
+    getsockopt,
+    // Socket types
+    Socket,
+    SocketState,
+    SocketError,
+    SockAddr,
+    SockAddrIn,
+    SockAddrIn6,
+    // Constants
+    domain,
+    sock_type,
+    proto as sock_proto,
+    flags,
+    level,
+    opt,
+};
+
+// ============================================================================
+// Re-exports from DHCP
+// ============================================================================
+pub use dhcp::{
+    DhcpClient,
+    DhcpConfig,
+    DhcpPacket,
+    DhcpState,
+    msg_type as dhcp_msg_type,
+    op as dhcp_op,
+    option as dhcp_option,
+    port as dhcp_port,
+};
+
+// ============================================================================
+// Re-exports from DNS
+// ============================================================================
+pub use dns::{
+    DnsCache,
+    DnsPacket,
+    DnsQuestion,
+    DnsRecord,
+    DnsRecordType,
+    DnsResolver,
+    DnsRcode,
+    DNS_MAX_SIZE,
+    DNS_PORT,
+};
 
 // ============================================================================
 // Re-exports from Common
