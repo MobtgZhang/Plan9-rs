@@ -1,269 +1,299 @@
-//! Init Process
-//!
-//! Implements the first user-space process (init).
+//! Plan 9 init — minimal user-mode shell that demonstrates kernel/user
+//! separation. Runs entirely in ring 3, only talks to the kernel via
+//! `int 0x80` syscalls.
 
-use crate::proc::{Proc, State, Pid};
-use crate::sched::scheduler;
-use crate::syscall;
-use core::sync::atomic::{AtomicBool, Ordering};
+#![no_std]
+#![no_main]
 
-// ============================================================================
-// Init Process
-// ============================================================================
+mod syscall;
 
-/// Init process entry function
-pub fn init_main() -> ! {
-    // Initialize the console
-    init_console();
-    
-    // Print welcome message
-    println!("Plan 9 from Outer Space\n");
-    println!("kernel booting...\n");
-    
-    // Initialize file systems
-    init_filesystems();
-    
-    // Start essential services
-    start_services();
-    
-    // Run the shell
-    run_shell();
-    
-    // Should never return
-    loop {}
+use core::arch::asm;
+
+use syscall::{brk, chdir, close, dup, exec, exit, fork, getpid, list, open, puts, read, stat, wait, write, yield_cpu};
+
+const O_RDONLY: u32 = 0;
+const O_WRONLY: u32 = 1;
+
+fn print(s: &str) {
+    puts(s.as_ptr());
 }
 
-/// Initialize console
-fn init_console() {
-    // The console is already initialized by the kernel
-    // Just configure it for init
+fn println(s: &str) {
+    print(s);
+    print("\n");
 }
 
-/// Initialize file systems
-fn init_filesystems() {
-    // Mount the root file system
-    // This would be done by the kernel during boot
-    println!("Initializing file systems...\n");
-    
-    // Mount /proc
-    // mount("#p", "/proc", "", None);
-    
-    // Mount /dev
-    // mount("#d", "/dev", "", None);
-    
-    // Mount /net
-    // mount("#I", "/net", "", None);
+fn print_prompt() {
+    print("term% ");
 }
 
-/// Start essential system services
-fn start_services() {
-    println!("Starting services...\n");
-    
-    // Start the Factotum authentication service
-    // if let Ok(_) = rfork(rfork::FLAGFPROC | rfork::FLAGFENV) {
-    //     exec("/bin/factotum", &[]);
-    // }
-    
-    // Start the Venti fossil storage system
-    // if let Ok(_) = rfork(rfork::FLAGFPROC) {
-    //     exec("/bin/fossil", &[]);
-    // }
+fn cstr(s: &str) -> (usize, [u8; 256]) {
+    let bytes = s.as_bytes();
+    let mut buf = [0u8; 256];
+    let n = if bytes.len() < 255 { bytes.len() } else { 255 };
+    buf[..n].copy_from_slice(&bytes[..n]);
+    buf[n] = 0;
+    (n, buf)
 }
 
-/// Run the shell
-fn run_shell() {
-    println!("Starting shell...\n");
-    
-    // Create a new process for the shell
-    let pid = rfork_shell();
-    
+fn open_console() -> i64 {
+    let (_, p) = cstr("/dev/console");
+    open(p.as_ptr(), O_WRONLY)
+}
+
+fn write_str(fd: i64, s: &str) {
+    write(fd, s.as_ptr(), s.len());
+}
+
+fn main() -> ! {
+    print("\n[init] Plan 9 from Outer Space — Rust kernel\n");
+    print("[init] pid=");
+    let mut pid_buf = [0u8; 16];
+    let p = format_u64(getpid() as u64, &mut pid_buf);
+    print(p);
+    print("\n");
+
+    // Try to exec `/rc/bin/rc` first (Plan 9 bootstrap split: init
+    // is just a loader, the boot script lives in `rc`). Falls back
+    // to the built-in shell if `rc` cannot be executed.
+    let (n, path_buf) = cstr("/rc/bin/rc");
+    let argv_arr: [*const u8; 1] = [path_buf.as_ptr()];
+    let pid = fork();
     if pid == 0 {
-        // Child: exec the shell
-        exec_shell();
-    } else {
-        // Parent: wait for shell to exit
+        // Child: exec the rc script.
+        exec(path_buf.as_ptr(), argv_arr.as_ptr(), 1);
+        // exec failed: exit so init's parent loop continues.
+        exit(127);
+    } else if pid > 0 {
+        // Parent: wait for rc, then continue with the shell fallback.
+        let _ = wait(pid as i32);
+    }
+
+    let con_fd = open_console();
+    if con_fd < 0 {
+        print("[init] failed to open console\n");
+    }
+    let mut input = [0u8; 256];
+
+    loop {
+        print_prompt();
+        // Read one byte at a time.
+        let mut idx = 0usize;
         loop {
-            let mut status: i32 = 0;
-            // waitpid(pid, &mut status, 0);
-            if status != 0 {
-                println!("Shell exited with status {}\n", status);
+            let n = read(0, &mut input[idx], 1);
+            if n <= 0 {
+                yield_cpu();
+                continue;
+            }
+            let b = input[idx];
+            if b == b'\n' || b == b'\r' {
                 break;
             }
+            if idx + 1 < input.len() {
+                idx += 1;
+            }
+        }
+        if idx == 0 {
+            continue;
+        }
+
+        let line = &input[..idx];
+        let cmd = match core::str::from_utf8(line) {
+            Ok(s) => s.trim(),
+            Err(_) => {
+                println("?");
+                continue;
+            }
+        };
+        if cmd.is_empty() {
+            continue;
+        }
+
+        if cmd == "help" {
+            cmd_help();
+        } else if let Some(rest) = cmd.strip_prefix("echo ") {
+            write_str(con_fd, rest);
+            write_str(con_fd, "\n");
+        } else if cmd == "echo" {
+            write_str(con_fd, "\n");
+        } else if cmd == "ls" {
+            cmd_ls("/");
+        } else if let Some(path) = cmd.strip_prefix("cat ") {
+            cmd_cat(path.trim());
+        } else if cmd == "pwd" {
+            write_str(con_fd, "/\n");
+        } else if cmd == "ps" {
+            cmd_ps();
+        } else if cmd == "exit" {
+            print("goodbye\n");
+            exit(0);
+        } else if cmd == "halt" {
+            loop {
+                unsafe { asm!("hlt", options(nostack, preserves_flags)) }
+            }
+        } else if cmd == "fork" {
+            let p = fork();
+            if p == 0 {
+                print("[init] child\n");
+            } else {
+                print("[init] forked pid=");
+                let mut b = [0u8; 16];
+                let s = format_u64(p as u64, &mut b);
+                print(s);
+                print("\n");
+                wait(p as i32);
+            }
+        } else if let Some(path) = cmd.strip_prefix("cd ") {
+            let (_, p) = cstr(path.trim());
+            let rc = chdir(p.as_ptr());
+            if rc < 0 {
+                print("cd: failed\n");
+            }
+        } else if let Some(path) = cmd.strip_prefix("stat ") {
+            let (_, p) = cstr(path.trim());
+            let mut buf = [0u8; 256];
+            let rc = stat(p.as_ptr(), buf.as_mut_ptr(), buf.len());
+            if rc < 0 {
+                print("stat: failed\n");
+            } else {
+                let s = unsafe { core::str::from_utf8_unchecked(&buf[..rc as usize]) };
+                print(s);
+                print("\n");
+            }
+        } else if let Some(addr_str) = cmd.strip_prefix("brk ") {
+            // Allow the user to grow the heap to a decimal address.
+            let addr = parse_u64(addr_str.trim());
+            let rc = brk(addr);
+            let mut b = [0u8; 16];
+            let s = format_u64(rc as u64, &mut b);
+            print("brk -> ");
+            print(s);
+            print("\n");
+        } else if let Some(rest) = cmd.strip_prefix("dup ") {
+            // `dup N` opens /dev/console and then duplicates fd N to it.
+            let src = rest.trim().parse::<i64>().unwrap_or(-1);
+            let newfd = dup(src);
+            let mut b = [0u8; 16];
+            let s = format_u64(newfd as u64, &mut b);
+            print("dup -> ");
+            print(s);
+            print("\n");
+        } else if let Some(rest) = cmd.strip_prefix("exec ") {
+            // Bare-bones exec: replace the current process with `/bin/<name>`.
+            let name = rest.trim();
+            let mut path_buf = [0u8; 256];
+            let path_str = b"/bin/";
+            let n = path_str.len();
+            path_buf[..n].copy_from_slice(path_str);
+            let copy_len = name.len().min(255 - n);
+            path_buf[n..n + copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
+            path_buf[n + copy_len] = 0;
+            let argv = [path_buf.as_ptr(), core::ptr::null()];
+            let rc = exec(path_buf.as_ptr(), argv.as_ptr(), 1);
+            let mut b = [0u8; 16];
+            let s = format_u64(rc as u64, &mut b);
+            print("exec -> ");
+            print(s);
+            print("\n");
+        } else {
+            print("unknown: ");
+            println(cmd);
         }
     }
 }
 
-/// Fork for shell
-fn rfork_shell() -> Pid {
-    // In a real implementation, this would call the scheduler's fork
-    let sched = scheduler();
-    
-    match sched.fork(curproc(), shell_entry) {
-        Some(pid) => pid,
-        None => 0,
-    }
+fn cmd_help() {
+    print("Available commands:\n");
+    print("  help   - this message\n");
+    print("  echo   - echo text\n");
+    print("  ls     - list current directory\n");
+    print("  cat F  - print file F\n");
+    print("  pwd    - print working directory\n");
+    print("  ps     - list processes\n");
+    print("  fork   - fork and wait\n");
+    print("  cd D   - change directory\n");
+    print("  stat F - stat file F\n");
+    print("  brk N  - grow heap to N\n");
+    print("  dup N  - duplicate fd N\n");
+    print("  exec N - exec /bin/N\n");
+    print("  exit   - exit init\n");
+    print("  halt   - halt the CPU\n");
 }
 
-/// Shell process entry
-extern "C" fn shell_entry() {
-    // This would be the shell's entry point
-    // After fork, the child would jump here
-    loop {}
-}
-
-/// Exec the shell
-fn exec_shell() -> ! {
-    // Path to shell
-    let shell_path = b"/bin/rc\0";
-    
-    // Arguments
-    let argv: [&[u8]; 2] = [
-        b"rc\0",
-        b"-c\0",
-    ];
-    
-    // Environment
-    let envp: [&[u8]; 4] = [
-        b"PATH=/bin\0",
-        b"home=/\0",
-        b"term=vt100\0",
-        b"\0",
-    ];
-    
-    // Exec the shell
-    // In a real implementation:
-    // syscall::sys_exec(shell_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
-    
-    loop {}
-}
-
-/// Get current process
-fn curproc() -> Option<&'static Proc> {
-    crate::proc::curproc()
-}
-
-// ============================================================================
-// Shutdown
-// ============================================================================
-
-/// Shutdown the system
-pub fn shutdown() {
-    static SHUTDOWN_INITIATED: AtomicBool = AtomicBool::new(false);
-    
-    // Ensure shutdown is only initiated once
-    if SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
+fn cmd_ls(path: &str) {
+    let (_, p) = cstr(path);
+    let mut buf = [0u8; 1024];
+    let n = list(p.as_ptr(), buf.as_mut_ptr(), buf.len());
+    if n < 0 {
+        print("ls failed\n");
         return;
     }
-    
-    println!("Shutting down...\n");
-    
-    // Sync file systems
-    sync_filesystems();
-    
-    // Stop services
-    stop_services();
-    
-    // Final halt
-    println!("System halted.\n");
-    halt();
+    let s = unsafe { core::str::from_utf8_unchecked(&buf[..n as usize]) };
+    print(s);
 }
 
-/// Sync all file systems
-fn sync_filesystems() {
-    println!("Syncing file systems...\n");
-    // fsyncall();
-}
-
-/// Stop all services
-fn stop_services() {
-    println!("Stopping services...\n");
-    // Send TERM signal to all processes
-    // kill(-1, SIGTERM);
-    // sleep(1);
-    // kill(-1, SIGKILL);
-}
-
-/// Halt the CPU
-fn halt() -> ! {
+fn cmd_cat(path: &str) {
+    let (_, p) = cstr(path);
+    let fd = open(p.as_ptr(), O_RDONLY);
+    if fd < 0 {
+        print("cat: open failed\n");
+        return;
+    }
+    let mut buf = [0u8; 256];
     loop {
-        crate::arch::x86_64::hlt();
-    }
-}
-
-// ============================================================================
-// Panic Handler
-// ============================================================================
-
-/// Panic handler for init process
-pub fn init_panic(msg: &[u8]) {
-    println!("PANIC: ");
-    for &b in msg {
-        print!("{}", b as char);
-    }
-    println!("\n");
-    
-    // Dump stack trace if possible
-    dump_stack();
-    
-    // Enter debugger or reboot
-    reboot();
-}
-
-/// Dump current stack
-fn dump_stack() {
-    // In a real implementation, this would print the stack trace
-    println!("Stack trace:");
-    // Walk the stack and print return addresses
-}
-
-/// Reboot the system
-fn reboot() -> ! {
-    println!("Rebooting...\n");
-    
-    // Try to sync first
-    sync_filesystems();
-    
-    // Trigger a software reset
-    // This would typically use the keyboard controller or ACPI
-    
-    loop {}
-}
-
-// ============================================================================
-// Console Output
-// ============================================================================
-
-/// Print a character to console
-pub fn putchar(c: u8) {
-    // Write to console device
-    // In a real implementation, this would call the console driver's putc
-    // syscall::sys_write(1, &c, 1);
-    let _ = c;
-}
-
-/// Print a string to console
-pub fn puts(s: &[u8]) {
-    for &c in s {
-        if c == b'\n' {
-            putchar(b'\r');
+        let n = read(fd, buf.as_mut_ptr(), buf.len());
+        if n <= 0 {
+            break;
         }
-        putchar(c);
+        write(1, buf.as_ptr(), n as usize);
+    }
+    close(fd);
+}
+
+fn cmd_ps() {
+    cmd_ls("/proc");
+}
+
+fn format_u64(mut v: u64, buf: &mut [u8]) -> &str {
+    if v == 0 {
+        buf[0] = b'0';
+        return unsafe { core::str::from_utf8_unchecked(&buf[..1]) };
+    }
+    let mut n = 0usize;
+    let mut tmp = [0u8; 20];
+    while v > 0 {
+        tmp[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    for i in 0..n {
+        buf[i] = tmp[n - 1 - i];
+    }
+    unsafe { core::str::from_utf8_unchecked(&buf[..n]) }
+}
+
+/// Parse a decimal unsigned integer. Returns 0 on parse failure.
+fn parse_u64(s: &str) -> usize {
+    let mut value: usize = 0;
+    for &b in s.as_bytes() {
+        if b < b'0' || b > b'9' {
+            return 0;
+        }
+        value = value * 10 + (b - b'0') as usize;
+    }
+    value
+}
+
+/// Panic handler: halt on any panic.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {
+        unsafe { core::arch::asm!("hlt", options(nostack, preserves_flags)) }
     }
 }
 
-/// Print formatted string (simple implementation)
-macro_rules! println {
-    ($($arg:tt)*) => {
-        print!($($arg)*);
-        puts(b"\n");
-    };
-}
-
-/// Print formatted string (no newline)
-macro_rules! print {
-    ($($arg:tt)*) => {
-        // Simple print implementation
-        // In real impl, would use formatted printing
-        let _ = format_args!($($arg)*);
-    };
+/// Binary entry point.
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    main()
 }
