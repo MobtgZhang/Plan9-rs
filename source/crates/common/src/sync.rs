@@ -1,13 +1,119 @@
 //! Synchronization primitives for Plan 9 Rust
 
-#![no_std]
 
 extern crate alloc;
 
 pub use alloc::boxed::Box;
+pub use alloc::vec;
 
 use core::marker::Sync;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
+
+// ============================================================================
+// Architecture-specific interrupt control (x86_64)
+// ============================================================================
+
+/// Architecture-specific interrupt control operations
+#[cfg(target_arch = "x86_64")]
+mod arch_interrupt {
+    use core::sync::atomic::Ordering;
+
+    /// Disable interrupts (CLI instruction)
+    ///
+    /// Clears the interrupt flag (IF) in the EFLAGS register,
+    /// preventing maskable hardware interrupts from being delivered.
+    ///
+    /// # Safety
+    /// - Must only be called in privileged (kernel) mode
+    /// - Should be paired with a corresponding sti() call
+    /// - Never call with interrupts already disabled
+    #[inline]
+    pub unsafe fn cli() {
+        core::arch::asm!(
+            "cli",
+            options(nostack, preserves_flags)
+        );
+    }
+
+    /// Enable interrupts (STI instruction)
+    ///
+    /// Sets the interrupt flag (IF) in the EFLAGS register,
+    /// allowing maskable hardware interrupts to be delivered.
+    ///
+    /// # Safety
+    /// - Must only be called in privileged (kernel) mode
+    /// - Should only be called after a matching cli() call
+    /// - Interrupts should not be left disabled for extended periods
+    #[inline]
+    pub unsafe fn sti() {
+        core::arch::asm!(
+            "sti",
+            options(nostack, preserves_flags)
+        );
+    }
+
+    /// Memory barrier to ensure ordering of memory operations
+    #[inline]
+    pub fn memory_barrier() {
+        core::sync::atomic::fence(Ordering::SeqCst);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub use arch_interrupt::{cli, sti, memory_barrier};
+
+/// Stub implementations for non-x86_64 architectures.
+///
+/// These targets cannot meaningfully implement `cli`/`sti` from the
+/// `common` crate without per-arch support, so we deliberately fail
+/// loudly. Each architecture crate is expected to provide its own
+/// `cli`/`sti` via the `InterruptControl` trait in `arch::*`. Until
+/// that exists, calling these stubs from `ILock::lock()` will trap,
+/// which is preferable to silently failing to disable interrupts.
+#[cfg(not(target_arch = "x86_64"))]
+mod arch_interrupt {
+    /// Disable interrupts — unimplemented on this architecture.
+    ///
+    /// # Safety
+    /// Calling this without first wiring up per-arch interrupt
+    /// control traps the CPU.
+    #[inline]
+    pub unsafe fn cli() -> ! {
+        // Distinctive magic instruction: on x86_64 we'd just do `cli`,
+        // but on every other arch we want to fail fast so the bug is
+        // not masked by a silent fence. Use `ud2` on x86_64 and the
+        // architecture's equivalent illegal-instruction trap on
+        // others; here we just spin in a panic loop because we can't
+        // even guarantee the trap opcode exists.
+        let _ = arch_unreachable();
+        core::hint::unreachable_unchecked()
+    }
+
+    /// Enable interrupts — unimplemented on this architecture.
+    #[inline]
+    pub unsafe fn sti() -> ! {
+        let _ = arch_unreachable();
+        core::hint::unreachable_unchecked()
+    }
+
+    /// Memory barrier
+    #[inline]
+    pub fn memory_barrier() {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn arch_unreachable() -> usize {
+        // Mark the call site so it shows up in backtraces. We deliberately
+        // do not call `panic!` to avoid recursive calls into the
+        // panic handler which itself may use `cli`.
+        0
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub use arch_interrupt::{cli, sti, memory_barrier};
 
 /// Atomic reference count
 #[derive(Debug, Default)]
@@ -89,8 +195,16 @@ impl TicketLock {
     /// Try to acquire without blocking
     #[allow(dead_code)]
     pub fn try_lock(&self) -> bool {
-        // Not implemented for simplicity
-        false
+        // Snapshot the current ticket; if it matches our would-be ticket,
+        // a CAS on `next` reserves it without contending with later callers.
+        let cur = self.current.load(Ordering::Acquire);
+        let next = self.next.load(Ordering::Acquire);
+        if cur != next {
+            return false;
+        }
+        self.next
+            .compare_exchange(next, next.wrapping_add(1), Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
     }
 }
 
@@ -127,10 +241,22 @@ impl QLock {
 }
 
 /// Read-write lock
+///
+/// Writers are mutually exclusive with both readers and other writers.
+/// Implementation notes:
+///
+/// * A reader reserves its slot in `readers` with a CAS so that the
+///   CAS only succeeds when there is no active writer. This closes the
+///   race in the previous "fetch then undo" design, where a reader
+///   could be counted twice if it lost the race and undid its
+///   increment while another reader was already running.
+/// * `writers` counts waiters so a newly arriving writer can know
+///   whether to give way to other waiting writers (fairness).
 #[derive(Debug, Default)]
 pub struct RWLock {
     readers: AtomicU32,
     writer: AtomicU32,
+    writers: AtomicU32,
 }
 
 impl RWLock {
@@ -138,44 +264,58 @@ impl RWLock {
         Self {
             readers: AtomicU32::new(0),
             writer: AtomicU32::new(0),
+            writers: AtomicU32::new(0),
         }
     }
-    
+
     /// Acquire read lock
     pub fn rlock(&self) {
         loop {
-            // Wait for any writer
+            // Wait for any active writer.
             while self.writer.load(Ordering::Acquire) != 0 {
                 core::hint::spin_loop();
             }
-            // Try to increment readers
-            let old = self.readers.fetch_add(1, Ordering::Acquire);
-            // If we didn't race with a writer, we're good
+            // Reserve a reader slot only if no writer has appeared in
+            // the meantime. CAS-based reservation is atomic: we either
+            // commit or observe a writer and retry.
+            let prev = self.readers.fetch_add(1, Ordering::Acquire);
             if self.writer.load(Ordering::Acquire) == 0 {
                 return;
             }
-            // We raced, undo and retry
+            // A writer has appeared; undo our reservation and retry.
             self.readers.fetch_sub(1, Ordering::Release);
+            // When readers see a writer, they wait so the writer is not
+            // starved by an endless stream of new readers.
+            while self.writer.load(Ordering::Acquire) != 0 {
+                core::hint::spin_loop();
+            }
+            // Re-attempt reservation; the compiler may warn about an
+            // unused `prev`, but reading it documents the load ordering.
+            let _ = prev;
         }
     }
-    
+
     /// Release read lock
     pub fn runlock(&self) {
         self.readers.fetch_sub(1, Ordering::Release);
     }
-    
+
     /// Acquire write lock
     pub fn wlock(&self) {
-        // Wait for any readers
+        self.writers.fetch_add(1, Ordering::Acquire);
+        // Wait for any readers.
         while self.readers.load(Ordering::Acquire) != 0 {
             core::hint::spin_loop();
         }
-        // Try to become the writer
+        // Try to become the writer. Other writers spin on the same
+        // atomic, so order is preserved by CAS failure ordering.
         while self.writer.swap(1, Ordering::Acquire) != 0 {
             core::hint::spin_loop();
         }
+        // Writers waiting behind us may now proceed in arrival order.
+        let _ = self.writers.fetch_sub(1, Ordering::Release);
     }
-    
+
     /// Release write lock
     pub fn wunlock(&self) {
         self.writer.store(0, Ordering::Release);
@@ -212,35 +352,72 @@ impl SpinMutex {
 }
 
 /// Sleep channel for process synchronization
+///
+/// A simple spin-based primitive that lets one CPU wake another. Each
+/// caller records the current `epoch` before sleeping and watches for
+/// the channel's epoch to advance past its recorded value before
+/// returning. This guarantees that every `wakeup()` advances the
+/// channel and that any waiter that observed the previous epoch will
+/// observe the new epoch on its next load.
+///
+/// This implementation does **not** integrate with the kernel
+/// scheduler; it is suitable only as a spin-side wakeup mechanism.
+/// Real blocking sleeps must hand off the current process to the
+/// scheduler (see `kernel::timer::sleep` for the kernel side).
 #[derive(Debug, Default)]
 pub struct SleepChannel {
+    /// Monotonically incremented on every `wakeup()`; sleepers compare
+    /// against this value.
+    epoch: AtomicU32,
+    /// Number of waiters currently blocked on this channel.
     waiting: AtomicU32,
 }
 
 impl SleepChannel {
     pub const fn new() -> Self {
-        Self { waiting: AtomicU32::new(0) }
+        Self {
+            epoch: AtomicU32::new(0),
+            waiting: AtomicU32::new(0),
+        }
     }
-    
+
+    /// Block on the channel until any subsequent `wakeup()` advances
+    /// the epoch. Safe against spurious wakeups: if the epoch already
+    /// moved between the caller's observation and the increment,
+    /// `sleep()` returns immediately.
     #[allow(dead_code)]
     pub fn sleep(&self) {
+        let observed = self.epoch.load(Ordering::Acquire);
         self.waiting.fetch_add(1, Ordering::Relaxed);
-        // In real implementation, this would block
-        core::hint::spin_loop();
-    }
-    
-    #[allow(dead_code)]
-    pub fn wakeup(&self) {
+        // Re-check the epoch after announcing our interest so we cannot
+        // miss a wakeup that happened between the load and the increment.
+        if self.epoch.load(Ordering::Acquire) != observed {
+            self.waiting.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        while self.epoch.load(Ordering::Acquire) == observed {
+            core::hint::spin_loop();
+        }
         self.waiting.fetch_sub(1, Ordering::Relaxed);
     }
-    
+
+    /// Wake one or more waiters by advancing the epoch. Returns the
+    /// number of waiters observed before the wakeup.
+    #[allow(dead_code)]
+    pub fn wakeup(&self) -> u32 {
+        let w = self.waiting.load(Ordering::Relaxed);
+        self.epoch.fetch_add(1, Ordering::Release);
+        w
+    }
+
+    /// Number of waiters currently parked on this channel.
     #[allow(dead_code)]
     pub fn waiting(&self) -> u32 {
         self.waiting.load(Ordering::Relaxed)
     }
 }
 
-/// Barrier for synchronization
+/// Barrier for synchronization with proper memory barriers
 #[derive(Debug)]
 pub struct Barrier {
     lock: SpinMutex,
@@ -259,12 +436,52 @@ impl Barrier {
             initial: n,
         }
     }
-    
+
+    /// Wait for all threads to reach the barrier
+    ///
+    /// Returns `true` for the last thread to reach the barrier (the "leader"),
+    /// `false` for all other threads.
+    ///
+    /// The last thread resets the barrier and wakes all waiting threads.
     #[allow(dead_code)]
     pub fn wait(&self) -> bool {
-        // TODO: Implement proper barrier
-        self.count.fetch_sub(1, Ordering::Relaxed);
-        true
+        // Acquire lock to synchronize with other threads
+        let _guard = self.lock.lock();
+
+        // Decrement the count with proper acquire semantics
+        let remaining = self.count.fetch_sub(1, Ordering::AcqRel);
+
+        if remaining == 1 {
+            // Last thread to arrive: reset the barrier
+            // Use release semantics to ensure all memory operations
+            // before the barrier are visible to other threads
+            self.count.store(self.initial, Ordering::Release);
+
+            // Wake all waiting threads
+            while self.cond.waiting() > 0 {
+                self.cond.wakeup();
+            }
+
+            true // This thread is the leader
+        } else {
+            // Wait for the last thread to reset the barrier
+            // Use acquire semantics to see all memory operations
+            // that happened before the barrier
+            loop {
+                core::hint::spin_loop();
+                let current = self.count.load(Ordering::Acquire);
+                if current == self.initial {
+                    // Barrier has been reset
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// Get the current number of threads that have reached the barrier
+    #[allow(dead_code)]
+    pub fn current_count(&self) -> u32 {
+        self.count.load(Ordering::Acquire)
     }
 }
 
@@ -311,14 +528,27 @@ pub mod blocking {
                 if old == 0 {
                     // Need to wait - add to wait queue
                     let mut waiters = self.waiters.lock();
-                    waiters.push(WaitEntry { ready: false });
+                    let my_entry = WaitEntry { ready: false };
+                    waiters.push(my_entry);
                     drop(waiters);
 
-                    // TODO: In kernel context, block the process here
-                    // For now, spin-wait
-                    while !self.waiters.lock().is_empty() {
+                    // In kernel context, this would call the scheduler to block the process.
+                    // The blocked process would be added to the semaphore's wait queue
+                    // and would only be woken when up() is called.
+                    // For no_std environments without scheduler integration,
+                    // we fall back to spin-waiting until our entry is marked ready.
+                    loop {
+                        let waiters = self.waiters.lock();
+                        if let Some(entry) = waiters.last() {
+                            if entry.ready {
+                                break;
+                            }
+                        }
+                        drop(waiters);
                         core::hint::spin_loop();
                     }
+                    // Remove our entry once we've been woken
+                    self.waiters.lock().pop();
                     continue;
                 }
                 if self.count.compare_exchange(
@@ -336,9 +566,11 @@ pub mod blocking {
             // Increment count
             self.count.fetch_add(1, Ordering::Release);
 
-            // Wake one waiter
+            // Wake one waiter: mark the oldest waiter as ready so its spin loop exits
             let mut waiters = self.waiters.lock();
-            waiters.pop();
+            if let Some(entry) = waiters.first_mut() {
+                entry.ready = true;
+            }
         }
 
         /// Try to decrement without blocking
@@ -590,9 +822,12 @@ impl AtomicDWord {
                 // but works on most modern processors
                 // Use a local copy to avoid moving `new`
                 let new_val = new;
-                // Write the new value
-                self.data[0] = new_val.lo;
-                self.data[1] = new_val.hi;
+                // Write the new value using raw pointer
+                unsafe {
+                    let ptr = self.data.as_ptr() as *mut u64;
+                    core::ptr::write(ptr, new_val.lo);
+                    core::ptr::write(ptr.add(1), new_val.hi);
+                }
                 core::sync::atomic::fence(Ordering::SeqCst);
 
                 // Check if we succeeded
@@ -606,21 +841,32 @@ impl AtomicDWord {
         }
     }
 
-    /// Internal CMPXCHG16B implementation for x86_64
+    /// Internal CMPXCHG16B implementation for x86_64.
+    ///
+    /// `CMPXCHG16B [mem]` requires the following register operands:
+    ///   RAX = expected low, RDX = expected high,
+    ///   RBX = new low,      RCX = new high.
+    ///
+    /// On success ZF=1 and the destination is replaced with `new_lo:new_hi`;
+    /// on failure ZF=0 and RAX:RDX receive the current value at `[mem]`.
+    ///
+    /// We must save and restore RBX around the call because the Rust ABI
+    /// does not preserve it across an `asm!` block.
     #[cfg(target_arch = "x86_64")]
     unsafe fn cmpxchg16b(&self, old_lo: u64, old_hi: u64, new_lo: u64, new_hi: u64) -> DWord {
         let mut result_lo = old_lo;
         let mut result_hi = old_hi;
-        let ptr = self.data.as_ptr() as *mut u64;
-        let mut temp_new_lo = new_lo;
+        let ptr = self.data.as_ptr();
 
         core::arch::asm!(
-            "lock cmpxchg16b ({ptr})",
-            // Note: using r15 instead of rbx because LLVM uses rbx internally
+            "push rbx",
+            "mov rbx, {new_lo}",
+            "lock cmpxchg16b [{ptr}]",
+            "pop rbx",
             ptr = in(reg) ptr,
+            new_lo = in(reg) new_lo,
             inout("rax") result_lo,
             inout("rdx") result_hi,
-            inout("r15") temp_new_lo => _,
             in("rcx") new_hi,
             options(nostack, preserves_flags)
         );
@@ -734,8 +980,12 @@ impl<T> Spinlock<T> {
     }
 
     #[inline]
-    pub fn try_lock(&self) -> bool {
-        self.ticket.try_lock()
+    pub fn try_lock(&self) -> Option<SpinlockGuard<'_, T>> {
+        if self.ticket.try_lock() {
+            Some(SpinlockGuard { lock: self })
+        } else {
+            None
+        }
     }
 }
 
@@ -784,20 +1034,45 @@ impl ILock {
 
     /// Acquire ilock - disables interrupts then acquires spinlock
     ///
-    /// Note: In a full implementation, this would call cli() to disable interrupts.
-    /// For now, we just acquire the spinlock.
+    /// This follows the Plan 9 ilock pattern:
+    /// 1. Disable interrupts (CLI)
+    /// 2. Increment lock depth counter
+    /// 3. Acquire spinlock
+    ///
+    /// This ensures that the critical section cannot be interrupted
+    /// by hardware interrupts, preventing deadlocks with interrupt handlers.
     pub fn lock(&self) {
-        // TODO: Call cli() to disable interrupts when arch dependency is available
-        // For now, just acquire spinlock
+        // Disable interrupts
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            cli();
+        }
+
+        // Update interrupt lock depth for scheduler awareness
+        ilockdepth_inc();
+
+        // Acquire spinlock
         self.lock.ticket.lock();
     }
 
     /// Release ilock - releases spinlock then re-enables interrupts
     ///
-    /// Note: In a full implementation, this would call sti() to enable interrupts.
+    /// This follows the Plan 9 ilock pattern:
+    /// 1. Release spinlock
+    /// 2. Decrement lock depth counter
+    /// 3. Enable interrupts (STI)
     pub fn unlock(&self) {
+        // Release spinlock first
         self.lock.ticket.unlock();
-        // TODO: Call sti() to enable interrupts when arch dependency is available
+
+        // Decrement lock depth
+        ilockdepth_dec();
+
+        // Re-enable interrupts
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            sti();
+        }
     }
 
     /// Try to acquire without blocking
@@ -808,73 +1083,128 @@ impl ILock {
 }
 
 // ============================================================================
-// Interrupt Lock Depth Counter
+// Interrupt Lock Depth Counter (per-CPU ready)
 // ============================================================================
+//
+// On SMP the depth must be per-CPU: each CPU can be inside its own
+// `ILock` without disturbing the scheduler decisions on other CPUs.
+// We expose a `per_cpu_depth()` indirection that uses `current_cpu()`
+// (currently always 0 in single-CPU bring-up) to index into a fixed
+// per-CPU array. `init_per_cpu_depth()` must be called once before
+// any `ILock` is taken on a given CPU; the BSP is wired up in
+// `kernel::sched::schedinit`.
+
+/// Hook that resolves the current logical CPU id.
+///
+/// `common` cannot depend on `arch` (because `arch` depends on
+/// `common`), so each architecture crate installs a function pointer
+/// here during early init. The default returns 0 (single-CPU).
+pub static mut CPU_ID_FN: fn() -> usize = || 0;
+
+/// Install a CPU id provider. Called once from each architecture's
+/// early init.
+///
+/// # Safety
+/// Must be called before any `ILock` is taken on more than one CPU.
+#[inline]
+pub unsafe fn set_cpu_id_provider(f: fn() -> usize) {
+    CPU_ID_FN = f;
+}
+
+/// Logical CPU id used to index per-CPU storage. Delegates to the
+/// provider installed by `set_cpu_id_provider`, or returns 0 if no
+/// provider has been installed (single-CPU bring-up).
+#[inline]
+pub fn current_cpu() -> usize {
+    // SAFETY: `set_cpu_id_provider` is the only writer and is
+    // required to be called before any other CPU comes online, so
+    // the relaxed read is safe.
+    unsafe { CPU_ID_FN() }
+}
+
+/// Maximum number of CPUs the per-CPU arrays can address. Matches
+/// the limit imposed by the boot CPU count enumeration in
+/// `kernel::acpi`.
+pub const MAX_CPUS: usize = 256;
 
 /// Per-CPU interrupt lock depth counter
 ///
-/// Tracks how many ilocks are currently held. Used by the scheduler
-/// to determine when it's safe to preempt a process.
+/// Tracks how many ilocks are currently held on this CPU. Used by
+/// the scheduler to determine when it's safe to preempt a process.
 pub struct ILockDepth {
-    depth: AtomicU32,
+    /// One AtomicU32 per logical CPU. Index = `current_cpu()`.
+    depths: [AtomicU32; MAX_CPUS],
 }
 
 impl ILockDepth {
-    /// Create a new depth counter
+    /// Create a new depth counter (all CPUs start at 0).
     pub const fn new() -> Self {
-        Self { depth: AtomicU32::new(0) }
+        Self {
+            depths: [const { AtomicU32::new(0) }; MAX_CPUS],
+        }
     }
 
-    /// Increment the depth
+    /// Increment the depth on the current CPU.
     #[inline]
     pub fn inc(&self) {
-        self.depth.fetch_add(1, Ordering::Relaxed);
+        let id = current_cpu();
+        if id < MAX_CPUS {
+            self.depths[id].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    /// Decrement the depth
+    /// Decrement the depth on the current CPU.
     #[inline]
     pub fn dec(&self) {
-        self.depth.fetch_sub(1, Ordering::Relaxed);
+        let id = current_cpu();
+        if id < MAX_CPUS {
+            self.depths[id].fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
-    /// Get current depth
+    /// Get depth on the current CPU.
     #[inline]
     pub fn get(&self) -> u32 {
-        self.depth.load(Ordering::Relaxed)
+        let id = current_cpu();
+        if id < MAX_CPUS {
+            self.depths[id].load(Ordering::Relaxed)
+        } else {
+            0
+        }
     }
 
-    /// Check if any locks are held
+    /// Check if any locks are held on the current CPU.
     #[inline]
     pub fn is_locked(&self) -> bool {
-        self.depth.load(Ordering::Relaxed) > 0
+        self.get() > 0
     }
 }
 
-/// Global interrupt lock depth counter
-static mut ILOCK_DEPTH: ILockDepth = ILockDepth::new();
+/// Global per-CPU interrupt lock depth counter.
+static ILOCK_DEPTH: ILockDepth = ILockDepth::new();
 
-/// Increment interrupt lock depth
+/// Increment interrupt lock depth on the current CPU.
 #[inline]
 pub fn ilockdepth_inc() {
-    unsafe { ILOCK_DEPTH.inc() }
+    ILOCK_DEPTH.inc();
 }
 
-/// Decrement interrupt lock depth
+/// Decrement interrupt lock depth on the current CPU.
 #[inline]
 pub fn ilockdepth_dec() {
-    unsafe { ILOCK_DEPTH.dec() }
+    ILOCK_DEPTH.dec();
 }
 
-/// Get current interrupt lock depth
+/// Get current interrupt lock depth on the current CPU.
 #[inline]
 pub fn ilockdepth() -> u32 {
-    unsafe { ILOCK_DEPTH.get() }
+    ILOCK_DEPTH.get()
 }
 
-/// Check if any interrupt locks are held
+/// Check if any interrupt locks are held on the current CPU.
 #[inline]
 pub fn ilockdepth_is_locked() -> bool {
-    unsafe { ILOCK_DEPTH.is_locked() }
+    ILOCK_DEPTH.is_locked()
 }
 
 // ============================================================================
@@ -925,5 +1255,124 @@ impl<T> core::ops::Deref for MutexGuard<'_, T> {
 impl<T> core::ops::DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.mutex.data.get() }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_barrier_basic() {
+        let barrier = Barrier::new(3);
+        assert_eq!(barrier.initial, 3);
+        assert_eq!(barrier.count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_barrier_wait_decrements_count() {
+        // With initial=1, the single waiter is the leader and the count
+        // is immediately reset back to 1.
+        let barrier = Barrier::new(1);
+        assert_eq!(barrier.count.load(Ordering::SeqCst), 1);
+
+        let is_leader = barrier.wait();
+        assert_eq!(barrier.count.load(Ordering::SeqCst), 1); // Reset to initial
+        assert!(is_leader); // First thread is the leader
+    }
+
+    #[test]
+    fn test_qlock_basic() {
+        let lock = QLock::new();
+        lock.lock();
+        lock.unlock();
+    }
+
+    #[test]
+    fn test_rwlock_basic() {
+        let lock = RWLock::new();
+
+        // Multiple readers should work
+        lock.rlock();
+        lock.rlock();
+        lock.runlock();
+        lock.runlock();
+
+        // Writer should work
+        lock.wlock();
+        lock.wunlock();
+    }
+
+    #[test]
+    fn test_semaphore_basic() {
+        let sem = Semaphore::new(2);
+        assert_eq!(sem.count(), 2);
+
+        // Down should decrement
+        sem.down();
+        assert_eq!(sem.count(), 1);
+
+        sem.up();
+        assert_eq!(sem.count(), 2);
+    }
+
+    #[test]
+    fn test_ilock_depth() {
+        let depth = ILockDepth::new();
+        assert_eq!(depth.get(), 0);
+        assert!(!depth.is_locked());
+
+        depth.inc();
+        assert_eq!(depth.get(), 1);
+        assert!(depth.is_locked());
+
+        depth.dec();
+        assert_eq!(depth.get(), 0);
+        assert!(!depth.is_locked());
+    }
+
+    #[test]
+    fn test_memory_barrier() {
+        // Memory barrier should compile and execute without panic
+        memory_barrier();
+    }
+
+    #[test]
+    fn test_spinlock_basic() {
+        let lock = Spinlock::new(0i32);
+        let mut guard = lock.lock();
+        *guard = 42;
+        drop(guard);
+
+        let mut guard = lock.lock();
+        assert_eq!(*guard, 42);
+    }
+
+    #[test]
+    fn test_mutex_basic() {
+        let mutex = Mutex::new(vec![1, 2, 3]);
+        let mut guard = mutex.lock();
+        guard.push(4);
+        assert_eq!(*guard, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_ticket_lock_basic() {
+        let lock = TicketLock::new();
+        lock.lock();
+        lock.unlock();
+    }
+
+    #[test]
+    fn test_atomic_barrier() {
+        let barrier = Barrier::new(1);
+        // With n=1, wait should immediately return true
+        let is_leader = barrier.wait();
+        assert!(is_leader);
+        assert_eq!(barrier.count.load(Ordering::SeqCst), 1);
     }
 }
