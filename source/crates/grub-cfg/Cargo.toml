@@ -1,0 +1,10 @@
+[package]
+name = "grub-cfg"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "grub-cfg"
+path = "src/main.rs"
+
+[dependencies]
