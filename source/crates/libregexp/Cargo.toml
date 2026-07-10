@@ -1,0 +1,5 @@
+[package]
+name = "plan9_libregexp"
+version = "0.1.0"
+edition = "2021"
+description = "Plan 9 Regular expression library"
