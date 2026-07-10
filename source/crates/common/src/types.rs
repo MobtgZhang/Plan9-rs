@@ -16,6 +16,7 @@ impl PhysAddr {
     pub const fn is_null(self) -> bool { self.0 == 0 }
     pub const fn page_align(self) -> Self { Self((self.0 + 4095) & !4095) }
     pub const fn align_to(self, align: u64) -> Self { Self((self.0 + align - 1) & !(align - 1)) }
+    pub const fn is_aligned(self) -> bool { self.0 & 0xFFF == 0 }
 }
 
 impl From<u64> for PhysAddr {
