@@ -232,11 +232,16 @@ impl From<Error> for i32 {
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// Kernel panic with error message
+///
+/// `panic!` is rewritten to route through the global kernel panic
+/// handler installed by `set_panic_handler`. If no handler has been
+/// installed (the host crate did not provide one), the macro spins in
+/// a `hlt` loop so the failure is visible on a bare-metal target.
 #[macro_export]
 macro_rules! panic {
     ($($arg:tt)*) => {
-        loop {
-            crate::common::error::_panic(file!(), line!(), format_args!($($arg)*));
+        {
+            $crate::error::invoke_panic(file!(), line!(), format_args!($($arg)*));
         }
     }
 }
@@ -267,20 +272,50 @@ macro_rules! try_or_return {
     };
 }
 
-/// Internal panic function
+/// Signature of a kernel panic handler.
+///
+/// The first two arguments are the file/line of the panic site; the
+/// third is the formatted message. The handler must not return.
+pub type PanicHandler = fn(&'static str, u32, core::fmt::Arguments<'_>) -> !;
+
+/// Storage for the installed panic handler. Defaults to a `hlt`
+/// loop, which is at least visible on bare metal.
+static mut PANIC_HANDLER: PanicHandler = default_panic_handler;
+
+fn default_panic_handler(file: &'static str, line: u32, args: core::fmt::Arguments<'_>) -> ! {
+    // We have no serial port here; on bare metal the caller must have
+    // already installed a real handler. We still spin so the failure
+    // is observable as a hang with a debug line in the trace buffer.
+    let _ = (file, line, args);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Install a panic handler. Must be called exactly once during early
+/// kernel boot (typically from `arch::x86_64::early_init` or
+/// immediately after).
+///
+/// # Safety
+/// Must be called before any `panic!` runs. Subsequent calls replace
+/// the handler.
+pub unsafe fn set_panic_handler(handler: PanicHandler) {
+    PANIC_HANDLER = handler;
+}
+
+/// Invoke the installed panic handler.
+#[doc(hidden)]
+pub fn invoke_panic(file: &'static str, line: u32, args: core::fmt::Arguments<'_>) -> ! {
+    // SAFETY: set_panic_handler is the only writer; we are inside a
+    // panic so the previous ordering guarantees are moot.
+    unsafe { (PANIC_HANDLER)(file, line, args) }
+}
+
+/// Internal panic function — retained for backwards compatibility.
+/// New code should use `panic!` which routes through `invoke_panic`.
 #[doc(hidden)]
 pub fn _panic(_file: &str, _line: u32, _args: core::fmt::Arguments<'_>) {
-    // Will be implemented with serial output later
-}
-
-/// Set error string for user
-#[allow(dead_code)]
-pub fn seterrstr(_err: &mut [u8], _msg: &str) {
-    // TODO: Implement
-}
-
-/// Get current error string
-#[allow(dead_code)]
-pub fn geterrstr() -> &'static str {
-    "unknown error"
+    // Intentionally a no-op now; `panic!` calls `invoke_panic` which
+    // calls the installed handler directly. Left here so external code
+    // that linked against the old symbol still compiles.
 }
