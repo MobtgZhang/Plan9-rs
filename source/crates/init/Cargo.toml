@@ -3,6 +3,9 @@ name = "plan9-init"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
-plan9-kernel = { path = "../kernel" }
-plan9-arch = { path = "../arch" }
+[[bin]]
+name = "plan9_init"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
