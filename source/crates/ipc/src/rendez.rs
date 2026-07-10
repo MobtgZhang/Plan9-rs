@@ -9,8 +9,22 @@
 
 #![allow(dead_code)]
 
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+/// Rendezvous errors
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RendezvousError {
+    /// Interrupted by a note
+    Interrupted,
+    /// Timeout occurred
+    Timeout,
+    /// Invalid argument
+    InvalidArg,
+}
 
 // ============================================================================
 // Constants
@@ -21,6 +35,42 @@ pub const RENDHASH: usize = 13;
 
 /// Interrupted marker
 pub const INTREDD_MARKER: *mut u8 = !0u8 as *mut u8;
+
+/// Simple rendezvous structure for thread sleep/wakeup
+pub struct Rendez {
+    /// Waiting flag
+    waiting: bool,
+    /// Data pointer
+    data: AtomicPtr<u8>,
+}
+
+impl Rendez {
+    /// Create a new rendezvous point
+    pub fn new() -> Self {
+        Self {
+            waiting: false,
+            data: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    /// Sleep until woken (simplified implementation)
+    pub fn sleep(&self, _timeout_ms: u64) -> Result<(), RendezvousError> {
+        // In a real implementation, this would block the thread
+        // For now, return immediately as a stub
+        Ok(())
+    }
+
+    /// Wake up a waiting thread
+    pub fn wake(&self) {
+        // Wake up logic
+    }
+}
+
+impl Default for Rendez {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Thread state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,24 +157,45 @@ impl RThread {
 /// are linked by their tag value.
 /// 
 /// Uses raw pointers for the hash table to avoid Sync issues.
-static mut RENDEZ_TABLE: [AtomicPtr<RThread>; RENDHASH] = [
-    AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()),
-];
+pub struct RendezTable {
+    buckets: [AtomicPtr<RThread>; RENDHASH],
+}
+
+impl RendezTable {
+    pub const fn new() -> Self {
+        Self {
+            buckets: [
+                AtomicPtr::new(core::ptr::null_mut()),
+                AtomicPtr::new(core::ptr::null_mut()),
+                AtomicPtr::new(core::ptr::null_mut()),
+                AtomicPtr::new(core::ptr::null_mut()),
+                AtomicPtr::new(core::ptr::null_mut()),
+                AtomicPtr::new(core::ptr::null_mut()),
+                AtomicPtr::new(core::ptr::null_mut()),
+                AtomicPtr::new(core::ptr::null_mut()),
+                AtomicPtr::new(core::ptr::null_mut()),
+                AtomicPtr::new(core::ptr::null_mut()),
+                AtomicPtr::new(core::ptr::null_mut()),
+                AtomicPtr::new(core::ptr::null_mut()),
+                AtomicPtr::new(core::ptr::null_mut()),
+            ],
+        }
+    }
+    
+    pub fn load(&self, idx: usize) -> *mut RThread {
+        self.buckets[idx].load(Ordering::Acquire)
+    }
+    
+    pub fn store(&self, idx: usize, val: *mut RThread) {
+        self.buckets[idx].store(val, Ordering::Release);
+    }
+}
+
+/// Global rendezvous table
+pub static RENDEZ_TABLE: RendezTable = RendezTable::new();
 
 /// Thread identifier counter
-static mut NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
+static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
 
 // ============================================================================
 // Helper Functions
@@ -150,12 +221,12 @@ fn find_in_chain(head: *mut RThread, tag: *mut u8) -> Option<*mut RThread> {
 
 /// Remove a thread from its hash chain
 fn remove_from_chain(idx: usize, target: *mut RThread) {
-    let head = unsafe { RENDEZ_TABLE[idx].load(Ordering::Acquire) };
+    let head = RENDEZ_TABLE.load(idx);
     
     if head == target {
         // Head of chain
         let next = unsafe { (*target).rendhash };
-        unsafe { RENDEZ_TABLE[idx].store(next, Ordering::Release) };
+        RENDEZ_TABLE.store(idx, next);
         return;
     }
     
@@ -194,7 +265,7 @@ fn remove_from_chain(idx: usize, target: *mut RThread) {
 /// sys/src/libthread/rendez.c:_threadrendezvous
 pub fn _threadrendezvous(tag: *mut u8, val: *mut u8) -> *mut u8 {
     // Get unique thread ID
-    let tid = unsafe { NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed) };
+    let tid = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
     
     // Create thread structure on stack
     let mut thread = RThread::new(tid);
@@ -208,9 +279,9 @@ pub fn _threadrendezvous(tag: *mut u8, val: *mut u8) -> *mut u8 {
     
     // Add to hash chain
     let thread_ptr = &thread as *const RThread as *mut RThread;
-    let old_head = unsafe { RENDEZ_TABLE[idx].load(Ordering::Acquire) };
+    let old_head = RENDEZ_TABLE.load(idx);
     thread.rendhash = old_head;
-    unsafe { RENDEZ_TABLE[idx].store(thread_ptr, Ordering::Release) };
+    RENDEZ_TABLE.store(idx, thread_ptr);
     
     // Look for a matching thread
     if let Some(partner) = find_in_chain(old_head, tag) {
@@ -242,7 +313,7 @@ pub fn _threadrendezvous(tag: *mut u8, val: *mut u8) -> *mut u8 {
         }
         
         // Check for matching thread
-        let head = unsafe { RENDEZ_TABLE[idx].load(Ordering::Acquire) };
+        let head = RENDEZ_TABLE.load(idx);
         if let Some(partner) = find_in_chain(head, tag) {
             let partner_val = unsafe { (*partner).rendval };
             
@@ -276,7 +347,7 @@ pub fn _threadflagrendez(t: *mut RThread) {
 /// Called during process shutdown to wake all threads waiting in rendezvous.
 pub fn _threadbreakrendez() {
     for i in 0..RENDHASH {
-        let head = unsafe { RENDEZ_TABLE[i].load(Ordering::Acquire) };
+        let head = RENDEZ_TABLE.load(i);
         let mut curr = head;
         
         while !curr.is_null() {
@@ -295,7 +366,7 @@ pub fn _threadbreakrendez() {
 
 /// Get next available thread ID
 pub fn _nextthreadid() -> usize {
-    unsafe { NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed) }
+    NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 // ============================================================================
@@ -337,7 +408,7 @@ pub fn threadstatename(state: ThreadState) -> &'static str {
 pub fn _rendezvous_count() -> usize {
     let mut count = 0;
     for i in 0..RENDHASH {
-        let head = unsafe { RENDEZ_TABLE[i].load(Ordering::Acquire) };
+        let head = RENDEZ_TABLE.load(i);
         let mut curr = head;
         while !curr.is_null() {
             count += 1;
