@@ -1,0 +1,13 @@
+[package]
+name = "plan9-rio"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rio"
+path = "src/main.rs"
+
+[dependencies]
+plan9-common = { path = "../common" }
+plan9-servers = { path = "../servers" }
+plan9_libdraw = { path = "../libdraw" }
