@@ -2,11 +2,67 @@
 //!
 //! Implements a complete 9P server that handles all protocol messages.
 
+
+extern crate alloc;
+
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
-use crate::plan9_common::types::Qid;
-use crate::net::protocol::{P9Msg, P9Codec, P9Server, Stat, P9Error};
-use crate::servers::p9session::{P9Session, OpenMode, ProtocolVersion};
+use crate::net::protocol::{P9Msg, P9Codec, P9Error, Qid};
+use crate::p9session::{
+    P9Session,
+    OpenMode,
+    LockEntry,
+};
+
+// ============================================================================
+// Config and Stats
+// ============================================================================
+
+/// 9P server configuration
+#[derive(Debug, Clone)]
+pub struct P9ServerConfig {
+    /// Maximum message size
+    pub max_msize: u32,
+    /// Root path
+    pub root_path: String,
+    /// Default user
+    pub default_user: String,
+    /// Enable dotl extensions
+    pub enable_dotl: bool,
+    /// Enable locking extensions
+    pub enable_locking: bool,
+}
+
+impl Default for P9ServerConfig {
+    fn default() -> Self {
+        Self {
+            max_msize: 65536,
+            root_path: "/".to_string(),
+            default_user: "none".to_string(),
+            enable_dotl: true,
+            enable_locking: true,
+        }
+    }
+}
+
+/// 9P server statistics
+#[derive(Debug, Clone, Default)]
+pub struct P9ServerStats {
+    /// Total requests handled
+    pub total_requests: u64,
+    /// Requests by type
+    pub attach_count: u64,
+    pub walk_count: u64,
+    pub open_count: u64,
+    pub read_count: u64,
+    pub write_count: u64,
+    pub create_count: u64,
+    pub stat_count: u64,
+}
+
+/// P9Server type alias for P9ServerImpl
+pub type P9Server = P9ServerImpl;
 
 // ============================================================================
 // 9P Server Implementation
@@ -29,9 +85,27 @@ pub enum ServerError {
     P9Error(P9Error),
 }
 
+impl From<&str> for ServerError {
+    fn from(s: &str) -> Self {
+        ServerError::P9Error(P9Error::from_errno(s))
+    }
+}
+
+impl From<String> for ServerError {
+    fn from(s: String) -> Self {
+        ServerError::P9Error(P9Error::from_errno(&s))
+    }
+}
+
 impl From<P9Error> for ServerError {
     fn from(e: P9Error) -> Self {
         ServerError::P9Error(e)
+    }
+}
+
+impl From<core::convert::Infallible> for ServerError {
+    fn from(_: core::convert::Infallible) -> Self {
+        ServerError::IoError
     }
 }
 
@@ -76,6 +150,10 @@ impl P9ServerImpl {
                 self.handle_version(tag, msize, &version)
             }
             P9Msg::TAttach { tag, fid, afid: _, uname, aname } => {
+                // Validate the attach aname against the server's root path.
+                if !aname.is_empty() && aname.as_bytes() != self.root_path.as_slice() {
+                    return Err(ServerError::InvalidPath);
+                }
                 self.handle_attach(tag, fid, &uname, &aname)
             }
             P9Msg::TWalk { tag, fid, new_fid, names } => {
@@ -135,8 +213,10 @@ impl P9ServerImpl {
 
     /// Handle Tversion
     fn handle_version(&mut self, tag: u16, msize: u32, version: &str) -> Result<P9Msg, ServerError> {
+        // Cap the requested msize at the server's configured maximum.
+        let requested = msize.min(self.max_msize);
         // Negotiate version
-        let (neg_msize, neg_version) = self.session.negotiate_version(version, msize)
+        let (neg_msize, neg_version) = self.session.negotiate_version(version, requested)
             .map_err(|e| ServerError::from(e))?;
 
         Ok(P9Msg::RVersion {
@@ -162,7 +242,7 @@ impl P9ServerImpl {
             .map_err(|e| ServerError::from(e))?;
 
         // Generate auth QID (simplified - real implementation would involve crypto)
-        let aqid = Qid::new(0, 0, 0x80000000); // Auth QID type
+        let aqid = Qid::new(0, 0, 0x80); // Auth QID type
 
         Ok(P9Msg::RAuth { tag, aqid })
     }
@@ -189,7 +269,7 @@ impl P9ServerImpl {
     /// Handle Topen
     fn handle_open(&mut self, tag: u16, fid: u32, mode: u8) -> Result<P9Msg, ServerError> {
         // Get the FID
-        let entry = self.session.get_fid(fid)
+        let entry = self.session.get_fid(fid as u64)
             .ok_or(ServerError::IoError)?;
 
         // Convert mode to OpenMode
@@ -217,9 +297,9 @@ impl P9ServerImpl {
     }
 
     /// Handle TOpenAt (9P2000.L dotl)
-    fn handle_openat(&mut self, tag: u16, dfid: u32, flags: u32, mode: u8) -> Result<P9Msg, ServerError> {
+    fn handle_openat(&mut self, tag: u16, dfid: u32, flags: u32, _mode: u8) -> Result<P9Msg, ServerError> {
         // Get the directory FID
-        let entry = self.session.get_fid(dfid)
+        let entry = self.session.get_fid(dfid as u64)
             .ok_or(ServerError::IoError)?;
 
         // Get the QID for the file
@@ -246,23 +326,18 @@ impl P9ServerImpl {
     }
 
     /// Handle Tcreate
-    fn handle_create(&mut self, tag: u16, fid: u32, name: &str, mode: u32, perm: u32) -> Result<P9Msg, ServerError> {
+    fn handle_create(&mut self, tag: u16, fid: u32, _name: &str, _mode: u32, _perm: u32) -> Result<P9Msg, ServerError> {
         // Get the parent FID
-        let entry = self.session.get_fid(fid)
+        let entry = self.session.get_fid(fid as u64)
             .ok_or(ServerError::IoError)?;
 
         // Check if it's a directory
-        if entry.qid.qtype == 0x40 { // QTDIR
+        if entry.qid.qtype & 0x80 != 0 { // QTDIR
             // Creating in directory
         }
 
-        // Create new QID for the file
-        static mut NEXT_PATH: u64 = 1;
-        let path = unsafe {
-            let p = NEXT_PATH;
-            NEXT_PATH += 1;
-            p
-        };
+        // Create new QID for the file using the session's allocator.
+        let path = self.session.alloc_qid_path();
         let qid = Qid::new(path, 0, 0);
 
         // Open the file
@@ -280,22 +355,19 @@ impl P9ServerImpl {
     }
 
     /// Handle TCreateAt (9P2000.L dotl)
-    fn handle_createat(&mut self, tag: u16, dfid: u32, name: &str, _flags: u32, mode: u32, perm: u64) -> Result<P9Msg, ServerError> {
+    fn handle_createat(&mut self, tag: u16, dfid: u32, _name: &str, _flags: u32, _mode: u32, perm: u64) -> Result<P9Msg, ServerError> {
         // Get the directory FID
-        let _entry = self.session.get_fid(dfid)
+        let _entry = self.session.get_fid(dfid as u64)
             .ok_or(ServerError::IoError)?;
 
-        // Create new QID for the file (with large file support)
-        static mut NEXT_PATH: u64 = 1;
-        let path = unsafe {
-            let p = NEXT_PATH;
-            NEXT_PATH += 1;
-            p
-        };
+        // Create new QID for the file (with large file support) via the
+        // session allocator. This eliminates the prior `static mut`
+        // pattern that was unsafe under concurrent 9P sessions.
+        let path = self.session.alloc_qid_path();
 
         // Set appropriate QID type based on permissions
         let qtype = if (perm as u32) & 0x80000000 != 0 { 0x40 } else { 0 };
-        let qid = Qid::new(path, 0, qtype);
+        let qid = Qid::new(path, 0, qtype as u8);
 
         // Open the file
         let open_mode = OpenMode::ReadWrite;
@@ -384,28 +456,51 @@ impl P9ServerImpl {
     }
 
     /// Handle TLock (9P2000.e)
-    fn handle_lock(&mut self, tag: u16, fid: u32, lock_type: u8, _flags: u32, start: u64, length: u64, proc_id: &[u8]) -> Result<P9Msg, ServerError> {
-        // Simplified lock implementation
-        // Lock types: 0 = none, 1 = read, 2 = write, 3 = reclaim
+    ///
+    /// Real implementation that consults the per-session lock manager. The
+    /// `lock_type` encodes one of the 9P2000.e lock flavours
+    /// (none / read / write / reclaim) and `flags` carries BLOCK/RECLAIM
+    /// hints. On conflict with an incompatible lock the response carries
+    /// status 1; on success the status is 0 and the lock entry is recorded
+    /// for the FID.
+    fn handle_lock(&mut self, tag: u16, fid: u32, lock_type: u8, flags: u32, start: u64, length: u64, proc_id: &[u8]) -> Result<P9Msg, ServerError> {
+        // Validate lock type up front.
         match lock_type {
-            0 => Ok(P9Msg::RLock { tag, status: 0 }), // Success
-            1 | 2 => Ok(P9Msg::RLock { tag, status: 0 }), // Success for read/write
-            3 => Ok(P9Msg::RLock { tag, status: 0 }), // Reclaim
-            _ => Err(ServerError::LockFailed),
+            0 | 1 | 2 | 3 => {}
+            _ => return Err(ServerError::LockFailed),
         }
+
+        let granted = self.session.lock_fid(fid, lock_type, start, length, proc_id, flags);
+        // Status 0 = success, status 1 = lock held by another proc (no blocking).
+        let status = if granted { 0 } else { 1 };
+        Ok(P9Msg::RLock { tag, status: status as u8 })
     }
 
     /// Handle TGetLock (9P2000.e)
-    fn handle_getlock(&mut self, tag: u16, fid: u32, lock_type: u8, start: u64, length: u64, proc_id: &[u8]) -> Result<P9Msg, ServerError> {
-        // Return that no lock is held (simplified)
-        Ok(P9Msg::RGetLock {
-            tag,
-            status: 0, // No lock held
-            lock_type: 0,
-            start: 0,
-            length: 0,
-            proc_id: Vec::new(),
-        })
+    ///
+    /// Looks up an existing lock for the requested FID/range and returns
+    /// its fields (or zeros when no lock is held).
+    fn handle_getlock(&mut self, tag: u16, fid: u32, lock_type: u8, start: u64, length: u64, _proc_id: &[u8]) -> Result<P9Msg, ServerError> {
+        // 9P2000.e TGetLock returns 0 when no lock is held.
+        let entry: Option<LockEntry> = self.session.get_lock_fid(fid, lock_type, start, length);
+        match entry {
+            Some(lock) => Ok(P9Msg::RGetLock {
+                tag,
+                status: 0,
+                lock_type: lock.lock_type,
+                start: lock.range.start,
+                length: lock.range.length,
+                proc_id: lock.proc_id,
+            }),
+            None => Ok(P9Msg::RGetLock {
+                tag,
+                status: 0,
+                lock_type: 0,
+                start: 0,
+                length: 0,
+                proc_id: Vec::new(),
+            }),
+        }
     }
 
     /// Get the session
@@ -444,15 +539,15 @@ pub fn run_server<T: P9Transport>(transport: &mut T, max_msize: u32) -> Result<(
         }
 
         // Decode message
-        let msg = P9Codec::decode(&buf[..n])
+        let codec = P9Codec::new();
+        let msg = codec.decode(&buf[..n])
             .map_err(|e| ServerError::from(e))?;
 
         // Process message
         let response = server.handle_message(msg)?;
 
         // Encode response
-        let mut response_buf = Vec::new();
-        P9Codec::encode(&response, &mut response_buf)?;
+        let response_buf = codec.encode(&response)?;
 
         // Send response
         transport.write(&response_buf)?;
@@ -485,15 +580,15 @@ impl P9Connection {
     /// Handle incoming data
     pub fn handle_data(&mut self, data: &[u8]) -> Result<Vec<u8>, ServerError> {
         // Decode message
-        let msg = P9Codec::decode(data)
+        let codec = P9Codec::new();
+        let msg = codec.decode(data)
             .map_err(|e| ServerError::from(e))?;
 
         // Process message
         let response = self.server.handle_message(msg)?;
 
         // Encode response
-        let mut response_buf = Vec::new();
-        P9Codec::encode(&response, &mut response_buf)?;
+        let response_buf = codec.encode(&response)?;
 
         Ok(response_buf)
     }

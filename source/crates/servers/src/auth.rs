@@ -2,7 +2,6 @@
 //!
 //! Implements the Plan 9 authentication server (factotum).
 
-#![no_std]
 
 extern crate alloc;
 
@@ -248,11 +247,32 @@ pub mod crypto {
     }
 
     /// Generate random bytes
+    ///
+    /// Uses a small xorshift64* PRNG seeded from the address of a stack
+    /// value. This is suitable for non-cryptographic uses such as nonce
+    /// generation for tests; for genuine cryptographic randomness the
+    /// `security` crate's RNG should be wired in instead.
     pub fn random_bytes(len: usize) -> alloc::vec::Vec<u8> {
-        // Simplified - use proper RNG in production
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static STATE: AtomicU64 = AtomicU64::new(0);
+
+        // Seed once with a non-zero value derived from the function
+        // address so different processes get different sequences.
+        let mut s = STATE.load(Ordering::Relaxed);
+        if s == 0 {
+            let seed = (&STATE as *const _ as u64) | 1;
+            STATE.store(seed, Ordering::Relaxed);
+            s = seed;
+        }
+
         let mut result = alloc::vec::Vec::with_capacity(len);
         for _ in 0..len {
-            result.push(0); // Placeholder
+            // xorshift64* step
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            STATE.store(s.wrapping_mul(0x2545_F491_4F6C_DD1D), Ordering::Relaxed);
+            result.push((s & 0xFF) as u8);
         }
         result
     }

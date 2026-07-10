@@ -1,14 +1,16 @@
 //! File System Server
 //!
-//! Implements the Plan 9 file system server.
+//! Implements the Plan 9 file system server with Tree-based backend.
 
-#![no_std]
 
 extern crate alloc;
 
-use crate::common::error::{Error, Result};
-use crate::common::types::Qid;
-use crate::fs::{RamFileSystem, FatFileSystem, Vfs};
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use alloc::sync::Arc;
+
+use crate::tree::{Qid, qidtype, Tree, File};
 
 // ============================================================================
 // 9P Server
@@ -16,13 +18,11 @@ use crate::fs::{RamFileSystem, FatFileSystem, Vfs};
 
 /// File server state
 pub struct FileServer {
-    /// Root file system
-    pub root: RamFileSystem,
-    /// VFS instance
-    pub vfs: Vfs,
-    /// Current user
+    /// Root file system tree
+    pub root: Arc<Tree>,
+    /// Current user ID
     pub uid: u32,
-    /// Current group
+    /// Current group ID
     pub gid: u32,
     /// User name
     pub uname: String,
@@ -34,8 +34,7 @@ impl FileServer {
     /// Create new file server
     pub fn new() -> Self {
         Self {
-            root: RamFileSystem::new(),
-            vfs: Vfs::new(),
+            root: Tree::new("none", "none", 0o755, None),
             uid: 0,
             gid: 0,
             uname: "glenda".to_string(),
@@ -44,54 +43,79 @@ impl FileServer {
     }
 
     /// Handle attach
-    pub fn attach(&mut self, fid: u32, _afid: u32, uname: &str, _aname: &str) -> Result<Qid> {
+    pub fn attach(&mut self, _fid: u32, _afid: u32, uname: &str, _aname: &str) -> Qid {
         self.uname = uname.to_string();
         self.uid = 0; // Would look up UID
         self.gid = 0;
 
         // Return root QID
-        Ok(Qid::new(1, 0, 1)) // path=1, vers=0, type=directory
+        Qid::new(1, 0, qidtype::DIR) // path=1, vers=0, type=directory
     }
 
     /// Handle walk
-    pub fn walk(&mut self, _fid: u32, new_fid: u32, names: &[&str]) -> Result<Vec<Qid>> {
-        let mut qids = Vec::new();
-
-        // Walk the path
-        // In a real implementation, would create new fid and walk
-
-        Ok(qids)
+    pub fn walk(&self, _fid: u32, _new_fid: u32, names: &[&str]) -> Option<Arc<File>> {
+        // Walk the path from root
+        let path = format!("/{}", names.join("/"));
+        self.root.walk(&path)
     }
 
     /// Handle open
-    pub fn open(&mut self, fid: u32, mode: u8) -> Result<(Qid, u32)> {
-        // Open the file
-        Ok((Qid::nil(), 8192)) // Return QID and IO unit
+    pub fn open(&self, fid: u32, mode: u8) -> Option<(Qid, u32)> {
+        // Open the file and return QID and IO unit
+        // For now, return a placeholder
+        let _ = fid;
+        let _ = mode;
+        Some((Qid::new(0, 0, 0), 8192))
     }
 
     /// Handle read
-    pub fn read(&mut self, fid: u32, offset: u64, count: u32) -> Result<Vec<u8>> {
+    pub fn read(&self, fid: u32, offset: u64, count: u32) -> Vec<u8> {
         // Read from the file
-        Ok(Vec::new())
+        // For now, return empty
+        let _ = fid;
+        let _ = offset;
+        let _ = count;
+        Vec::new()
     }
 
     /// Handle write
-    pub fn write(&mut self, fid: u32, offset: u64, data: &[u8]) -> Result<u32> {
+    pub fn write(&self, fid: u32, offset: u64, data: &[u8]) -> u32 {
         // Write to the file
-        Ok(data.len() as u32)
+        let _ = fid;
+        let _ = offset;
+        data.len() as u32
     }
 
     /// Handle clunk
-    pub fn clunk(&mut self, fid: u32) -> Result<()> {
+    pub fn clunk(&self, fid: u32) {
         // Close the file descriptor
-        Ok(())
+        let _ = fid;
     }
 
     /// Handle stat
-    pub fn stat(&mut self, fid: u32) -> Result<Vec<u8>> {
+    pub fn stat(&self, fid: u32) -> Option<StatData> {
         // Return stat data
-        Ok(Vec::new())
+        let _ = fid;
+        Some(StatData::default())
     }
+}
+
+impl Default for FileServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stat data for file
+#[derive(Debug, Clone, Default)]
+pub struct StatData {
+    pub name: String,
+    pub uid: String,
+    pub gid: String,
+    pub mode: u32,
+    pub length: u64,
+    pub atime: u32,
+    pub mtime: u32,
 }
 
 // ============================================================================

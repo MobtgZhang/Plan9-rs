@@ -2,12 +2,40 @@
 //!
 //! Implements the Plan 9 process management server.
 
-#![no_std]
 
 extern crate alloc;
 
-use crate::common::error::{Error, Result};
-use crate::common::types::Pid;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Process ID type
+pub type Pid = u32;
+
+/// Error type for proc server operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcError {
+    Esrch,      // No such process
+    Eintr,      // Interrupted system call
+    Eproclim,   // Too many processes
+    Ebadf,      // Bad file descriptor
+}
+
+impl ProcError {
+    pub fn errno(&self) -> u32 {
+        match self {
+            ProcError::Esrch => 3,
+            ProcError::Eintr => 4,
+            ProcError::Eproclim => 11,
+            ProcError::Ebadf => 9,
+        }
+    }
+}
+
+pub type Result<T> = core::result::Result<T, ProcError>;
 
 // ============================================================================
 // Process State
@@ -72,20 +100,17 @@ impl ProcInfo {
 /// Process table
 pub struct ProcTable {
     /// Process entries
-    processes: alloc::vec::Vec<ProcInfo>,
+    processes: Vec<ProcInfo>,
     /// Next PID
-    next_pid: Pid,
-    /// Lock
-    lock: crate::common::sync::Spinlock,
+    next_pid: u32,
 }
 
 impl ProcTable {
     /// Create new process table
     pub fn new() -> Self {
         Self {
-            processes: alloc::vec::Vec::new(),
+            processes: Vec::new(),
             next_pid: 1,
-            lock: crate::common::sync::Spinlock::new(),
         }
     }
 
@@ -123,12 +148,12 @@ impl ProcTable {
     }
 
     /// List all processes
-    pub fn list(&self) -> alloc::vec::Vec<&ProcInfo> {
+    pub fn list(&self) -> Vec<&ProcInfo> {
         self.processes.iter().collect()
     }
 
     /// Find processes by name
-    pub fn find_by_name(&self, name: &str) -> alloc::vec::Vec<&ProcInfo> {
+    pub fn find_by_name(&self, name: &str) -> Vec<&ProcInfo> {
         self.processes.iter().filter(|p| p.name == name).collect()
     }
 
@@ -168,7 +193,7 @@ impl ProcServer {
     /// Spawn a new process
     pub fn spawn(&mut self, name: &str) -> Result<Pid> {
         if self.table.count() >= self.max_procs {
-            return Err(Error::Eproclim);
+            return Err(ProcError::Eproclim);
         }
 
         let pid = self.table.alloc_pid();
@@ -184,7 +209,7 @@ impl ProcServer {
             proc.state = ProcState::Dead;
             Ok(())
         } else {
-            Err(Error::Esrch)
+            Err(ProcError::Esrch)
         }
     }
 
@@ -192,27 +217,27 @@ impl ProcServer {
     pub fn wait(&mut self, pid: Pid) -> Result<ProcInfo> {
         if pid == 0 {
             // Wait for any child
-            if let Some(pos) = self.processes.iter().position(|p| p.state == ProcState::Dead) {
-                return Ok(self.processes.remove(pos));
+            if let Some(pos) = self.table.processes.iter().position(|p| p.state == ProcState::Dead) {
+                return Ok(self.table.processes.remove(pos));
             }
-            Err(Error::Eintr)
+            Err(ProcError::Eintr)
         } else {
             // Wait for specific child
-            if let Some(pos) = self.processes.iter().position(|p| p.pid == pid && p.state == ProcState::Dead) {
-                Ok(self.processes.remove(pos))
+            if let Some(pos) = self.table.processes.iter().position(|p| p.pid == pid && p.state == ProcState::Dead) {
+                Ok(self.table.processes.remove(pos))
             } else {
-                Err(Error::Esrch)
+                Err(ProcError::Esrch)
             }
         }
     }
 
     /// Get process info
     pub fn info(&self, pid: Pid) -> Result<ProcInfo> {
-        self.table.get(pid).cloned().ok_or(Error::Esrch)
+        self.table.get(pid).cloned().ok_or(ProcError::Esrch)
     }
 
     /// List all processes
-    pub fn ps(&self) -> alloc::vec::Vec<ProcInfo> {
+    pub fn ps(&self) -> Vec<ProcInfo> {
         self.table.list().into_iter().cloned().collect()
     }
 
@@ -222,7 +247,7 @@ impl ProcServer {
             proc.state = state;
             Ok(())
         } else {
-            Err(Error::Esrch)
+            Err(ProcError::Esrch)
         }
     }
 }
@@ -239,28 +264,30 @@ impl Default for ProcServer {
 
 /// /proc file system entries
 pub mod procfs {
+    use super::*;
+
     /// Read process status
-    pub fn read_status(_pid: Pid) -> alloc::vec::Vec<u8> {
-        alloc::vec::Vec::new()
+    pub fn read_status(_pid: Pid) -> Vec<u8> {
+        Vec::new()
     }
 
     /// Read process memory maps
-    pub fn read_maps(_pid: Pid) -> alloc::vec::Vec<u8> {
-        alloc::vec::Vec::new()
+    pub fn read_maps(_pid: Pid) -> Vec<u8> {
+        Vec::new()
     }
 
     /// Read process command line
-    pub fn read_cmdline(_pid: Pid) -> alloc::vec::Vec<u8> {
-        alloc::vec::Vec::new()
+    pub fn read_cmdline(_pid: Pid) -> Vec<u8> {
+        Vec::new()
     }
 
     /// Read process environ
-    pub fn read_environ(_pid: Pid) -> alloc::vec::Vec<u8> {
-        alloc::vec::Vec::new()
+    pub fn read_environ(_pid: Pid) -> Vec<u8> {
+        Vec::new()
     }
 
     /// Read process fd directory
-    pub fn read_fd(_pid: Pid) -> alloc::vec::Vec<u8> {
-        alloc::vec::Vec::new()
+    pub fn read_fd(_pid: Pid) -> Vec<u8> {
+        Vec::new()
     }
 }
