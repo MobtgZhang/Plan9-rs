@@ -7,5 +7,17 @@ edition = "2021"
 name = "plan9_init"
 path = "src/main.rs"
 
+[[bin]]
+name = "bash"
+path = "src/bash.rs"
+
+[[bin]]
+name = "ssh"
+path = "src/ssh.rs"
+
+[dependencies]
+plan9-net = { path = "../net" }
+plan9-common = { path = "../common", features = ["alloc"] }
+
 [profile.dev]
 panic = "abort"

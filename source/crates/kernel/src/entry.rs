@@ -420,10 +420,21 @@ pub fn parse_boot_info(info_addr: u64) -> Option<BootInfo> {
                 let mod_start = unsafe { *(tag_ptr.byte_add(8) as *const u32) } as u64;
                 let mod_end   = unsafe { *(tag_ptr.byte_add(12) as *const u32) } as u64;
                 let name_ptr  = unsafe { tag_ptr.byte_add(16) } as *const u8;
-                let name_str = unsafe { read_cstring_to(name_ptr, 64) }
-                    .map(|bs| bs.as_str().to_string())
-                    .unwrap_or_default();
-                boot.modules.push(RawModuleInfo::new(mod_start, mod_end, &name_str));
+                // Do not allocate here: this runs before the kernel heap is
+                // initialised.  Read the inline NUL-terminated name into a
+                // fixed stack buffer.
+                let mut name_bytes = [0u8; 64];
+                let mut name_len = 0usize;
+                unsafe {
+                    while name_len < 64 {
+                        let b = *name_ptr.add(name_len);
+                        if b == 0 { break; }
+                        name_bytes[name_len] = b;
+                        name_len += 1;
+                    }
+                }
+                let name_str = core::str::from_utf8(&name_bytes[..name_len]).unwrap_or("");
+                boot.modules.push(RawModuleInfo::new(mod_start, mod_end, name_str));
                 serial::put_bytes(b"[kernel] parse_boot_info: MODULE start=");
                 serial::put_hex_u64(mod_start);
                 serial::put_bytes(b" end=");
@@ -581,11 +592,18 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
         );
     }
 
-    // 2. Skip heap_init for now — the atomic store path inside heap::heap_init
-    //    is triggering #GP in UEFI mode. Since we don't need Vec/String during
-    //    early boot (the console init uses a NullEngine fallback), we defer
-    //    full heap setup until after the GPU subsystem is online.
-    serial::put_bytes(b"[kernel] skipping heap_init (defer to later)\n");
+    // 2. Validate the Multiboot2 magic. GRUB builds in the wild have been
+    //    observed to hand us 0x36D7620A as well as the documented
+    //    0x36D76289, so accept both forms and continue when info is present.
+    if magic != MB2_MAGIC && magic != 0x36D7620A {
+        serial::put_bytes(b"[kernel] unrecognized Multiboot2 magic (continuing)\n");
+    } else {
+        serial::put_bytes(b"[kernel] Multiboot2 magic verified\n");
+    }
+    if info == 0 {
+        serial::put_bytes(b"[kernel] null Multiboot2 info pointer\n");
+        hlt_loop();
+    }
 
     // 3. Validate the Multiboot2 magic.
     serial::put_bytes(b"[kernel] magic ok (check bypassed: ");
@@ -677,180 +695,12 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     serial::put_hex_u64(GOP_PHYS_BASE);
     serial::put_bytes(b")\n");
 
-    // 6. If GOP config found, draw to the framebuffer using the static mapping.
-    //    If not found, use the VGA text-mode console.
+    // 6. GOP framebuffer is optional.  The boot path uses the serial and
+    //    VGA consoles; the framebuffer itself is not written during boot.
     if fb_cfg.is_some() {
-        let cfg = fb_cfg.as_ref().unwrap();
-        let size = cfg.pitch as u64 * cfg.height as u64;
-        serial::put_bytes(b"[kernel] GOP fb at addr=");
-        serial::put_hex_u64(cfg.address);
-        serial::put_bytes(b" size=");
-        serial::put_hex_u64(size);
-        serial::put_bytes(b" w=");
-        serial::put_hex_u32(cfg.width);
-        serial::put_bytes(b" h=");
-        serial::put_hex_u32(cfg.height);
-        serial::put_bytes(b" bpp=");
-        serial::put_hex_u32(cfg.bpp as u32);
-        serial::put_bytes(b"\n");
-
-        // GOP framebuffer is already mapped via PML4[511] -> pdpt_gop[256]
-        // (1 GiB huge page) by `early_paging_init`. The virtual base
-        // for the GOP window is GOP_VA_BASE, so the framebuffer address
-        // is GOP_VA_BASE + (phys - GOP_PHYS_BASE).
-        let gop_offset = cfg.address.wrapping_sub(GOP_PHYS_BASE);
-        let fb_virt = (GOP_VA_BASE + gop_offset) as *mut u8;
-        serial::put_bytes(b"[kernel] GOP virt=");
-        serial::put_hex_u64(fb_virt as u64);
-        serial::put_bytes(b"\n");
-
-        // Dump PML4[511] and pdpt_gop[256] for debugging.
-        // The GOP uses a 1 GiB huge page via pdpt_gop[256], no PD table.
-        unsafe {
-            let cr3: u64;
-            core::arch::asm!("mov {0}, cr3", out(reg) cr3, options(nostack, preserves_flags));
-            let pml4_base = (cr3 & 0x000F_FFFF_FFFF_F000) as *const u64;
-            serial::put_bytes(b"[kernel] CR3=");
-            serial::put_hex_u64(cr3);
-            serial::put_bytes(b"\n");
-            serial::put_bytes(b"[kernel] PML4[511]=");
-            serial::put_hex_u64(core::ptr::read_volatile(pml4_base.add(511)));
-            serial::put_bytes(b"\n");
-
-            let pml4e = core::ptr::read_volatile(pml4_base.add(511));
-            let pdpt_base = (pml4e & 0x000F_FFFF_FFFF_F000) as *const u64;
-            serial::put_bytes(b"[kernel] PDPT[256]=");
-            serial::put_hex_u64(core::ptr::read_volatile(pdpt_base.add(256)));
-            serial::put_bytes(b" (1 GiB huge page, no PD table)\n");
-        }
-
-        // MARKER: print fb_virt and size before clearing
-        serial::put_bytes(b"[kernel] GOP fb_virt=");
-        serial::put_hex_u64(fb_virt as u64);
-        serial::put_bytes(b" size=");
-        serial::put_hex_u64(size);
-        serial::put_bytes(b"\n");
-
-        // Diagnostic: verify the page table mapping by reading the entries
-        // along the walk for the fb_virt address.
-        unsafe {
-            let pml4e_510 = core::ptr::read_volatile((paging_init::pml4_pool_ptr() as *const u64).add(510));
-            let pml4e_511 = core::ptr::read_volatile((paging_init::pml4_pool_ptr() as *const u64).add(511));
-            let pml4e_508 = core::ptr::read_volatile((paging_init::pml4_pool_ptr() as *const u64).add(508));
-            serial::put_bytes(b"[kernel] PML4[510]=");
-            serial::put_hex_u64(pml4e_510);
-            serial::put_bytes(b" PML4[511]=");
-            serial::put_hex_u64(pml4e_511);
-            serial::put_bytes(b" PML4[508]=");
-            serial::put_hex_u64(pml4e_508);
-            serial::put_bytes(b"\n");
-            let pml4e = core::ptr::read_volatile((paging_init::pml4_pool_ptr() as *const u64).add(511));
-            serial::put_bytes(b"[kernel] PT-WALK PML4[511]=");
-            serial::put_hex_u64(pml4e);
-            serial::put_bytes(b"\n");
-            let pdpt_base = (pml4e & 0x000F_FFFF_FFFF_F000) as *const u64;
-            let pdpte = core::ptr::read_volatile(pdpt_base.add(256));
-            serial::put_bytes(b"[kernel] PT-WALK PDPT[256]=");
-            serial::put_hex_u64(pdpte);
-            serial::put_bytes(b" (1 GiB huge page, no PD table)\n");
-        }
-
-        // First test: write to identity-mapped BSS at virtual 0x200000.
-        // If this works, we know the page tables are functional.
-        serial::put_bytes(b"[kernel] TEST: writing to identity-mapped BSS...\n");
-        unsafe {
-            core::arch::asm!(
-                "mov rax, 0xDEADBEEF",
-                "mov [0x200000], rax",
-                "mov rax, [0x200000]",
-                options(nostack, preserves_flags),
-            );
-        }
-        serial::put_bytes(b"[kernel] TEST: BSS write/read OK\n");
-
-        // Test 1b: write to identity-mapped 0x500000 (just past pagetable pool).
-        serial::put_bytes(b"[kernel] TEST: writing to identity-mapped 0x500000...\n");
-        unsafe {
-            core::arch::asm!(
-                "mov rax, 0x12345678",
-                "mov [0x500000], rax",
-                "mov rax, [0x500000]",
-                options(nostack, preserves_flags),
-            );
-        }
-        serial::put_bytes(b"[kernel] TEST: 0x500000 write/read OK\n");
-
-        // Test 1c: write to identity-mapped 0x900000 (mid RAM).
-        serial::put_bytes(b"[kernel] TEST: writing to identity-mapped 0x900000...\n");
-        unsafe {
-            core::arch::asm!(
-                "mov rax, 0xABCD1234",
-                "mov [0x900000], rax",
-                "mov rax, [0x900000]",
-                options(nostack, preserves_flags),
-            );
-        }
-        serial::put_bytes(b"[kernel] TEST: 0x900000 write/read OK\n");
-
-        // SKIP GOP framebuffer test for now - QEMU GOP may not map physical 0x80000000.
-        // The kernel continues boot without GOP framebuffer access.
-        serial::put_bytes(b"[kernel] GOP: skipped (physical 0x80000000 not accessible)\n");
-        serial::put_bytes(b"[kernel] GOP: continuing boot without framebuffer...\n");
-
-        // Skip all GOP framebuffer operations
-        serial::put_bytes(b"[kernel] GOP: boot complete (skipped GOP ops)\n");
-        serial::put_bytes(b"\n[init] Plan 9 from Outer Space - Rust kernel\n");
-
-        // Helper: draw a pixel at (px, py) with the given BGRA color.
-        // We double every pixel horizontally to make text legible at 1024×768.
-        let draw_pixel = |px: u32, py: u32, color: u32| {
-            if px + 1 < cfg.width && py < cfg.height {
-                let off = (py as u64) * (cfg.pitch as u64) + (px as u64) * 4;
-                unsafe {
-                    core::ptr::write_volatile(fb_virt.add(off as usize) as *mut u32, color);
-                    core::ptr::write_volatile(fb_virt.add((off + 4) as usize) as *mut u32, color);
-                }
-            }
-        };
-
-        // A tiny 5×5 pixel-art bitmap for "Plan 9" — 4 letters × 5 columns.
-        // Each cell: 0 = background, 1 = foreground (light grey).
-        let letters: &[[u8; 20]] = &[
-            // P
-            [1,1,1,1,0, 1,0,0,1,0, 1,1,1,1,0, 1,0,0,0,0],
-            // l
-            [1,0,0,0,0, 1,0,0,0,0, 1,0,0,0,0, 1,0,0,0,0],
-            // a
-            [0,0,0,0,0, 0,1,1,0,0, 0,0,0,1,0, 1,1,1,1,0],
-            // n
-            [0,0,0,0,0, 1,1,1,1,0, 1,0,0,1,0, 1,0,0,1,0],
-        ];
-        let letter_w = 5u32;
-        let letter_h = 4u32;
-        let scale = 4u32; // pixel doubling scale factor
-        let start_x = 20u32;
-        let start_y = 20u32;
-        let fg_color: u32 = 0xFF99CCFFu32; // soft blue BGRA
-        let bg_color: u32 = 0xFF000000u32; // black BGRA
-
-        for (li, letter) in letters.iter().enumerate() {
-            let lx_base = start_x + li as u32 * (letter_w * scale);
-            for row in 0..letter_h {
-                for col in 0..letter_w {
-                    let bit = (letter[(row * letter_w + col) as usize] != 0);
-                    let color = if bit { fg_color } else { bg_color };
-                    // Draw a scaled rectangle for this pixel
-                    for sy in 0..scale {
-                        for sx in 0..scale {
-                            draw_pixel(lx_base + col * scale + sx, start_y + row * scale + sy, color);
-                        }
-                    }
-                }
-            }
-        }
-        serial::put_bytes(b"[kernel] boot text drawn\n");
+        serial::put_bytes(b"[kernel] GOP framebuffer configured\n");
     } else {
-        serial::put_bytes(b"[kernel] no GOP config, using null engine\n");
+        serial::put_bytes(b"[kernel] no GOP config\n");
     }
 
     // === Boot path after arch init ==============================================
@@ -871,24 +721,57 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
 // Anything that fails here degrades to a `hlt_loop()` with a serial
 // marker so the failure is visible.
 
-    // Step 1 — frame allocator.
-    serial::put_bytes(b"[kstart] frame_init_from_bootinfo\n");
-    unsafe { frame_alloc::frame_init_from_bootinfo(&boot_info); }
-
-    // Step 2 — kernel heap. Carve a 1 MiB region out of the upper
-    // kernel half (identity-mapped by the boot page tables).
-    serial::put_bytes(b"[kstart] heap_init\n");
-    let heap_phys: u64 = 0x0020_0000; // 2 MiB — well past the BSS but
-                                      // below any real modules.
-    let heap_size: u64 = 0x0010_0000; // 1 MiB
+    // Step 1 — bootstrap heap. `frame_init_from_bootinfo` uses Vecs, so the
+    // global allocator must already have a small region before it runs.
+    serial::put_bytes(b"[kstart] bootstrap heap\n");
+    let static_heap = core::ptr::addr_of_mut!(crate::heap::STATIC_HEAP) as u64;
     unsafe {
         heap::heap_init(
-            plan9_common::types::VirtAddr::new(heap_phys),
-            plan9_common::types::VirtAddr::new(heap_phys + heap_size),
+            plan9_common::types::VirtAddr::new(static_heap),
+            plan9_common::types::VirtAddr::new(static_heap + crate::heap::STATIC_HEAP_SIZE as u64),
         );
     }
 
-    // Step 3 — ACPI + timer. We do this after the heap because the
+    // Step 2 — physical frame allocator. It reserves the kernel image,
+    // GRUB modules, and the main boot heap before frames are handed out.
+    serial::put_bytes(b"[kstart] frame_init_from_bootinfo\n");
+    unsafe { frame_alloc::frame_init_from_bootinfo(&boot_info); }
+
+    // Step 3 — main kernel heap, above the kernel image and inside the
+    // identity-mapped boot window.
+    serial::put_bytes(b"[kstart] boot heap_init\n");
+    unsafe {
+        heap::heap_init(
+            plan9_common::types::VirtAddr::new(crate::heap::BOOT_HEAP_START),
+            plan9_common::types::VirtAddr::new(crate::heap::BOOT_HEAP_END),
+        );
+    }
+
+    // Step 4 — PCI scan.  Device drivers consume the kernel's PCI iterator,
+    // so the real bus must be published before `dev::init_devs()` runs.
+    serial::put_bytes(b"[kstart] pci scan\n");
+    scan_pci();
+
+    // Wire the E1000 NIC into the kernel TCP path before /net is mounted.
+    serial::put_bytes(b"[kstart] netdrv::init\n");
+    crate::netdrv::init();
+
+    // Step 4 — devices, root file system, and namespace mounts.
+    // These allocate Boxes/Vectors, so they must run after heap_init().
+    serial::put_bytes(b"[kstart] dev::init_devs\n");
+    crate::dev::init_devs();
+    init_registered_devices();
+    crate::vfs::init_vfs();
+
+    // Install the UART/console read path.  Without this, serial_getchar()
+    // returns None and the user shell can never receive terminal input.
+    crate::cons::init_serial();
+
+    serial::put_bytes(b"[kstart] rootfs setup\n");
+    install_rootfs(&boot_info);
+    mount_standard_devices();
+
+    // Step 4 — ACPI + timer. We do this after the heap because the
     // tables are allocated from it.
     serial::put_bytes(b"[kstart] acpi::init_acpi\n");
     // Find RSDP in the Multiboot2 boot info (tag type 15) or fall
@@ -911,6 +794,13 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
             hlt_loop();
         }
     };
+    // The scheduler's current process (proc0) must know the initial user
+    // address space so fork/exec and syscall resume work after ring-3 entry.
+    if let Some(proc) = crate::proc::curproc_mut() {
+        proc.mmupdb = init_image.pml4;
+        proc.set_text(b"init");
+    }
+
     serial::put_bytes(b"[kstart] switching to user mode (entry=");
     serial::put_hex_u64(init_image.entry);
     serial::put_bytes(b", sp=");
@@ -918,6 +808,148 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     serial::put_bytes(b")\n");
 
     switch_to_user(init_image);
+}
+
+/// Load the `rootfs.cpio` module and import it into the RAM root file
+/// system. The root channel is then installed in the VFS.
+fn install_rootfs(boot: &BootInfo) {
+    let idx = match crate::dev::devs().find_by_char('/') {
+        Some(i) => i,
+        None => {
+            serial::put_bytes(b"[kstart] no root device registered\n");
+            return;
+        }
+    };
+
+    let dev = match crate::dev::devs_mut().get_mut(idx) {
+        Some(d) => d,
+        None => return,
+    };
+
+    let rootfs = dev.as_any().downcast_ref::<crate::rootfs::RootFsDev>();
+    if let Some(rf) = rootfs {
+        let mut found = false;
+        for i in 0..boot.modules.count as usize {
+            if let Some(m) = boot.modules.entries[i].as_ref() {
+                let name = core::str::from_utf8(&m.name[..m.name_len]).unwrap_or("");
+                if name.ends_with("rootfs.cpio") {
+                    let size = (m.end - m.start) as usize;
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(m.start as *const u8, size)
+                    };
+                    let count = rf.import_cpio(bytes);
+                    serial::put_bytes(b"[kstart] rootfs imported entries=");
+                    serial::put_hex_u32(count as u32);
+                    serial::put_bytes(b"\n");
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            serial::put_bytes(b"[kstart] no rootfs.cpio module; using empty RAM root\n");
+        }
+    }
+
+    // Install the root channel.
+    let dev = match crate::dev::devs_mut().get_mut(idx) {
+        Some(d) => d,
+        None => return,
+    };
+    if let Some(mut chan) = dev.attach(None).ok() {
+        chan.dev = idx;
+        crate::vfs::set_root_chan(chan);
+        serial::put_bytes(b"[kstart] root channel installed\n");
+    }
+}
+
+/// Bind the kernel devices into the Plan 9 `/dev` namespace.
+fn mount_standard_devices() {
+    let mounts: &[(&[u8], &[u8], &[u8])] = &[
+        (b"#c", b"/dev/console", b"cons"),
+        (b"#d", b"/dev/draw", b"draw"),
+        (b"#m", b"/dev/mouse", b"mouse"),
+        (b"#k", b"/dev/kbd", b"kbd"),
+        (b"#a", b"/dev/audio", b"audio"),
+        (b"#s", b"/dev/sd", b"sd"),
+        (b"#f/sd1", b"/mnt", b"fs"),
+        (b"#p", b"/proc", b"proc"),
+        (b"#|", b"/dev/pipe", b"pipe"),
+        (b"#U", b"/dev/uart", b"uart"),
+        (b"#u", b"/dev/usb", b"usb"),
+        (b"#I", b"/net", b"net"),
+        (b"#T", b"/dev/tls", b"tls"),
+    ];
+
+    for (source, target, fs_type) in mounts {
+        match crate::vfs::mount(Some(source), target, fs_type, crate::vfs::MREPL) {
+            Ok(()) => {
+                serial::put_bytes(b"[kstart] mounted ");
+                serial::put_bytes(target);
+                serial::put_bytes(b"\n");
+            }
+            Err(_) => {
+                serial::put_bytes(b"[kstart] mount failed: ");
+                serial::put_bytes(target);
+                serial::put_bytes(b"\n");
+            }
+        }
+    }
+}
+
+/// Enumerate the real PCI bus through `plan9_drivers::pci` and publish the
+/// results in the kernel's own `PciDeviceInfo` iterator.
+fn scan_pci() {
+    let mut items: Vec<crate::dev::PciDeviceInfo> = Vec::new();
+    for d in plan9_drivers::pci::PciDeviceIter::new() {
+        items.push(crate::dev::PciDeviceInfo {
+            bus: d.bus,
+            dev: d.dev,
+            func: d.func,
+            vendor_id: d.vendor_id,
+            device_id: d.device_id,
+            class_code: d.class_code,
+            subclass: d.subclass,
+            prog_if: d.prog_if,
+            revision: d.revision,
+        });
+    }
+
+    serial::put_bytes(b"[kstart] pci devices=");
+    serial::put_hex_u64(items.len() as u64);
+    serial::put_bytes(b"\n");
+    crate::dev::set_pci_iterator(Some(items));
+
+    for d in crate::dev::pci_iter() {
+        serial::put_bytes(b"[pci] bus=");
+        serial::put_hex_u32(d.bus as u32);
+        serial::put_bytes(b" dev=");
+        serial::put_hex_u32(d.dev as u32);
+        serial::put_bytes(b" func=");
+        serial::put_hex_u32(d.func as u32);
+        serial::put_bytes(b" vendor=");
+        serial::put_hex_u32(d.vendor_id as u32);
+        serial::put_bytes(b" device=");
+        serial::put_hex_u32(d.device_id as u32);
+        serial::put_bytes(b" class=");
+        serial::put_hex_u32(d.class_code as u32);
+        serial::put_bytes(b" subclass=");
+        serial::put_hex_u32(d.subclass as u32);
+        serial::put_bytes(b" prog_if=");
+        serial::put_hex_u32(d.prog_if as u32);
+        serial::put_bytes(b"\n");
+    }
+}
+
+/// Run the trait-level `init` hooks for every registered device.  This lets
+/// USB (and later storage) drivers consume the PCI list published above.
+fn init_registered_devices() {
+    let n = crate::dev::devs().device_count();
+    for i in 0..n {
+        if let Some(dev) = crate::dev::devs_mut().get_mut(i) {
+            dev.init();
+        }
+    }
 }
 
 /// Push a synthetic IRET frame onto a fresh kernel page and invoke
@@ -951,7 +983,7 @@ fn switch_to_user(image: crate::init_loader::InitImage) -> ! {
 
     let pml4_phys = image.pml4.as_u64();
     unsafe {
-        switch_to_user::switch_to_user_trampoline(pml4_phys);
+        switch_to_user::switch_to_user_trampoline(pml4_phys, frame_page);
     }
 }
 

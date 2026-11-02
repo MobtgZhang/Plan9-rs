@@ -73,6 +73,53 @@ pub struct FatBootSector {
 }
 
 impl FatBootSector {
+    /// Parse a FAT boot sector from its first 512 bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 512 {
+            return Err(Error::Eio);
+        }
+        if bytes[510] != 0x55 || bytes[511] != 0xAA {
+            return Err(Error::Einval);
+        }
+        let mut oem_name = [0u8; 8];
+        oem_name.copy_from_slice(&bytes[3..11]);
+        let mut reserved = [0u8; 12];
+        reserved.copy_from_slice(&bytes[52..64]);
+        let mut volume_label = [0u8; 11];
+        volume_label.copy_from_slice(&bytes[71..82]);
+        let mut fs_type = [0u8; 8];
+        fs_type.copy_from_slice(&bytes[82..90]);
+        Ok(Self {
+            jmp_boot: [bytes[0], bytes[1], bytes[2]],
+            oem_name,
+            bytes_per_sector: u16::from_le_bytes([bytes[11], bytes[12]]),
+            sectors_per_cluster: bytes[13],
+            reserved_sectors: u16::from_le_bytes([bytes[14], bytes[15]]),
+            num_fats: bytes[16],
+            root_entries: u16::from_le_bytes([bytes[17], bytes[18]]),
+            total_sectors_16: u16::from_le_bytes([bytes[19], bytes[20]]),
+            media: bytes[21],
+            fat_size_16: u16::from_le_bytes([bytes[22], bytes[23]]),
+            sectors_per_track: u16::from_le_bytes([bytes[24], bytes[25]]),
+            num_heads: u16::from_le_bytes([bytes[26], bytes[27]]),
+            hidden_sectors: u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
+            total_sectors_32: u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]),
+            fat_size_32: u32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]),
+            ext_flags: u16::from_le_bytes([bytes[40], bytes[41]]),
+            fs_version: u16::from_le_bytes([bytes[42], bytes[43]]),
+            root_cluster: u32::from_le_bytes([bytes[44], bytes[45], bytes[46], bytes[47]]),
+            fs_info: u16::from_le_bytes([bytes[48], bytes[49]]),
+            backup_boot: u16::from_le_bytes([bytes[50], bytes[51]]),
+            reserved,
+            drive_number: bytes[64],
+            reserved1: bytes[65],
+            boot_signature: bytes[66],
+            volume_id: u32::from_le_bytes([bytes[67], bytes[68], bytes[69], bytes[70]]),
+            volume_label,
+            fs_type,
+        })
+    }
+
     /// Check if this is a valid FAT boot sector
     pub fn is_valid(&self) -> bool {
         // Check jump instruction

@@ -2,6 +2,7 @@
 //!
 //! Implements the Plan 9 console device for text input/output.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use crate::dev::{Chan, Qid, Error, devtype, qidtype, Dev, DirEntry};
 use crate::plan9_common::sync::{ Mutex };
@@ -306,11 +307,21 @@ impl SerialDev {
         }
         Some(self.read_reg(0))
     }
+
+    /// Current line-status register, used by the diagnostic path.
+    pub fn lsr(&self) -> u8 {
+        self.read_reg(5)
+    }
     
-    /// Write a byte to the serial port
+    /// Write a byte to the serial port.
+    /// The TX-empty wait is bounded: an absent or unusual UART must not
+    /// wedge kernel output forever.
     pub fn write_byte(&self, byte: u8) {
-        // Wait for transmit buffer to be empty
-        while self.read_reg(5) & 0x20 == 0 {}
+        for _ in 0..0x10000 {
+            if self.read_reg(5) & 0x20 != 0 {
+                break;
+            }
+        }
         self.write_reg(0, byte);
     }
     
@@ -426,10 +437,8 @@ static CONSOLE: AtomicPtr<ConsoleDev> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Initialize the console
 pub fn init_console() {
-    let mut console = ConsoleDev::new();
-    let console_ptr: *mut ConsoleDev = core::ptr::addr_of_mut!(console);
-    CONSOLE.store(console_ptr, Ordering::SeqCst);
-    core::mem::forget(console);
+    let console = Box::new(ConsoleDev::new());
+    CONSOLE.store(Box::into_raw(console), Ordering::SeqCst);
 }
 
 /// Print a single character to the console
@@ -453,29 +462,30 @@ pub fn puts(s: &[u8]) {
 /// Global serial port instance
 static SERIAL: AtomicPtr<SerialDev> = AtomicPtr::new(core::ptr::null_mut());
 
-/// Initialize serial console
+/// Initialize serial console.
+/// The device is heap-allocated: a pointer to a stack local would dangle
+/// as soon as `init_serial` returns and could make input reads use a
+/// corrupted port.
 pub fn init_serial() {
-    let mut serial = SerialDev::new(0x3F8); // COM1
+    let serial = Box::new(SerialDev::new(0x3F8)); // COM1
     serial.init();
-    let serial_ptr: *mut SerialDev = core::ptr::addr_of_mut!(serial);
-    SERIAL.store(serial_ptr, Ordering::SeqCst);
-    core::mem::forget(serial);
+    SERIAL.store(Box::into_raw(serial), Ordering::SeqCst);
 }
 
-/// Write a byte to serial port
+/// Write a byte to serial port.  If the full SerialDev has not been
+/// initialised yet, fall back to the early-boot direct COM1 driver so
+/// user-space `puts`/`write` output is visible during boot.
 pub fn serial_putchar(c: u8) {
-    unsafe {
-        if let Some(serial) = SERIAL.load(Ordering::SeqCst).as_ref() {
-            serial.write_byte(c);
-        }
-    }
+    // Output goes through the early serial driver.  The SerialDev output
+    // path waits indefinitely for QEMU's LSR TX-empty bit, which can wedge
+    // the syscall before any characters appear; the boot driver uses a
+    // bounded wait and is reliable on both hardware and emulation.
+    crate::serial::putc(c);
 }
 
 /// Write a string to serial port
 pub fn serial_puts(s: &[u8]) {
-    for &c in s {
-        serial_putchar(c);
-    }
+    crate::serial::put_bytes(s);
 }
 
 /// Read a byte from serial port (non-blocking)
@@ -486,5 +496,14 @@ pub fn serial_getchar() -> Option<u8> {
         } else {
             None
         }
+    }
+}
+
+/// Diagnostic line-status register for terminal input debugging.
+pub fn serial_lsr() -> Option<u8> {
+    unsafe {
+        SERIAL.load(Ordering::SeqCst)
+            .as_ref()
+            .map(|serial| serial.lsr())
     }
 }

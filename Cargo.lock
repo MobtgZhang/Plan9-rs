@@ -3,69 +3,53 @@
 version = 4
 
 [[package]]
-name = "arch-aarch64"
-version = "0.1.0"
-dependencies = [
- "hal",
-]
-
-[[package]]
-name = "arch-i386"
-version = "0.1.0"
-dependencies = [
- "hal",
-]
-
-[[package]]
-name = "arch-loongarch64"
-version = "0.1.0"
-dependencies = [
- "hal",
-]
-
-[[package]]
-name = "arch-riscv64"
-version = "0.1.0"
-dependencies = [
- "hal",
-]
-
-[[package]]
-name = "arch-x86_64"
-version = "0.1.0"
-dependencies = [
- "hal",
-]
-
-[[package]]
-name = "bit_field"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e4b40c7323adcfc0a41c4b88143ed58346ff65a288fc144329c5c45e05d70c6"
-
-[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
-name = "hal"
-version = "0.1.0"
+name = "cc"
+version = "1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86e055fa6e3e40ad6187ba25b6855eeb635d5271f8e0f0e1e9a5826b8d75bea0"
 dependencies = [
- "bitflags",
- "lazy_static",
- "spin",
+ "find-msvc-tools",
+ "shlex",
 ]
 
 [[package]]
-name = "lazy_static"
-version = "1.5.0"
+name = "cfg-if"
+version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+[[package]]
+name = "find-msvc-tools"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+
+[[package]]
+name = "getrandom"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
- "spin",
+ "cfg-if",
+ "libc",
+ "wasi",
 ]
+
+[[package]]
+name = "grub-cfg"
+version = "0.1.0"
+
+[[package]]
+name = "libc"
+version = "0.2.191"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "lock_api"
@@ -77,24 +61,46 @@ dependencies = [
 ]
 
 [[package]]
-name = "log"
-version = "0.4.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
-
-[[package]]
-name = "plan9-boot"
+name = "plan9-arch"
 version = "0.1.0"
 dependencies = [
- "spin",
- "uefi",
+ "cc",
+ "plan9-common",
 ]
 
 [[package]]
-name = "plan9-cmd"
+name = "plan9-bootloader"
 version = "0.1.0"
 dependencies = [
- "plan9-lib",
+ "plan9-common",
+]
+
+[[package]]
+name = "plan9-common"
+version = "0.1.0"
+
+[[package]]
+name = "plan9-fs"
+version = "0.1.0"
+dependencies = [
+ "plan9-common",
+ "plan9_libventi",
+]
+
+[[package]]
+name = "plan9-init"
+version = "0.1.0"
+dependencies = [
+ "plan9-common",
+ "plan9-net",
+]
+
+[[package]]
+name = "plan9-ipc"
+version = "0.1.0"
+dependencies = [
+ "plan9-common",
+ "spin",
 ]
 
 [[package]]
@@ -102,97 +108,124 @@ name = "plan9-kernel"
 version = "0.1.0"
 dependencies = [
  "bitflags",
- "hal",
- "lazy_static",
+ "cc",
+ "plan9-arch",
+ "plan9-common",
+ "plan9-ipc",
+ "plan9-net",
+ "plan9-servers",
+ "plan9_drivers",
  "spin",
 ]
 
 [[package]]
-name = "plan9-lib"
+name = "plan9-libbio"
+version = "0.1.0"
+
+[[package]]
+name = "plan9-libstring"
+version = "0.1.0"
+
+[[package]]
+name = "plan9-libsys"
 version = "0.1.0"
 dependencies = [
- "bitflags",
- "spin",
+ "plan9-common",
 ]
 
 [[package]]
-name = "plan9-pc"
+name = "plan9-net"
 version = "0.1.0"
 dependencies = [
- "arch-x86_64",
- "bitflags",
- "hal",
- "plan9-kernel",
- "spin",
+ "plan9-common",
 ]
 
 [[package]]
-name = "plan9-pc64"
+name = "plan9-rio"
 version = "0.1.0"
 dependencies = [
- "arch-x86_64",
- "bitflags",
- "hal",
- "plan9-kernel",
- "spin",
+ "plan9-common",
+ "plan9-servers",
+ "plan9_libdraw",
 ]
 
 [[package]]
-name = "plan9-pcboot"
+name = "plan9-security"
 version = "0.1.0"
 dependencies = [
- "hal",
- "spin",
- "uefi",
+ "getrandom",
+ "plan9-common",
 ]
 
 [[package]]
-name = "plan9-stdlib"
+name = "plan9-servers"
+version = "0.1.0"
+dependencies = [
+ "plan9-common",
+]
+
+[[package]]
+name = "plan9-userspace"
+version = "0.1.0"
+dependencies = [
+ "plan9-security",
+ "regex-lite",
+]
+
+[[package]]
+name = "plan9_drivers"
+version = "0.1.0"
+dependencies = [
+ "plan9-arch",
+ "plan9-common",
+]
+
+[[package]]
+name = "plan9_libdraw"
+version = "0.1.0"
+dependencies = [
+ "plan9-common",
+]
+
+[[package]]
+name = "plan9_libhttpd"
 version = "0.1.0"
 
 [[package]]
-name = "proc-macro2"
-version = "1.0.106"
+name = "plan9_libplumb"
+version = "0.1.0"
+dependencies = [
+ "plan9-common",
+]
+
+[[package]]
+name = "plan9_libregexp"
+version = "0.1.0"
+
+[[package]]
+name = "plan9_libventi"
+version = "0.1.0"
+dependencies = [
+ "plan9-common",
+]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
-dependencies = [
- "unicode-ident",
-]
-
-[[package]]
-name = "ptr_meta"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcada80daa06c42ed5f48c9a043865edea5dc44cbf9ac009fda3b89526e28607"
-dependencies = [
- "ptr_meta_derive",
-]
-
-[[package]]
-name = "ptr_meta_derive"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bca9224df2e20e7c5548aeb5f110a0f3b77ef05f8585139b7148b59056168ed2"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
-name = "quote"
-version = "1.0.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
-dependencies = [
- "proc-macro2",
-]
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "spin"
@@ -204,81 +237,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "syn"
-version = "1.0.109"
+name = "wasi"
+version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
-]
-
-[[package]]
-name = "syn"
-version = "2.0.118"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b9ae57f904213ebb649ce6895b8a66c66f0203b9319718f69a5612a065b1422"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
-]
-
-[[package]]
-name = "ucs2"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df79298e11f316400c57ec268f3c2c29ac3c4d4777687955cd3d4f3a35ce7eba"
-dependencies = [
- "bit_field",
-]
-
-[[package]]
-name = "uefi"
-version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b63e82686b4bdb0db74f18b2abbd60a0470354fb640aa69e115598d714d0a10"
-dependencies = [
- "bitflags",
- "log",
- "ptr_meta",
- "ucs2",
- "uefi-macros",
- "uefi-raw",
- "uguid",
-]
-
-[[package]]
-name = "uefi-macros"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "023d94ef8e135d068b9a3bd94614ef2610b2b0419ade0a9d8f3501fa9cd08e95"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
-name = "uefi-raw"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62642516099c6441a5f41b0da8486d5fc3515a0603b0fdaea67b31600e22082e"
-dependencies = [
- "bitflags",
- "ptr_meta",
- "uguid",
-]
-
-[[package]]
-name = "uguid"
-version = "2.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c8352f8c05e47892e7eaf13b34abd76a7f4aeaf817b716e88789381927f199c"
-
-[[package]]
-name = "unicode-ident"
-version = "1.0.24"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"

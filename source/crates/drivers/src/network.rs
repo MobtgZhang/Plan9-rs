@@ -1,7 +1,8 @@
 //! Network Device Drivers
 //!
-//! Implements network device abstraction and common NIC drivers.
-
+//! Implements network device abstraction and the E1000 NIC driver.  The
+//! E1000 path uses real MMIO registers and physical DMA descriptor rings;
+//! the virtio-net path remains a scaffold for future work.
 
 extern crate alloc;
 
@@ -57,12 +58,6 @@ pub mod e1000_reg {
     pub const E1000_IMC: usize = 0x00D8;
     pub const E1000_IAM: usize = 0x00E0;
 
-    // Flow control
-    pub const E1000_FCRTH: usize = 0x0248;
-    pub const E1000_FCRTL: usize = 0x024C;
-    pub const E1000_FCTTV: usize = 0x0250;
-    pub const E1000_FCRTV: usize = 0x025C;
-
     // Transmit
     pub const E1000_TDBAL: usize = 0x3800;
     pub const E1000_TDBAH: usize = 0x3804;
@@ -82,78 +77,26 @@ pub mod e1000_reg {
     pub const E1000_RCTL: usize = 0x0100;
     pub const E1000_RSCR: usize = 0x280C;
 
-    // Statistics
-    pub const E1000_CRCERRS: usize = 0x4000;
-    pub const E1000_ALGERR: usize = 0x4004;
-    pub const E1000_SYMERRS: usize = 0x4008;
-    pub const E1000_RXERRC: usize = 0x400C;
-    pub const E1000_MPC: usize = 0x4010;
-    pub const E1000_SCC: usize = 0x4014;
-    pub const E1000_COLC: usize = 0x4028;
-    pub const E1000_RERC: usize = 0x402C;
-    pub const E1000_DC: usize = 0x4030;
-    pub const E1000_SEC: usize = 0x4034;
-    pub const E1000_RLEC: usize = 0x4048;
-    pub const E1000_XONRXC: usize = 0x4050;
-    pub const E1000_XONTXC: usize = 0x4054;
-    pub const E1000_XOFFRXC: usize = 0x4058;
-    pub const E1000_XOFFTXC: usize = 0x405C;
-    pub const E1000_GPRC: usize = 0x4074;
-    pub const E1000_BPRC: usize = 0x4078;
-    pub const E1000_MPRC: usize = 0x407C;
-    pub const E1000_GPTC: usize = 0x4080;
-    pub const E1000_TORL: usize = 0x40C0;
-    pub const E1000_TORH: usize = 0x40C8;
-    pub const E1000_TOTL: usize = 0x40D0;
-    pub const E1000_TOTH: usize = 0x40D8;
-    pub const E1000_TPR: usize = 0x40D0;
-    pub const E1000_TPT: usize = 0x40D4;
-
     // MAC addresses
     pub const E1000_RAL0: usize = 0x5400;
     pub const E1000_RAH0: usize = 0x5404;
 
-    // Multicast table
-    pub const E1000_MTA: usize = 0x5200;
-
-    // Receive registers
-    pub const E1000_RDTR: usize = 0x2820;
-    pub const E1000_RADV: usize = 0x282C;
-    pub const E1000_RSRPD: usize = 0x2C00;
-
-    // Transmit registers
-    pub const E1000_TIDV: usize = 0x3820;
-    pub const E1000_TADV: usize = 0x382C;
-    pub const E1000_TSPMT: usize = 0x3830;
-
-    // Device control
+    // Device control bits
     pub const E1000_CTRL_FD: u32 = 1 << 0;
     pub const E1000_CTRL_LRST: u32 = 1 << 3;
     pub const E1000_CTRL_ASDE: u32 = 1 << 5;
     pub const E1000_CTRL_SLU: u32 = 1 << 6;
-    pub const E1000_CTRL_FRCSPD: u32 = 1 << 11;
-    pub const E1000_CTRL_FRCDPX: u32 = 1 << 12;
 
-    // Transmit control
+    // Transmit control bits
     pub const E1000_TCTL_EN: u32 = 1 << 1;
     pub const E1000_TCTL_PSP: u32 = 1 << 3;
     pub const E1000_TCTL_CT: u32 = 0xF << 4;
-    pub const E1000_TCTL_COLD: u32 = 0x3F << 12;
+    pub const E1000_TCTL_COLD: u32 = 0x40 << 12;
 
-    // Receive control
+    // Receive control bits
     pub const E1000_RCTL_EN: u32 = 1 << 1;
-    pub const E1000_RCTL_UPE: u32 = 1 << 3;
-    pub const E1000_RCTL_MPE: u32 = 1 << 4;
-    pub const E1000_RCTL_LPE: u32 = 1 << 5;
-    pub const E1000_RCTL_LBM: u32 = 3 << 6;
-    pub const E1000_RCTL_RDMTS: u32 = 3 << 8;
-    pub const E1000_RCTL_MO: u32 = 3 << 12;
     pub const E1000_RCTL_BAM: u32 = 1 << 15;
-    pub const E1000_RCTL_SZ: u32 = 3 << 16;
     pub const E1000_RCTL_SZ_2048: u32 = 0 << 16;
-    pub const E1000_RCTL_SZ_4096: u32 = 1 << 16;
-    pub const E1000_RCTL_SZ_8192: u32 = 2 << 16;
-    pub const E1000_RCTL_SZ_16384: u32 = 3 << 16;
     pub const E1000_RCTL_SECRC: u32 = 1 << 26;
 }
 
@@ -173,7 +116,6 @@ impl E1000TxDesc {
     pub const CMD_EOP: u8 = 1 << 0;
     pub const CMD_IFCS: u8 = 1 << 1;
     pub const CMD_RS: u8 = 1 << 3;
-
     pub const STATUS_DD: u8 = 1 << 0;
 }
 
@@ -208,8 +150,13 @@ pub struct E1000 {
     pub rx_size: usize,
 }
 
+// Raw descriptor pointers are safe to share only through the kernel's
+// spinlock-guarded NIC object.
+unsafe impl Send for E1000 {}
+unsafe impl Sync for E1000 {}
+
 impl E1000 {
-    /// Create new E1000 device
+    /// Create a new E1000 device with no DMA rings configured yet.
     pub fn new(base: PhysAddr) -> Self {
         Self {
             base_addr: base,
@@ -226,55 +173,40 @@ impl E1000 {
         }
     }
 
-    /// Read a register from MMIO
-    ///
-    /// Reads a 32-bit value from the specified register offset.
-    /// Uses volatile read to prevent optimization.
+    /// Read a 32-bit MMIO register.
     fn read_reg(&self, offset: usize) -> u32 {
         let addr = self.base_addr.as_u64() as *const u32;
         unsafe { core::ptr::read_volatile(addr.add(offset / 4)) }
     }
 
-    /// Write a register to MMIO
-    ///
-    /// Writes a 32-bit value to the specified register offset.
-    /// Uses volatile write to prevent optimization.
+    /// Write a 32-bit MMIO register.
     fn write_reg(&self, offset: usize, val: u32) {
         let addr = self.base_addr.as_u64() as *mut u32;
         unsafe { core::ptr::write_volatile(addr.add(offset / 4), val) }
     }
 
-/// Read a register using I/O port (for legacy mode)
-///
-/// Some E1000 devices use I/O ports instead of MMIO.
-pub fn read_reg_io(&self, _offset: u16) -> u32 {
-    // In real implementation, would use inl/outl instructions
-    // unsafe { llvm_asm!("inl $1, $0" : "=a"(val) : "d"(port)) }
-    0
-}
+    /// Write a 64-bit MMIO register represented by two consecutive 32-bit
+    /// registers (the E1000 uses this for descriptor-ring base addresses).
+    fn write64(&self, offset: usize, val: u64) {
+        self.write_reg(offset, (val & 0xFFFF_FFFF) as u32);
+        self.write_reg(offset + 4, ((val >> 32) & 0xFFFF_FFFF) as u32);
+    }
 
-/// Write a register using I/O port
-pub fn write_reg_io(&self, offset: u16, val: u32) {
-    // unsafe { llvm_asm!("outl $0, $1" : : "a"(val), "d"(port)) }
-    let _ = offset;
-    let _ = val;
-}
-
-    /// Initialize the device
+    /// Reset the NIC and configure its basic operating mode.
     pub fn init(&mut self) -> Result<()> {
-        // Reset the device
+        // Ask for a link reset.  QEMU's e1000e clears the LRST bit after the
+        // reset completes; if the hardware does not implement it, the bounded
+        // wait below simply continues with a normal configuration.
         self.write_reg(e1000_reg::E1000_CTRL, e1000_reg::E1000_CTRL_LRST);
-
-        // Wait for reset to complete
-        for _ in 0..1000 {
+        for _ in 0..2000 {
             if self.read_reg(e1000_reg::E1000_CTRL) & e1000_reg::E1000_CTRL_LRST == 0 {
                 break;
             }
         }
 
-        // Read MAC address
-        let mac_low = self.read_reg(e1000_reg::E1000_RAH0);
-        let mac_high = self.read_reg(e1000_reg::E1000_RAL0);
+        // RAL0 holds the low four MAC bytes and RAH0 holds the high two.
+        let mac_low = self.read_reg(e1000_reg::E1000_RAL0);
+        let mac_high = self.read_reg(e1000_reg::E1000_RAH0);
 
         self.mac[0] = (mac_low & 0xFF) as u8;
         self.mac[1] = ((mac_low >> 8) & 0xFF) as u8;
@@ -283,64 +215,187 @@ pub fn write_reg_io(&self, offset: u16, val: u32) {
         self.mac[4] = (mac_high & 0xFF) as u8;
         self.mac[5] = ((mac_high >> 8) & 0xFF) as u8;
 
-        // Allocate transmit descriptors
-        // In real implementation, would allocate from memory
+        // Disable legacy/MSI interrupt delivery; the kernel polls the rings.
+        self.write_reg(e1000_reg::E1000_IMC, 0xFFFF_FFFF);
 
-        // Configure transmit
-        self.write_reg(e1000_reg::E1000_TCTL, 0
-            | e1000_reg::E1000_TCTL_EN
-            | e1000_reg::E1000_TCTL_PSP
-            | (0xF << 4)  // Collision threshold
-            | (0x40 << 12)  // Collision distance
+        // Transmit control: enable transmitter, pad short packets, and set
+        // the collision threshold/distance.
+        self.write_reg(
+            e1000_reg::E1000_TCTL,
+            e1000_reg::E1000_TCTL_EN
+                | e1000_reg::E1000_TCTL_PSP
+                | e1000_reg::E1000_TCTL_CT
+                | e1000_reg::E1000_TCTL_COLD,
+        );
+        self.write_reg(e1000_reg::E1000_TIPG, 0x0060_1006);
+
+        // Receive control: enable receiver and broadcast acceptance, and
+        // strip CRC on receive.
+        self.write_reg(
+            e1000_reg::E1000_RCTL,
+            e1000_reg::E1000_RCTL_EN
+                | e1000_reg::E1000_RCTL_BAM
+                | e1000_reg::E1000_RCTL_SZ_2048
+                | e1000_reg::E1000_RCTL_SECRC,
         );
 
-        // Inter-packet gap (recommended for 1GbE)
-        self.write_reg(e1000_reg::E1000_TIPG, 0x00601006);
-
-        // Configure receive
-        self.write_reg(e1000_reg::E1000_RCTL, 0
-            | e1000_reg::E1000_RCTL_BAM
-            | e1000_reg::E1000_RCTL_SZ_2048
-            | e1000_reg::E1000_RCTL_SECRC
-        );
-
-        // Enable link
+        // Force link up (SLU) and auto-speed detect if supported.
         let ctrl = self.read_reg(e1000_reg::E1000_CTRL);
-        self.write_reg(e1000_reg::E1000_CTRL, ctrl | e1000_reg::E1000_CTRL_SLU);
+        self.write_reg(
+            e1000_reg::E1000_CTRL,
+            ctrl | e1000_reg::E1000_CTRL_SLU | e1000_reg::E1000_CTRL_ASDE,
+        );
 
         Ok(())
     }
 
-    /// Transmit a packet
+    /// Install physical DMA rings and buffers.  All addresses are physical
+    /// addresses; the kernel identity-maps the low 1 GiB region, so these
+    /// pointers are directly usable by the CPU.
+    pub fn init_dma(
+        &mut self,
+        tx_desc: PhysAddr,
+        rx_desc: PhysAddr,
+        tx_buffer: PhysAddr,
+        rx_buffers: [PhysAddr; 16],
+    ) -> Result<()> {
+        self.tx_descs = tx_desc.as_u64() as *mut E1000TxDesc;
+        self.rx_descs = rx_desc.as_u64() as *mut E1000RxDesc;
+        self.tx_buffer = tx_buffer.as_u64() as *mut u8;
+        for i in 0..self.rx_size {
+            self.rx_buffers[i] = rx_buffers[i].as_u64() as *mut u8;
+        }
+
+        unsafe {
+            for i in 0..self.tx_size {
+                let d = &mut *self.tx_descs.add(i);
+                d.buffer_addr = tx_buffer.as_u64();
+                d.length = 0;
+                d.cso = 0;
+                d.cmd = 0;
+                d.status = 0;
+                d.css = 0;
+                d.special = 0;
+            }
+            for i in 0..self.rx_size {
+                let d = &mut *self.rx_descs.add(i);
+                d.buffer_addr = rx_buffers[i].as_u64();
+                d.length = 0;
+                d.checksum = 0;
+                d.status = 0;
+                d.errors = 0;
+                d.special = 0;
+            }
+        }
+
+        // Transmit ring
+        self.write64(e1000_reg::E1000_TDBAL, tx_desc.as_u64());
+        self.write_reg(e1000_reg::E1000_TDLEN, (self.tx_size * 16) as u32);
+        self.write_reg(e1000_reg::E1000_TDH, 0);
+        self.write_reg(e1000_reg::E1000_TDT, 0);
+
+        // Receive ring
+        self.write64(e1000_reg::E1000_RDBAL, rx_desc.as_u64());
+        self.write_reg(e1000_reg::E1000_RDLEN, (self.rx_size * 16) as u32);
+        self.write_reg(e1000_reg::E1000_RDH, 0);
+        self.write_reg(e1000_reg::E1000_RDT, (self.rx_size - 1) as u32);
+
+        self.tx_head = 0;
+        self.tx_tail = 0;
+        self.rx_head = 0;
+        Ok(())
+    }
+
+    /// Transmit one Ethernet frame.  The descriptor ring is used
+    /// synchronously: one frame is copied into the transmit buffer and the
+    /// descriptor is handed to the NIC before we wait for DD completion.
     pub fn transmit(&mut self, packet: &[u8]) -> Result<()> {
         if packet.len() > 1514 {
             return Err(Error::Einval);
         }
+        if self.tx_descs.is_null() || self.tx_buffer.is_null() {
+            return Err(Error::Eio);
+        }
 
-        // In real implementation, would:
-        // 1. Wait for a free transmit descriptor
-        // 2. Copy packet to transmit buffer
-        // 3. Update descriptor with packet length and CMD_RS
-        // 4. Update TDT register
-        // 5. Wait for TX completion
+        let idx = self.tx_tail;
+        unsafe {
+            core::ptr::copy_nonoverlapping(packet.as_ptr(), self.tx_buffer, packet.len());
+            let d = &mut *self.tx_descs.add(idx);
+            d.buffer_addr = self.tx_buffer as u64;
+            d.length = packet.len() as u16;
+            d.cso = 0;
+            d.cmd = E1000TxDesc::CMD_EOP | E1000TxDesc::CMD_IFCS | E1000TxDesc::CMD_RS;
+            d.status = 0;
+            d.css = 0;
+            d.special = 0;
+        }
+
+        // Advancing TDT makes the descriptor visible to the hardware.
+        self.write_reg(e1000_reg::E1000_TDT, ((idx + 1) % self.tx_size) as u32);
+        self.tx_tail = (idx + 1) % self.tx_size;
+
+        // Wait (bounded) for the descriptor's DD status bit.  QEMU sets this
+        // almost immediately, but polling avoids depending on interrupts.
+        unsafe {
+            for _ in 0..100_000 {
+                let d = &*self.tx_descs.add(idx);
+                if d.status & E1000TxDesc::STATUS_DD != 0 {
+                    break;
+                }
+            }
+        }
 
         Ok(())
     }
 
-    /// Receive a packet
-    pub fn receive(&mut self, _buffer: &mut [u8]) -> Result<usize> {
-        // In real implementation, would:
-        // 1. Check if received packet is ready (status DD bit)
-        // 2. Copy packet from receive buffer
-        // 3. Update descriptor status
-        // 4. Update RDT register
+    /// Poll the receive ring and copy one received frame into `buffer`.
+    /// Returns 0 when no descriptor is ready.
+    pub fn receive(&mut self, buffer: &mut [u8]) -> Result<usize> {
+        if self.rx_descs.is_null() {
+            return Ok(0);
+        }
+
+        for _ in 0..self.rx_size {
+            let idx = self.rx_head;
+            unsafe {
+                let d = &mut *self.rx_descs.add(idx);
+                if d.status & E1000RxDesc::STATUS_DD != 0 {
+                    let len = d.length as usize;
+                    if len == 0 {
+                        d.status = 0;
+                        self.write_reg(e1000_reg::E1000_RDT, idx as u32);
+                        self.rx_head = (idx + 1) % self.rx_size;
+                        return Ok(0);
+                    }
+                    let n = core::cmp::min(len, buffer.len());
+                    core::ptr::copy_nonoverlapping(
+                        d.buffer_addr as *const u8,
+                        buffer.as_mut_ptr(),
+                        n,
+                    );
+                    d.status = 0;
+                    d.length = 0;
+                    d.errors = 0;
+                    self.write_reg(e1000_reg::E1000_RDT, idx as u32);
+                    self.rx_head = (idx + 1) % self.rx_size;
+                    return Ok(n);
+                }
+            }
+        }
 
         Ok(0)
     }
 
-    /// Get MAC address
     pub fn mac_address(&self) -> [u8; 6] {
         self.mac
+    }
+
+    pub fn link_up(&self) -> bool {
+        (self.read_reg(e1000_reg::E1000_STATUS) & (1 << 1)) != 0
+    }
+
+    pub fn status(&self) -> u32 {
+        self.read_reg(e1000_reg::E1000_STATUS)
     }
 }
 
@@ -362,16 +417,16 @@ impl NetDevice for E1000 {
     }
 
     fn link_up(&self) -> bool {
-        (self.read_reg(e1000_reg::E1000_STATUS) & (1 << 1)) != 0
+        self.link_up()
     }
 
     fn set_irq(&mut self, _enabled: bool) {
-        // Configure MSI or legacy interrupt
+        // Polling mode; interrupt delivery is disabled.
     }
 }
 
 // ============================================================================
-// VirtIO Network Driver
+// VirtIO Network Driver (scaffold)
 // ============================================================================
 
 /// VirtIO net device
@@ -386,7 +441,6 @@ pub struct VirtioNet {
 }
 
 impl VirtioNet {
-    /// Create new VirtIO net device
     pub fn new(base: PhysAddr) -> Self {
         Self {
             base_addr: base,
@@ -399,35 +453,19 @@ impl VirtioNet {
         }
     }
 
-    /// Initialize the device
     pub fn init(&mut self) -> Result<()> {
-        // VirtIO initialization sequence:
-        // 1. Reset device
-        // 2. Acknowledge device
-        // 3. Set driver features
-        // 4. Set up virtqueues
-        // 5. Set DRIVER_OK
-
-        // Read MAC address from config
-        // In real implementation, would read from VirtIO config space
-
         self.mtu = 1500;
         Ok(())
     }
 
-    /// Transmit a packet
     pub fn transmit(&mut self, packet: &[u8]) -> Result<()> {
         if packet.len() > self.mtu {
             return Err(Error::Einval);
         }
-
-        // In real implementation, would use TX virtqueue
         Ok(())
     }
 
-    /// Receive a packet
     pub fn receive(&mut self, _buffer: &mut [u8]) -> Result<usize> {
-        // In real implementation, would use RX virtqueue
         Ok(0)
     }
 }
@@ -453,9 +491,7 @@ impl NetDevice for VirtioNet {
         self.status & 1 != 0
     }
 
-    fn set_irq(&mut self, _enabled: bool) {
-        // Configure MSI or virtio interrupt
-    }
+    fn set_irq(&mut self, _enabled: bool) {}
 }
 
 // ============================================================================
@@ -469,7 +505,6 @@ pub struct NetManager {
 }
 
 impl NetManager {
-    /// Create new network manager
     pub fn new() -> Self {
         Self {
             devices: [None, None, None, None],
@@ -477,7 +512,6 @@ impl NetManager {
         }
     }
 
-    /// Add a device
     pub fn add_device(&mut self, device: Box<dyn NetDevice>) -> usize {
         if self.device_count < 4 {
             let idx = self.device_count;
@@ -487,16 +521,6 @@ impl NetManager {
         } else {
             0xFFFF
         }
-    }
-
-    /// Get device by index
-    pub fn get_device(&self, index: usize) -> Option<&dyn NetDevice> {
-        self.devices.get(index).and_then(|d| d.as_ref().map(|b| b.as_ref()))
-    }
-
-    /// Get mutable device by index
-    pub fn get_device_mut(&mut self, index: usize) -> Option<&mut Box<dyn NetDevice>> {
-        self.devices.get_mut(index).and_then(|d| d.as_mut())
     }
 }
 

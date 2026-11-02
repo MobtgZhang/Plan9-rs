@@ -46,7 +46,7 @@ pub const KERNEL_PHYS_BASE: u64 = 0x200_000;
 /// 0x80000000 region (GOP framebuffer physical address range). We
 /// allocate that from the identity-mapped area (at 0xC00000, which is
 /// safe — the kernel image ends well before that).
-pub const MAPPED_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAPPED_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// A 4 KiB-aligned page-table page.
 #[repr(C, align(4096))]
@@ -130,6 +130,10 @@ pub unsafe fn early_paging_init() {
     let pd_high_phys  = pool.pd_high.0.as_ptr() as u64;
 
     pool.pml4.0[0]     = pdpt_phys     | PTE_PRESENT | PTE_WRITABLE;
+    // KERNEL_VIRT_BASE = 0xFFFF_8000_0000_0000 (PML4 index 256)
+    pool.pml4.0[256]   = pdpt_phys     | PTE_PRESENT | PTE_WRITABLE;
+    // PHYS_MEMORY_VIRT = 0xFFFF_8800_0000_0000 (PML4 index 272)
+    pool.pml4.0[272]   = pdpt_phys     | PTE_PRESENT | PTE_WRITABLE;
     pool.pml4.0[508]   = pdpt_phys     | PTE_PRESENT | PTE_WRITABLE;
     asm!("mov dx, 0x3F8; mov al, 'C'; out dx, al", options(nostack, preserves_flags));
 
@@ -139,14 +143,23 @@ pub unsafe fn early_paging_init() {
     pool.pml4.0[511]   = pdpt_gop_phys | PTE_PRESENT | PTE_WRITABLE;
     asm!("mov dx, 0x3F8; mov al, 'D'; out dx, al", options(nostack, preserves_flags));
 
-    // 3. PDPT slot 0 -> pd_low, slot 0 from the high mirror -> pd_high.
-    //    (Both PML4 entries share this PDPT.)
+    // 3. PDPT slot 0 -> pd_low.  Slot 1 is deliberately left free so the
+    //    user address space (USER_BASE = 1 GiB, PDPT index 1) can be mapped
+    //    without clobbering the kernel's low identity mapping.  The kernel's
+    //    high canonical mirror also goes through PDPT slot 0, so pd_high is
+    //    no longer needed.
     pool.pdpt.0[0] = pd_low_phys  | PTE_PRESENT | PTE_WRITABLE;
-    pool.pdpt.0[1] = pd_high_phys | PTE_PRESENT | PTE_WRITABLE;
     asm!("mov dx, 0x3F8; mov al, 'E'; out dx, al", options(nostack, preserves_flags));
 
     // GOP framebuffer physical base — must match entry.rs.
     const GOP_BASE: u64 = 0x8000_0000u64;
+
+    // 3a. Map the PCI MMIO BAR window.  QEMU q35 places the AHCI BAR at
+    // 0x810c4000, which is beyond the 64 MiB identity window.  PDPT slot 2
+    // covers the 0x80000000..0xBFFFFFFF 1 GiB region and is shared by the
+    // low identity PML4 and the higher-half direct mapping.
+    pool.pdpt.0[2] = 0x8000_0000u64 | PTE_PRESENT | PTE_WRITABLE | PTE_PS | PTE_GLOBAL;
+    asm!("mov dx, 0x3F8; mov al, 'M'; out dx, al", options(nostack, preserves_flags));
 
     // 3b. PDPT for GOP: pdpt_gop[256] -> 1 GiB huge page.
     //     The GOP virtual address 0xFFFF_8080_0000_0000 uses:

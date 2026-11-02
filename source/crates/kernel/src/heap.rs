@@ -48,11 +48,19 @@ pub unsafe fn heap_init(start: VirtAddr, end: VirtAddr) {
     crate::serial::put_bytes(b"[heap_init] DONE\n");
 }
 
-/// Static 64 KiB heap slab placed in .bss. Used as a fallback when
-/// no external region is available, and on first invocation by the
-/// kernel boot path.
+/// Static 64 KiB heap slab placed in .bss. Used as a bootstrap heap while
+/// the frame allocator itself is being initialised.
+pub const STATIC_HEAP_SIZE: usize = 0x10000;
+
 #[no_mangle]
-pub static mut STATIC_HEAP: [u8; 0x10000] = [0; 0x10000];
+pub static mut STATIC_HEAP: [u8; STATIC_HEAP_SIZE] = [0; STATIC_HEAP_SIZE];
+
+/// Virtual/physical region reserved for the main boot heap. It lies above
+/// the kernel image, inside the identity-mapped boot window, and is marked
+/// reserved in the frame allocator before any frames are handed out.
+pub const BOOT_HEAP_START: u64 = 0x0100_0000; // 16 MiB
+pub const BOOT_HEAP_SIZE:  u64 = 0x0200_0000; // 32 MiB
+pub const BOOT_HEAP_END:   u64 = BOOT_HEAP_START + BOOT_HEAP_SIZE;
 
 /// Round `v` up to a multiple of `align`. `align` must be a power of two.
 fn round_up(v: u64, align: u64) -> u64 { (v + align - 1) & !(align - 1) }

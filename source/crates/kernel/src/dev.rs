@@ -936,7 +936,9 @@ impl Dev for RamDev {
     }
 
     fn dev_char(&self) -> char {
-        's'
+        // Plan 9 uses `#s` for the SD/storage device.  This RAM namespace
+        // device must not shadow it, so use `#r` (RAM disk).
+        'r'
     }
 
     fn name(&self) -> &'static str {
@@ -1048,6 +1050,11 @@ impl DevTable {
         None
     }
 
+    /// Number of registered devices.
+    pub fn device_count(&self) -> usize {
+        self.count
+    }
+
     /// Get device by index
     pub fn get(&self, index: usize) -> Option<&dyn Dev> {
         self.devices.get(index).and_then(|d| d.as_ref().map(|b| b.as_ref()))
@@ -1088,8 +1095,8 @@ impl DevTable {
         self.register(Box::new(NullDev::new()));
         // Register zero device (#z)
         self.register(Box::new(ZeroDev::new()));
-        // Register root device ('/')
-        self.register(Box::new(RootDev::new()));
+        // Register root device ('/') — the RAM root file system.
+        self.register(Box::new(crate::rootfs::RootFsDev::new()));
         // Register console device (#c)
         self.register(Box::new(ConsDev::new()));
         // Register RAM device for /sd
@@ -1102,6 +1109,8 @@ impl DevTable {
         self.register(Box::new(crate::devpipe::PipeDev::new()));
         // Register SD device (#s) - storage/disk
         self.register(Box::new(crate::devsd::SdDev::new()));
+        // Register filesystem device (#f) - EXT/NTFS/FAT/XFS images
+        self.register(Box::new(crate::devfs::FsDev::new()));
         // Register UART device (#U) - serial ports
         self.register(Box::new(crate::devuart::UartDev::new()));
         // Register mouse device (#m) - PS/2 mouse
@@ -1114,12 +1123,14 @@ impl DevTable {
         self.register(Box::new(crate::devaudio::AudioDev::new()));
         // Register mnt device (#M) - mount driver
         self.register(Box::new(crate::devmnt::MntDev::new()));
-        // Register TLS device (#I) - TLS/SSL
+        // Register TLS device (#T) - TLS/SSL
         self.register(Box::new(crate::devtls::TlsDev::new()));
         // Register bridge device (#l) - Ethernet bridge
         self.register(Box::new(crate::devbridge::BridgeDev::new()));
         // Register USB device (#u) - USB host
         self.register(Box::new(crate::devusb::UsbDev::new()));
+        // Register network device (#I) - the Plan 9 /net tree
+        self.register(Box::new(crate::netfs::NetFs::new()));
         // Register srv device - service access device
         self.register(Box::new(crate::devsrv::SrvDev::new()));
     }
@@ -1322,22 +1333,21 @@ pub type PciIterator = alloc::vec::IntoIter<PciDeviceInfo>;
 /// should call this once during initialization.
 pub fn set_pci_iterator(iter: Option<alloc::vec::Vec<PciDeviceInfo>>) {
     if let Some(items) = iter {
-        PCI_BUFFER.lock().replace(items.into_iter());
+        *PCI_BUFFER.lock() = Some(items);
     } else {
-        PCI_BUFFER.lock().take();
+        *PCI_BUFFER.lock() = None;
     }
 }
 
-/// Iterate over PCI devices known to the kernel.
+/// Iterate over a fresh copy of the PCI devices known to the kernel.  Each
+/// call starts from the beginning, so multiple drivers can consume the list.
 pub fn pci_iter() -> PciIteratorGuard {
-    // Pop the current iterator (if any) and return a guard that holds it
-    // for the lifetime of the iteration.
-    let guard = PCI_BUFFER.lock().take();
-    PciIteratorGuard { iter: guard }
+    let items = PCI_BUFFER.lock().clone();
+    PciIteratorGuard {
+        iter: items.map(|v| v.into_iter()),
+    }
 }
 
-/// A guard over a swapped-out PCI iterator. When the guard is dropped the
-/// iterator is restored so the next caller can resume from the start.
 pub struct PciIteratorGuard {
     iter: Option<alloc::vec::IntoIter<PciDeviceInfo>>,
 }
@@ -1352,15 +1362,7 @@ impl Iterator for PciIteratorGuard {
     }
 }
 
-impl Drop for PciIteratorGuard {
-    fn drop(&mut self) {
-        if let Some(iter) = self.iter.take() {
-            PCI_BUFFER.lock().replace(iter);
-        }
-    }
-}
-
-static PCI_BUFFER: Mutex<Option<alloc::vec::IntoIter<PciDeviceInfo>>> = Mutex::new(None);
+static PCI_BUFFER: Mutex<Option<alloc::vec::Vec<PciDeviceInfo>>> = Mutex::new(None);
 
 /// Install a fixed list of PCI devices (for tests and stub environments).
 pub fn install_test_pci_devices(devices: alloc::vec::Vec<PciDeviceInfo>) {
@@ -1395,4 +1397,17 @@ pub fn dev_read(chan: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, E
 pub fn dev_write(chan: &mut Chan, buf: &[u8], offset: u64) -> Result<usize, Error> {
     let dev = devs_mut().get_mut(chan.dev).ok_or(Error::Enoent)?;
     dev.write(chan, buf, offset)
+}
+
+/// Close a device channel
+pub fn dev_close(chan: &mut Chan) -> Result<(), Error> {
+    let dev = devs_mut().get_mut(chan.dev).ok_or(Error::Enoent)?;
+    dev.close(chan);
+    Ok(())
+}
+
+/// Get device channel status
+pub fn dev_stat(chan: &mut Chan) -> Result<DirEntry, Error> {
+    let dev = devs_mut().get_mut(chan.dev).ok_or(Error::Enoent)?;
+    dev.stat(chan)
 }

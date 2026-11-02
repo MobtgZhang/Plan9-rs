@@ -6,7 +6,7 @@
 //! - System call handling
 //! - Page fault handling
 
-use crate::proc::{ curproc, curproc_mut, Proc };use crate::sched::{scheduler, sched_ticks};
+use crate::proc::{ curproc, curproc_mut, Proc, SavedUserFrame };use crate::sched::{scheduler, sched_ticks};
 use crate::fault::page_fault_handler as do_page_fault;
 
 /// Exec context for syscall return
@@ -374,13 +374,32 @@ pub fn handle_interrupt(vector: usize) {
 
 /// System call handler - dispatches to syscall module
 /// Called from the syscall entry stub with the syscall number in rdi
-fn syscall_handler(num: usize) -> i64 {
+fn syscall_handler(
+    num: usize,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    user_frame_ptr: u64,
+) -> i64 {
+    // Copy the CPU's IRET frame and the saved user registers into a stable
+    // per-process frame.  The assembly stub points `user_frame_ptr` at the
+    // first saved register (R15), and the IRET fields begin at +80 bytes.
+    let saved = if user_frame_ptr != 0 {
+        unsafe { core::ptr::read_unaligned(user_frame_ptr as *const SavedUserFrame) }
+    } else {
+        SavedUserFrame::default()
+    };
+
     // Set up process context
     if let Some(proc) = curproc() {
         unsafe {
             let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
             p.insyscall = true;
             p.nsyscall += 1;
+            p.user_frame = Some(saved);
 
             // Clear any previous exec context
             SYSCALL_USE_EXEC_CONTEXT = false;
@@ -388,45 +407,58 @@ fn syscall_handler(num: usize) -> i64 {
         }
     }
 
-    // Create a minimal syscall frame
+    // Create a syscall frame from the real user IRET frame.
     let frame = SyscallFrame {
         exc: ExceptionFrame {
             error_code: 0,
-            rip: 0,
-            cs: 0,
-            rflags: 0,
-            rsp: 0,
-            ss: 0,
+            rip: saved.rip,
+            cs: saved.cs,
+            rflags: saved.rflags,
+            rsp: saved.rsp,
+            ss: saved.ss,
         },
         syscall_num: num as u64,
-        arg0: 0,
-        arg1: 0,
-        arg2: 0,
-        arg3: 0,
-        arg4: 0,
-        arg5: 0,
+        arg0: a0,
+        arg1: a1,
+        arg2: a2,
+        arg3: a3,
+        arg4: a4,
+        arg5: a5,
         ret: 0,
     };
 
     // Dispatch to syscall handler in syscall.rs
     let result = crate::syscall::dispatch(num, &frame);
 
-    // Check if exec was successful (exec sets exec_context in the process)
-    if num == 1 {
-        // EXEC syscall
+    // Check if exec was successful (exec sets exec_context in the process).
+    // In Plan 9, exec replaces the process image, so resume user mode at the
+    // new entry/stack directly instead of returning to the old syscall frame.
+    if num == crate::syscall::nr::EXEC {
         if let Some(proc) = curproc() {
             unsafe {
                 let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
                 if p.has_exec_context() && result >= 0 {
-                    // Store exec entry point for assembly stub
-                    SYSCALL_EXEC_ENTRY = p.get_exec_entry();
-                    // Set flag to indicate we should return to exec context
-                    SYSCALL_USE_EXEC_CONTEXT = true;
-                    // Clear exec context in process
+                    let mut f = p.user_frame.unwrap_or_default();
+                    f.rip = p.get_exec_entry();
+                    f.rsp = p.get_exec_stack();
+                    f.rax = 0;
+                    f.cs = 0x23;
+                    f.ss = 0x2B;
+                    f.rflags = 1 << 9;
+                    p.user_frame = Some(f);
                     p.clear_exec_context();
-                    // Return the entry point in RAX for the stub
-                    // Note: RAX is clobbered by the call, so we need to use the stub
-                    // The stub will read from SYSCALL_EXEC_ENTRY
+                    p.insyscall = false;
+
+                    let frame_ptr = p
+                        .user_frame
+                        .as_ref()
+                        .map(|fr| fr as *const SavedUserFrame as u64)
+                        .unwrap_or(0);
+                    let pml4 = p.mmupdb.as_u64();
+                    plan9_arch::x86_64::switch_to_user::kernel_resume_user(
+                        frame_ptr,
+                        pml4,
+                    );
                 }
             }
         }
@@ -478,7 +510,7 @@ pub fn init_idt() {
         syscall_addr,
         code_sel,
         0,
-        attr::PRESENT | attr::RING0 | attr::INTR,
+        attr::PRESENT | attr::RING3 | attr::TRAP,
     );
     unsafe {
         IDT[0x80] = syscall_entry;
@@ -546,24 +578,32 @@ unsafe extern "C" fn syscall_entry_stub() {
             "mov rbp, rsp",
             "and rsp, -16",
 
-            // Get syscall number from stack
-            // Stack (from rbp): r15, r14, r13, r12, rbx, rbp, arg5, arg4, arg3, arg2, arg1, arg0, syscall_num, rflags, rip
-            // syscall_num is at rbp + 96 = rbp + 12*8
+            // Load the syscall number and arguments from the saved stack.
+            // Layout from rbp: r15, r14, r13, r12, rbx, rbp,
+            // arg5, arg4, arg3, arg2, arg1, arg0, syscall_num, rflags, rip.
+            // syscall_num is at rbp + 96; arg0..arg5 at rbp + 88 .. +48.
             "mov rdi, [rbp + 96]",
+            "mov rsi, [rbp + 88]",
+            "mov rdx, [rbp + 80]",
+            "mov rcx, [rbp + 72]",
+            "mov r8,  [rbp + 64]",
+            "mov r9,  [rbp + 56]",
+            "push qword ptr [rbp + 48]",
 
-            // Call syscall handler
+            // Call syscall handler (7 arguments: num + 6 syscall args)
             "call syscall_handler",
 
             // Restore stack pointer
             "mov rsp, rbp",
 
             // Check if we should return to exec context
-            "mov rax, SYSCALL_USE_EXEC_CONTEXT",
-            "cmp byte ptr [rax], 0",
+            // Use r10 for the flag address so RAX keeps the syscall result.
+            "mov r10, SYSCALL_USE_EXEC_CONTEXT",
+            "cmp byte ptr [r10], 0",
             "jne 2f",
 
             // Exec return path: clear flag and use exec entry point
-            "mov byte ptr [rax], 0",  // Clear flag
+            "mov byte ptr [r10], 0",  // Clear flag
             "mov r12, SYSCALL_EXEC_ENTRY",  // Load exec entry into r12
 
             // Restore callee-saved registers
@@ -709,6 +749,46 @@ unsafe extern "C" fn exception_entry_stub() {
 /// Initialize trap handling
 pub fn init() {
     init_idt();
+}
+
+/// Bridge used by the architecture crate's syscall stub.
+///
+/// The arch crate cannot depend on the kernel crate, so it declares this
+/// symbol externally. The kernel provides the real implementation here and
+/// routes the call through the full VFS/process-aware syscall table.
+#[no_mangle]
+pub extern "C" fn kernel_syscall_from_user(
+    num: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    user_frame_ptr: u64,
+) -> i64 {
+    syscall_handler(num as usize, a0, a1, a2, 0, 0, 0, user_frame_ptr)
+}
+
+/// Bridge used by the architecture crate's hardware-IRQ stubs.
+///
+/// The stubs save the interrupted user register state and call this
+/// function with the vector number.  We dispatch through the kernel's
+/// existing interrupt table.  A timer tick also acknowledges the interrupt
+/// controller so the source can deliver the next tick.
+#[no_mangle]
+pub extern "C" fn kernel_interrupt_from_user(vector: u64) {
+    handle_interrupt(vector as usize);
+
+    // The boot timer is normally IRQ0 / vector 32.  Acknowledge the
+    // legacy 8259 PIC so a pending timer interrupt is not held forever.
+    if vector == irq::TIMER as u64 {
+        unsafe {
+            core::arch::asm!(
+                "mov dx, 0x20",
+                "mov al, 0x20",
+                "out dx, al",
+                options(nostack, preserves_flags),
+            );
+        }
+    }
 }
 
 /// Trigger a software interrupt (syscall)

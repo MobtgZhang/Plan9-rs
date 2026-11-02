@@ -103,6 +103,10 @@ pub unsafe fn frame_init_from_bootinfo(boot: &BootInfo) {
     // Reserve the kernel image + boot stack + page-table pool.
     reserve_kernel_image();
 
+    // Reserve the boot heap region so the frame allocator never hands out
+    // frames that the global bump allocator is using.
+    reserve_range(crate::heap::BOOT_HEAP_START, crate::heap::BOOT_HEAP_END);
+
     // Reserve any GRUB-loaded modules so we never hand out their pages.
     for i in 0..boot.modules.count as usize {
         if let Some(m) = &boot.modules.entries[i] {

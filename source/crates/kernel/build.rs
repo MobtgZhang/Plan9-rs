@@ -14,19 +14,19 @@ fn main() {
     // crate's `src/`.
     let src_dir = manifest_dir.join("src");
 
-    // Compile the kernel assembly entry and the IDT stubs.
+    // Compile the kernel assembly entry.  The IDT/exception stubs live in
+    // the `plan9-arch` crate (idt_asm.S); compiling an identical copy here
+    // would produce duplicate global symbols at link time.
     cc::Build::new()
         .include(src_dir.as_path())
         .flag("-m64")
         .flag("-c")
         .file(manifest_dir.join("src/arch/x86_64/boot.S"))
-        .file(manifest_dir.join("src/arch/x86_64/idt_asm.S"))
         .target("x86_64-unknown-none")
         .opt_level(0)
         .compile("kernel_asm");
 
     println!("cargo:rerun-if-changed=src/arch/x86_64/boot.S");
-    println!("cargo:rerun-if-changed=src/arch/x86_64/idt_asm.S");
     println!("cargo:rerun-if-changed=src/arch/x86_64/multiboot2_constants.S");
     println!("cargo:rerun-if-changed=kernel-x86_64.ld");
     println!("cargo:rerun-if-changed=build.rs");

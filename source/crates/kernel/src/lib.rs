@@ -44,11 +44,17 @@ pub mod block;
 pub mod vfs;
 pub mod procfs;
 
+// Root filesystem and boot archive
+pub mod rootfs;
+pub mod cpio;
+
 // Devices
 pub mod cons;
 pub mod dev;
 pub mod devpipe;
 pub mod devsd;
+pub mod devfs;
+pub mod storage_backend;
 pub mod devuart;
 pub mod devmouse;
 pub mod devkb;
@@ -59,6 +65,8 @@ pub mod devtls;
 pub mod devbridge;
 pub mod devusb;
 pub mod devsrv;
+pub mod netfs;
+pub mod netdrv;
 
 // Graphics
 pub mod vga;

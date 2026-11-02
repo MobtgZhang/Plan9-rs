@@ -25,7 +25,11 @@ use crate::plan9_common::sync::Spinlock;
 use crate::frame_alloc;
 
 /// Where the user-mode ELF gets mapped.  Plan 9-style non-PIE userspace.
-const USER_LOAD_BASE: u64 = 0x0000_0000_0040_0000; // 4 MiB
+/// User programs are linked at 0x200000 (the kernel's linker base), so we
+/// relocate the whole image uniformly to 1 GiB (USER_BASE).  This keeps the
+/// kernel's low identity mapping (0..64 MiB) intact in the user PML4 and
+/// prevents user program pages from overwriting kernel code/IDT/GDT pages.
+const USER_LOAD_BASE: u64 = 0x0000_0000_4000_0000;
 
 /// Where the user stack lives.
 const USER_STACK_TOP:  u64 = 0x0000_7FFF_FFFF_F000;
@@ -36,6 +40,7 @@ const USER_STACK_SIZE:  u64 = USER_STACK_PAGES * PAGESIZE as u64;
 const PTE_PRESENT:  u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_USER:     u64 = 1 << 2;
+const PTE_PS:       u64 = 1 << 7;   // 2 MiB / 1 GiB huge-page bit
 const PTE_NX:       u64 = 1 << 63;
 
 /// ELF64 program header types we care about.
@@ -92,22 +97,41 @@ pub fn load_init(boot: &BootInfo) -> Option<InitImage> {
     unsafe {
         let base = module.start as *const u8;
         if core::slice::from_raw_parts(base, 4) != b"\x7FELF" {
+            crate::serial::put_bytes(b"[init_loader] module is not ELF\n");
             return None;
         }
     }
 
+    crate::serial::put_bytes(b"[init_loader] module start=");
+    crate::serial::put_hex_u64(module.start);
+    crate::serial::put_bytes(b" end=");
+    crate::serial::put_hex_u64(module.end);
+    crate::serial::put_bytes(b"\n");
+
     // Allocate a fresh PML4 and populate it with copies of the kernel
     // mappings from the boot PML4 (so the kernel can keep servicing
     // interrupts and page faults).
+    crate::serial::put_bytes(b"[init_loader] allocating pml4 frame\n");
     let new_pml4 = frame_alloc::frame_alloc_zeroed()?;
-    // Mirror the kernel PML4 entries above PML4[256].
+    crate::serial::put_bytes(b"[init_loader] pml4=");
+    crate::serial::put_hex_u64(new_pml4.as_u64());
+    crate::serial::put_bytes(b"\n");
+    // Mirror the kernel PML4 entries above PML4[256], but build a
+    // dedicated low-half PDPT for the user address space so the user
+    // region does not collide with GRUB's huge identity mappings.
     unsafe {
-        copy_kernel_pml4_into(new_pml4);
+        if copy_kernel_pml4_into(new_pml4).is_none() {
+            crate::serial::put_bytes(b"[init_loader] PML4 mirror failed\n");
+            return None;
+        }
     }
 
     // Allocate a user stack.
     let stack_top = USER_STACK_TOP;
     let stack_base = stack_top - USER_STACK_SIZE + PAGESIZE as u64;
+    crate::serial::put_bytes(b"[init_loader] stack_base=");
+    crate::serial::put_hex_u64(stack_base);
+    crate::serial::put_bytes(b"\n");
     unsafe {
         for page in 0..USER_STACK_PAGES {
             let phys = match frame_alloc::frame_alloc_zeroed() {
@@ -115,13 +139,19 @@ pub fn load_init(boot: &BootInfo) -> Option<InitImage> {
                 None => return None,
             };
             let vaddr = stack_base + page * PAGESIZE as u64;
-            map_user_page(new_pml4, vaddr, phys.as_u64(),
-                          PTE_PRESENT | PTE_WRITABLE | PTE_USER)?;
+            if map_user_page(new_pml4, vaddr, phys.as_u64(),
+                             PTE_PRESENT | PTE_WRITABLE | PTE_USER).is_none() {
+                crate::serial::put_bytes(b"[init_loader] stack map failed\n");
+                return None;
+            }
         }
     }
 
     // Parse the ELF program headers and map each PT_LOAD segment.
     let entry = unsafe { map_elf_segments(new_pml4, module)? };
+    crate::serial::put_bytes(b"[init_loader] entry=");
+    crate::serial::put_hex_u64(entry);
+    crate::serial::put_bytes(b"\n");
 
     Some(InitImage {
         pml4:    new_pml4,
@@ -138,7 +168,7 @@ pub fn load_init(boot: &BootInfo) -> Option<InitImage> {
 /// half and the kernel half. Keyed by (pml4_phys, virt_addr).
 static TABLE_CACHE: Spinlock<Vec<u64>> = Spinlock::new(Vec::new());
 
-unsafe fn alloc_pte_page(pml4: PhysAddr) -> Option<u64> {
+pub unsafe fn alloc_pte_page(_pml4: PhysAddr) -> Option<u64> {
     frame_alloc::frame_alloc_zeroed().map(|p| p.as_u64())
 }
 
@@ -152,7 +182,11 @@ fn virt_indices(vaddr: u64) -> (usize, usize, usize, usize) {
 
 /// Map a single 4 KiB user page. Allocates intermediate page tables on
 /// demand.
-unsafe fn map_user_page(
+///
+/// Intermediate entries may already contain huge (2 MiB or 1 GiB) mappings
+/// inherited from GRUB.  A huge PDE cannot be used as a table pointer, so
+/// replace it with a fresh, dedicated page table before writing the 4 KiB PTE.
+pub unsafe fn map_user_page(
     pml4: PhysAddr,
     vaddr: u64,
     paddr: u64,
@@ -170,51 +204,164 @@ unsafe fn map_user_page(
         write_pte(pml4_base, i4, new | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
         new
     };
+
     let pdpte = read_pte(pdpt_phys, i3);
-    let pd_phys = if pdpte & PTE_PRESENT != 0 {
+    let pd_phys = if (pdpte & PTE_PRESENT) != 0 && (pdpte & PTE_PS) == 0 {
         pdpte & 0x000F_FFFF_FFFF_F000
     } else {
+        // Allocate a fresh PD, replacing either a missing entry or a 1 GiB
+        // huge-page entry.
         let new = alloc_pte_page(pml4)?;
         write_pte(pdpt_phys, i3, new | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
         new
     };
+
     let pde = read_pte(pd_phys, i2);
-    let pt_phys = if pde & PTE_PRESENT != 0 {
+    let pt_phys = if (pde & PTE_PRESENT) != 0 && (pde & PTE_PS) == 0 {
         pde & 0x000F_FFFF_FFFF_F000
     } else {
+        // Allocate a fresh PT, replacing either a missing entry or a 2 MiB
+        // huge-page entry.
         let new = alloc_pte_page(pml4)?;
         write_pte(pd_phys, i2, new | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
         new
     };
+
     write_pte(pt_phys, i1, paddr | flags);
     let mut cache = TABLE_CACHE.lock();
     cache.push(pt_phys);
     Some(())
 }
 
-unsafe fn read_pte(table: u64, index: usize) -> u64 {
+pub unsafe fn read_pte(table: u64, index: usize) -> u64 {
     let ptr = table as *const u64;
     core::ptr::read_volatile(ptr.add(index))
 }
 
-unsafe fn write_pte(table: u64, index: usize, val: u64) {
+pub unsafe fn write_pte(table: u64, index: usize, val: u64) {
     let ptr = table as *mut u64;
     core::ptr::write_volatile(ptr.add(index), val);
 }
 
-/// Copy the high-half PML4 entries (kernel mirror) from the boot PML4 to
-/// the new PML4 so the kernel can still service page faults.
-unsafe fn copy_kernel_pml4_into(new_pml4: PhysAddr) {
+/// Copy the kernel PML4 mappings from the boot PML4 to the new PML4.
+///
+/// The kernel's low identity mapping (0..1 GiB, PDPT slot 0) is preserved so
+/// kernel code, IDT, GDT, stacks and trap handlers remain addressable while
+/// running in user mode.  A *new* PDPT page is created, and its slot 1 is
+/// populated with a fresh PD reserved for the relocated user program
+/// (USER_BASE = 1 GiB).  This avoids reusing GRUB's huge 2 MiB PDEs, which
+/// would otherwise make `map_user_page` treat a huge mapping as a PT pointer.
+/// The high canonical kernel mirror (PML4[256..511]) is copied verbatim.
+pub unsafe fn copy_kernel_pml4_into(new_pml4: PhysAddr) -> Option<()> {
     // Read the boot PML4 from CR3.
     let boot_pml4: u64;
     core::arch::asm!("mov {0}, cr3", out(reg) boot_pml4);
     let boot = boot_pml4 & 0x000F_FFFF_FFFF_F000;
     let dst = new_pml4.as_u64();
-    // Copy entries 256..=511 verbatim.
+
+    let boot_low = read_pte(boot, 0);
+    if (boot_low & PTE_PRESENT) == 0 {
+        return None;
+    }
+    let boot_pdpt = boot_low & 0x000F_FFFF_FFFF_F000;
+
+    // Keep the kernel's 0..1 GiB identity map (PDPT slot 0) but do not
+    // reuse the boot PDPT page itself; slot 1 belongs to the user image.
+    let new_pdpt = alloc_pte_page(new_pml4)?;
+    let low_pdpt0 = read_pte(boot_pdpt, 0);
+    if (low_pdpt0 & PTE_PRESENT) == 0 {
+        return None;
+    }
+    write_pte(new_pdpt, 0, low_pdpt0);
+
+    // Preserve the boot kernel's PCI/MMIO mapping at PDPT slot 2
+    // (0x80000000..0xBFFFFFFF).  Without this, the AHCI BAR at
+    // 0x810c4000 is unavailable while a syscall runs in the user PML4,
+    // and filesystem reads fault after user mode starts.
+    let low_pdpt2 = read_pte(boot_pdpt, 2);
+    if (low_pdpt2 & PTE_PRESENT) != 0 {
+        write_pte(new_pdpt, 2, low_pdpt2);
+    }
+
+    // Dedicated PD for the user region 1..2 GiB.  Slot 1 is not inherited
+    // from GRUB, so no huge 2 MiB PDEs can appear there.
+    let new_pd = alloc_pte_page(new_pml4)?;
+    write_pte(new_pdpt, 1, new_pd | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+
+    write_pte(dst, 0, new_pdpt | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+
+    // High-half kernel mirror.
     for i in 256..512 {
         let v = read_pte(boot, i);
         write_pte(dst, i, v);
     }
+
+    Some(())
+}
+
+/// Copy the parent's user-space mappings (virtual addresses >= USER_LOAD_BASE)
+/// into a new child PML4.  Every mapped data page is copied to a fresh
+/// physical frame, and new page-table pages are allocated for the child, so
+/// exec/write in the child cannot modify the parent's image or stack.
+pub unsafe fn copy_user_mappings(parent_pml4: u64, child_pml4: PhysAddr) -> Option<()> {
+    let page_size = PAGESIZE as usize;
+
+    for i4 in 0..256usize {
+        let pml4e = read_pte(parent_pml4, i4);
+        if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
+            continue;
+        }
+        let pdpt = pml4e & 0x000F_FFFF_FFFF_F000;
+
+        for i3 in 0..512usize {
+            let pdpte = read_pte(pdpt, i3);
+            if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
+                continue;
+            }
+            let pd = pdpte & 0x000F_FFFF_FFFF_F000;
+
+            for i2 in 0..512usize {
+                let pde = read_pte(pd, i2);
+                if pde & PTE_PRESENT == 0 || pde & PTE_PS != 0 {
+                    continue;
+                }
+                let pt = pde & 0x000F_FFFF_FFFF_F000;
+
+                for i1 in 0..512usize {
+                    let pte = read_pte(pt, i1);
+                    if pte & PTE_PRESENT == 0 || pte & PTE_PS != 0 {
+                        continue;
+                    }
+
+                    let vaddr = ((i4 as u64) << 39)
+                        | ((i3 as u64) << 30)
+                        | ((i2 as u64) << 21)
+                        | ((i1 as u64) << 12);
+                    if vaddr < USER_LOAD_BASE {
+                        continue;
+                    }
+
+                    let flags = pte & 0xFFF;
+                    let parent_frame = pte & 0x000F_FFFF_FFFF_F000;
+
+                    let new_frame = match frame_alloc::frame_alloc_zeroed() {
+                        Some(f) => f,
+                        None => return None,
+                    };
+
+                    let src = parent_frame as *const u8;
+                    let dst = new_frame.as_u64() as *mut u8;
+                    core::ptr::copy_nonoverlapping(src, dst, page_size);
+
+                    if map_user_page(child_pml4, vaddr, new_frame.as_u64(), flags).is_none() {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    Some(())
 }
 
 /// Walk the ELF program headers and map every PT_LOAD segment into the
@@ -246,7 +393,77 @@ unsafe fn map_elf_segments(pml4: PhysAddr, module: &crate::entry::RawModuleInfo)
     let phoff = ehdr.e_phoff as usize;
     let phnum = ehdr.e_phnum as usize;
     let phsize = ehdr.e_phentsize as usize;
-    let entry = ehdr.e_entry;
+    let entry = ehdr.e_entry + USER_LOAD_BASE;
+
+    // Relocate absolute pointers stored in `.got`.  The ELF is linked at
+    // 0x200000 (the kernel's linker base) but mapped at USER_LOAD_BASE.
+    // RIP-relative displacements naturally relocate with the code, but GOT
+    // entries contain absolute target addresses and must be shifted manually.
+    unsafe {
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        struct Shdr64 {
+            sh_name:      u32,
+            sh_type:      u32,
+            sh_flags:     u64,
+            sh_addr:      u64,
+            sh_offset:    u64,
+            sh_size:      u64,
+            sh_link:      u32,
+            sh_info:      u32,
+            sh_addralign: u64,
+            sh_entsize:   u64,
+        }
+
+        let shoff = ehdr.e_shoff as usize;
+        let shnum = ehdr.e_shnum as usize;
+        let shsize = ehdr.e_shentsize as usize;
+        let shstrndx = ehdr.e_shstrndx as usize;
+
+        if shoff != 0 && shnum != 0 && shstrndx < shnum {
+            let shstr_sh = (base as usize + shoff + shstrndx * shsize) as *const Shdr64;
+            let shstr = *shstr_sh;
+            let strtab = (base as usize + shstr.sh_offset as usize) as *const u8;
+            let strtab_len = shstr.sh_size as usize;
+
+            for i in 0..shnum {
+                let sh = *((base as usize + shoff + i * shsize) as *const Shdr64);
+                let name_ptr = (strtab as usize + sh.sh_name as usize) as *const u8;
+                let mut name_len = 0usize;
+                while name_len < strtab_len {
+                    let b = *name_ptr.add(name_len);
+                    if b == 0 { break; }
+                    name_len += 1;
+                }
+                let name = core::str::from_utf8(
+                    core::slice::from_raw_parts(name_ptr, name_len)
+                ).unwrap_or("");
+
+                if (name == ".got" || name == ".data.rel.ro") && sh.sh_size >= 8 {
+                    let off = sh.sh_offset as usize;
+                    let nwords = sh.sh_size as usize / 8;
+                    for w in 0..nwords {
+                        let p = (base as usize + off + w * 8) as *mut u64;
+                        let val = *p;
+                        // Relocate only absolute low-image pointers.  The
+                        // .data.rel.ro section also contains small integers
+                        // and packed table fields that must stay unchanged.
+                        if val >= crate::segment::USER_IMAGE_BASE
+                            && val < crate::segment::USER_IMAGE_LIMIT
+                        {
+                            *p = val + USER_LOAD_BASE;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    crate::serial::put_bytes(b"[map_elf] phnum=");
+    crate::serial::put_hex_u32(phnum as u32);
+    crate::serial::put_bytes(b" entry=");
+    crate::serial::put_hex_u64(entry);
+    crate::serial::put_bytes(b"\n");
 
     let mut loaded = false;
     for i in 0..phnum {
@@ -254,38 +471,42 @@ unsafe fn map_elf_segments(pml4: PhysAddr, module: &crate::entry::RawModuleInfo)
         let ph = *ph_ptr;
         if ph.p_type != PT_LOAD { continue; }
         loaded = true;
+        crate::serial::put_bytes(b"[map_elf] segment vaddr=");
+        crate::serial::put_hex_u64(ph.p_vaddr + USER_LOAD_BASE);
+        crate::serial::put_bytes(b" memsz=");
+        crate::serial::put_hex_u64(ph.p_memsz);
+        crate::serial::put_bytes(b"\n");
 
-        // Round down the start of the mapping to a page boundary.
-        let seg_start_vaddr = ph.p_vaddr;
-        let seg_end_vaddr   = ph.p_vaddr + ph.p_memsz;
-        let file_off_start  = ph.p_offset;
-        let file_off_end    = ph.p_offset + ph.p_filesz;
+        // Relocate the whole segment uniformly into the user half.
+        let seg_start_vaddr = ph.p_vaddr + USER_LOAD_BASE;
+        let seg_end_vaddr   = ph.p_vaddr + USER_LOAD_BASE + ph.p_memsz;
+        let data_end_vaddr  = seg_start_vaddr + ph.p_filesz;
 
         let mut cur_vaddr = seg_start_vaddr & !(PAGESIZE as u64 - 1);
-        let mut cur_off   = file_off_start.saturating_sub(
-            seg_start_vaddr - cur_vaddr
-        );
 
         while cur_vaddr < seg_end_vaddr {
             let phys = frame_alloc::frame_alloc_zeroed()?;
-            // Copy file bytes for this page (if any).
-            if cur_off < file_off_end {
-                let page_file_end = core::cmp::min(
-                    cur_off + PAGESIZE as u64,
-                    file_off_end,
-                );
-                let copy_len = (page_file_end - cur_off) as usize;
-                let src = (base as usize + cur_off as usize) as *const u8;
-                let dst = crate::plan9_arch::x86_64::paging::phys_to_virt(phys).as_mut_ptr::<u8>();
+            let page_end = cur_vaddr + PAGESIZE as u64;
+
+            // Copy only the portion of this page that has file data.  Bytes
+            // before the segment start (or after p_filesz) stay zero.
+            let copy_start = core::cmp::max(cur_vaddr, seg_start_vaddr);
+            let copy_end   = core::cmp::min(page_end, data_end_vaddr);
+            if copy_start < copy_end {
+                let dst_off = (copy_start - cur_vaddr) as usize;
+                let file_off = ph.p_offset + (copy_start - seg_start_vaddr);
+                let copy_len = (copy_end - copy_start) as usize;
+                let src = (base as usize + file_off as usize) as *const u8;
+                let dst = (phys.as_u64() as *mut u8).add(dst_off);
                 core::ptr::copy_nonoverlapping(src, dst, copy_len);
             }
+
             // Build PTE flags from program-header flags.
             let mut flags = PTE_PRESENT | PTE_USER;
             if ph.p_flags & 0x2 != 0 { flags |= PTE_WRITABLE; }
             if ph.p_flags & 0x1 == 0 { flags |= PTE_NX; }
             map_user_page(pml4, cur_vaddr, phys.as_u64(), flags)?;
             cur_vaddr += PAGESIZE as u64;
-            cur_off   += PAGESIZE as u64;
         }
     }
 

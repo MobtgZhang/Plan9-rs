@@ -15,7 +15,8 @@ const O_RDONLY: u32 = 0;
 const O_WRONLY: u32 = 1;
 
 fn print(s: &str) {
-    puts(s.as_ptr());
+    let (_, buf) = cstr(s);
+    puts(buf.as_ptr());
 }
 
 fn println(s: &str) {
@@ -42,7 +43,12 @@ fn open_console() -> i64 {
 }
 
 fn write_str(fd: i64, s: &str) {
-    write(fd, s.as_ptr(), s.len());
+    // Copy the string into a user-stack buffer before passing it to the
+    // kernel.  Static string literals live in the ELF image at a low linker
+    // address, but the image is mapped at USER_BASE; passing `s.as_ptr()`
+    // directly would make the kernel read unrelated kernel memory.
+    let (n, buf) = cstr(s);
+    write(fd, buf.as_ptr(), n);
 }
 
 fn main() -> ! {
@@ -56,17 +62,23 @@ fn main() -> ! {
     // Try to exec `/rc/bin/rc` first (Plan 9 bootstrap split: init
     // is just a loader, the boot script lives in `rc`). Falls back
     // to the built-in shell if `rc` cannot be executed.
-    let (n, path_buf) = cstr("/rc/bin/rc");
-    let argv_arr: [*const u8; 1] = [path_buf.as_ptr()];
-    let pid = fork();
-    if pid == 0 {
-        // Child: exec the rc script.
-        exec(path_buf.as_ptr(), argv_arr.as_ptr(), 1);
-        // exec failed: exit so init's parent loop continues.
-        exit(127);
-    } else if pid > 0 {
-        // Parent: wait for rc, then continue with the shell fallback.
-        let _ = wait(pid as i32);
+    //
+    // For now the built-in shell starts immediately; rc/bash exec can be
+    // enabled once the exec path is validated.
+    let run_rc = true;
+    if run_rc {
+        let (_n, path_buf) = cstr("/rc/bin/rc");
+        let argv_arr: [*const u8; 2] = [path_buf.as_ptr(), core::ptr::null()];
+        let pid = fork();
+        if pid == 0 {
+            // Child: exec the rc script.
+            exec(path_buf.as_ptr(), argv_arr.as_ptr(), 1);
+            // exec failed: exit so init's parent loop continues.
+            exit(127);
+        } else if pid > 0 {
+            // Parent: wait for rc, then continue with the shell fallback.
+            let _ = wait(pid as i32);
+        }
     }
 
     let con_fd = open_console();
@@ -77,23 +89,34 @@ fn main() -> ! {
 
     loop {
         print_prompt();
-        // Read one byte at a time.
+
+        // Read an entire available line in one syscall.  Reading one byte at a
+        // time can leave the UART FIFO holding the rest of the line, and the
+        // shell then spins on an empty read.  Accumulating a partial line also
+        // handles a byte stream that arrives in smaller chunks.
         let mut idx = 0usize;
-        loop {
-            let n = read(0, &mut input[idx], 1);
+        let mut complete = false;
+        while idx < input.len() {
+            let buf_ptr = unsafe { input.as_mut_ptr().add(idx) };
+            let n = read(0, buf_ptr, input.len() - idx);
             if n <= 0 {
                 yield_cpu();
                 continue;
             }
-            let b = input[idx];
-            if b == b'\n' || b == b'\r' {
+
+            idx += n as usize;
+
+            if let Some(pos) = input[..idx]
+                .iter()
+                .position(|&b| b == b'\n' || b == b'\r')
+            {
+                input[pos] = b'\n';
+                idx = pos;
+                complete = true;
                 break;
             }
-            if idx + 1 < input.len() {
-                idx += 1;
-            }
         }
-        if idx == 0 {
+        if !complete {
             continue;
         }
 
@@ -112,18 +135,23 @@ fn main() -> ! {
         if cmd == "help" {
             cmd_help();
         } else if let Some(rest) = cmd.strip_prefix("echo ") {
-            write_str(con_fd, rest);
-            write_str(con_fd, "\n");
+            write_str(1, rest);
+            write_str(1, "\n");
         } else if cmd == "echo" {
-            write_str(con_fd, "\n");
+            write_str(1, "\n");
         } else if cmd == "ls" {
             cmd_ls("/");
         } else if let Some(path) = cmd.strip_prefix("cat ") {
             cmd_cat(path.trim());
         } else if cmd == "pwd" {
-            write_str(con_fd, "/\n");
+            write_str(1, "/\n");
         } else if cmd == "ps" {
             cmd_ps();
+        } else if cmd == "getpid" {
+            let pid = getpid();
+            let mut b = [0u8; 16];
+            let text = format_u64(pid as u64, &mut b);
+            println(text);
         } else if cmd == "exit" {
             print("goodbye\n");
             exit(0);
@@ -134,7 +162,8 @@ fn main() -> ! {
         } else if cmd == "fork" {
             let p = fork();
             if p == 0 {
-                print("[init] child\n");
+                write_str(1, "[init] child\n");
+                exit(0);
             } else {
                 print("[init] forked pid=");
                 let mut b = [0u8; 16];
@@ -284,9 +313,32 @@ fn parse_u64(s: &str) -> usize {
     value
 }
 
-/// Panic handler: halt on any panic.
+/// Simple serial writer for formatting panic messages.
+struct PanicWriter;
+impl core::fmt::Write for PanicWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        write_str(1, s);
+        Ok(())
+    }
+}
+
+/// Panic handler: report the source location and message, then halt.
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    write_str(1, "[user panic] ");
+    if let Some(loc) = info.location() {
+        write_str(1, loc.file());
+        write_str(1, ":");
+        let mut b = [0u8; 16];
+        let s = format_u64(loc.line() as u64, &mut b);
+        write_str(1, s);
+    } else {
+        write_str(1, "unknown");
+    }
+    write_str(1, " ");
+    let mut out = PanicWriter;
+    let _ = core::fmt::write(&mut out, format_args!("{}", info.message()));
+    write_str(1, "\n");
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, preserves_flags)) }
     }

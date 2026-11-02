@@ -154,8 +154,8 @@ static DELAYED_SCHEDS: Mutex<u64> = Mutex::new(0);
 pub struct Scheduler {
     /// Run queues for each priority level (each with its own lock)
     run_queues: [LockedRunQueue; NPRIQ],
-    /// Process table
-    procs: ProcTable,
+    /// Process table (also exposed as the global Plan 9 process table)
+    pub procs: ProcTable,
     /// Lock for scheduler operations
     lock: Spinlock<()>,
     /// Scheduler ticks counter
@@ -220,10 +220,19 @@ impl Scheduler {
         proc.basepri = PRI_KPROC;
         proc.set_text(b"idle");
         proc.kstack_size = KSTACK_SIZE;
+
+        // Create the descriptor/namespace/environment groups for the idle
+        // process.  The user-mode `init` runs with this process context, so
+        // syscalls such as open/read/write have a valid file-descriptor group.
+        proc.fork_groups(None, 0);
         
         let proc_owned: &'static mut Proc = Box::leak(proc);
         let proc_ptr: *mut Proc = proc_owned;
         self.procs.add(unsafe { Box::from_raw(proc_ptr) });
+
+        // Make the idle process the current process so kernel syscalls have
+        // a valid context when user mode is entered.
+        set_curproc(proc_owned);
 
         let p = unsafe { &*proc_ptr };
         let idx = (PRI_KPROC as usize).min(NPRIQ - 1);
@@ -364,7 +373,7 @@ impl Scheduler {
         }
 
         // === Handle current process state ===
-        if let Some(cur) = prev.take() {
+        if let Some(cur) = prev {
             let cur_ptr: *mut Proc = core::ptr::addr_of!(*cur) as *mut Proc;
             let cur_state = unsafe { (*cur_ptr).state };
             match cur_state {
@@ -376,16 +385,19 @@ impl Scheduler {
                     self.ready(unsafe { &mut *cur_ptr });
                 }
                 State::Moribund => {
-                    // Process is exiting
+                    // Process is exiting.  Do not save/restore a dead context.
                     unsafe {
                         self.proc_exit(&mut *cur_ptr);
                     }
+                    prev = None;
                 }
                 State::Dead => {
                     // Already dead, just clean up
+                    prev = None;
                 }
                 _ => {
-                    // For other states (sleeping, etc.), don't requeue
+                    // For other states (sleeping, waiting, etc.), don't requeue
+                    // but keep the kernel context so it can be restored later.
                 }
             }
         }
@@ -417,8 +429,8 @@ impl Scheduler {
             set_curproc(&mut *next_ptr);
             self.switches += 1;
 
-            // Perform context switch
-            let prev_ref = prev.take().map(|p| {
+            // Perform context switch, preserving the previous kernel context.
+            let prev_ref = prev.map(|p| {
                 let p_mut = core::ptr::addr_of!(*p) as *mut Proc;
                 &mut *p_mut
             });
@@ -591,13 +603,9 @@ impl Scheduler {
     /// The context switching uses the Plan 9 style setjmp/longjmp mechanism
     /// implemented in context.rs with inline assembly for x86_64.
     fn context_switch(&mut self, prev: Option<&mut Proc>, next: &'static Proc) {
-        // Step 1: Switch page table for the next process
-        // This must be done before saving context to ensure we use the right page table
-        if next.mmupdb.as_u64() != 0 {
-            switch_page_table(next.mmupdb);
-        }
-
-        // Step 2: Save previous process context (if it exists and isn't exiting)
+        // Step 1: Save previous process context under the current page table.
+        // The kernel stack is identity-mapped in both address spaces, but
+        // saving before the CR3 change keeps the context location valid.
         // We use setjmp to save the current position. If it returns 0,
         // we just saved and will continue. If it returns 1, we were restored
         // by another process calling longjmp.
@@ -621,15 +629,19 @@ impl Scheduler {
             }
         }
 
+        // Step 2: Switch page table for the next process.
+        if next.mmupdb.as_u64() != 0 {
+            switch_page_table(next.mmupdb);
+        }
+
         // Step 3: Set current process pointer
         // This must be done before restoring the next process's context
         // SAFETY: We're transferring control to next, so it's safe to get mutable access
         set_curproc(unsafe { &mut *(core::ptr::addr_of!(*next) as *mut Proc) });
 
-        // Step 4: Restore next process context
-        // If the next process has a saved context (has run before),
-        // we switch to it. If not, this is its first run and we
-        // just continue from here.
+        // Step 4: Restore next process context.
+        // A saved kernel context (blocked syscall) takes precedence over a
+        // saved user frame; otherwise resume ring-3 execution directly.
         if next.sched.is_set() {
             // Convert proc Label to Context and switch
             unsafe {
@@ -662,6 +674,19 @@ impl Scheduler {
                     in("rdi") &ctx as *const Context as u64,
                     options(noreturn),
                 );
+            }
+        } else if let Some(frame) = next.user_frame.as_ref() {
+            // First run (or a non-blocked user process): resume its ring-3
+            // frame directly.
+            let pml4 = next.mmupdb.as_u64();
+            if pml4 != 0 {
+                let frame_ptr = frame as *const crate::proc::SavedUserFrame as u64;
+                unsafe {
+                    crate::plan9_arch::x86_64::switch_to_user::kernel_resume_user(
+                        frame_ptr,
+                        pml4,
+                    );
+                }
             }
         }
         // If new process has no saved context, this is first run
@@ -726,20 +751,9 @@ impl Scheduler {
             self.hzsched();
         }
         
-        // Check if current process exceeded quantum
-        if self.ticks % SCHED_QUANTUM == 0 {
-            if let Some(cur) = self.current_proc {
-                if cur.state == State::Running {
-                    // Get mutable reference using raw pointer
-                    let cur_mut = unsafe { &mut *(core::ptr::addr_of!(*cur) as *mut Proc) };
-                    cur_mut.state = State::Ready;
-                    self.ready(cur);
-                    drop(self.lock.lock());
-                    // Use global scheduler
-                    schedule();
-                }
-            }
-        }
+        // User-mode preemption is not performed in this prototype: switching
+        // from an IRQ stub would need the interrupted user frame to be saved
+        // and resumed, and the shell/fork paths handle their own transitions.
     }
 
     /// Yield CPU - current process voluntarily gives up CPU
@@ -828,25 +842,46 @@ impl Scheduler {
             // Fork process groups based on flags
             proc.fork_groups(Some(p), flags);
 
-            // Handle memory based on flags
+            // Handle memory based on flags.  For ordinary fork we make a
+            // separate PML4 with copied kernel mappings and a deep copy of
+            // the parent's user pages, so exec/write in the child cannot
+            // overwrite the parent's image or stack.
             if flags & rfork::FLAGFMEM == 0 {
-                // COW fork - create new page table with copy-on-write
-                // Create a new page table for the child
-                if !proc.setup_page_table() {
-                    return None;
-                }
-
-                // Set up COW mappings for the child
-                // This marks parent's pages as read-only (COW)
-                // and creates corresponding entries in child's page table
-                use crate::fault::setup_cow_for_fork;
-                if let Err(_) = setup_cow_for_fork(&mut proc, p) {
-                    // COW setup failed, but we can continue without it
-                    // In a full implementation, we would clean up and return None
+                if p.mmupdb.as_u64() != 0 {
+                    let child_pml4 = match crate::frame_alloc::frame_alloc_zeroed() {
+                        Some(f) => f,
+                        None => return None,
+                    };
+                    crate::serial::put_hex_u64(child_pml4.as_u64());
+                    crate::serial::put_bytes(b"\n");
+                    unsafe {
+                        if crate::init_loader::copy_kernel_pml4_into(child_pml4).is_none() {
+                                return None;
+                        }
+                            if crate::init_loader::copy_user_mappings(
+                            p.mmupdb.as_u64(),
+                            child_pml4,
+                        ).is_none() {
+                                return None;
+                        }
+                        }
+                    proc.mmupdb = child_pml4;
+                } else {
+                    if !proc.setup_page_table() {
+                        return None;
+                    }
                 }
             } else {
-                // Share memory - use parent's page table
+                // Share memory - use parent's page table.
                 proc.mmupdb = p.mmupdb;
+            }
+
+            // Copy the parent's ring-3 frame so the child resumes at the
+            // fork syscall return point with RAX = 0.
+            if let Some(parent_frame) = p.user_frame {
+                let mut child_frame = parent_frame;
+                child_frame.rax = 0;
+                proc.user_frame = Some(child_frame);
             }
         } else {
             proc.pri = PRI_NORMAL;
@@ -867,9 +902,10 @@ impl Scheduler {
             proc.kstack = crate::plan9_arch::x86_64::paging::phys_to_virt(kstack_phys).as_u64();
         }
 
-        // Set up initial scheduler context for child
+        // Set up initial scheduler context for child.  A user fork child
+        // resumes through its copied SavedUserFrame instead of a kernel entry.
         let child_entry = entry as u64;
-        if child_entry != 0 {
+        if proc.user_frame.is_none() && child_entry != 0 {
             // Set up context for child to start at entry point
             let stack_top = proc.kstack + KSTACK_SIZE as u64;
 //             use crate::plan9_arch::x86_64::context::Context;

@@ -8,21 +8,28 @@ struct Config {
     cmdline: String,
     output: String,
     iso_mode: bool,
+    modules: Vec<String>,
 }
 
 impl Config {
     fn from_args() -> Self {
         let mut args = env::args().skip(1);
-        
+
         let mut kernel = String::new();
         let mut init = String::new();
         let mut cmdline = String::new();
         let mut output = String::new();
         let mut iso_mode = false;
-        
+        let mut modules: Vec<String> = Vec::new();
+
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--iso" => iso_mode = true,
+                "--module" => {
+                    if let Some(m) = args.next() {
+                        modules.push(m);
+                    }
+                }
                 _ => {
                     if kernel.is_empty() {
                         kernel = arg;
@@ -32,26 +39,51 @@ impl Config {
                         cmdline = arg;
                     } else if output.is_empty() {
                         output = arg;
+                    } else {
+                        modules.push(arg);
                     }
                 }
             }
         }
-        
+
         if kernel.is_empty() || output.is_empty() {
-            eprintln!("Usage: grub-cfg <kernel> <init> <cmdline> <output> [--iso]");
+            eprintln!("Usage: grub-cfg <kernel> <init> <cmdline> <output> [--iso] [--module <path>]...");
             std::process::exit(1);
         }
-        
+
         if init.is_empty() {
             init = "/boot/init".to_string();
         }
-        
-        Config { kernel, init, cmdline, output, iso_mode }
+
+        Config {
+            kernel,
+            init,
+            cmdline,
+            output,
+            iso_mode,
+            modules,
+        }
     }
 }
 
-fn build_grub_config(kernel_path: &str, init_path: &str, cmdline: &str, iso_mode: bool) -> String {
-    // For ISO mode, we use GOP/graphics. For ESP mode, we can use serial.
+fn build_grub_config(
+    kernel_path: &str,
+    init_path: &str,
+    module_paths: &[String],
+    cmdline: &str,
+    iso_mode: bool,
+) -> String {
+    let modules = module_paths
+        .iter()
+        .map(|m| {
+            let name = Path::new(m)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(m);
+            format!("    module2 {} {}\n", m, name)
+        })
+        .collect::<String>();
+
     if iso_mode {
         format!(
 r#"# Plan 9 GRUB Configuration
@@ -61,30 +93,24 @@ set default=0
 set timeout=5
 
 menuentry "Plan 9 from Bell Labs" {{
-    # Load necessary modules for GOP graphics
     insmod part_gpt
     insmod fat
     insmod efi_gop
-    insmod efi_uga
     insmod video_fb
 
-    # Set video mode before loading kernel (GOP)
-    # Try common resolutions, prefer graphics
     set gfxmode=1024x768
     set gfxpayload=keep
 
-    # Load kernel with Multiboot2 and pass command line as arguments
     multiboot2 {kernel_path} {cmdline}
 
-    # Load init process as a module (GRUB creates MODULE tag)
-    module2 {init_path}
-
-    # Boot
+    module2 {init_path} init
+{modules}
     boot
 }}
 "#,
             kernel_path = kernel_path,
             init_path = init_path,
+            modules = modules,
             cmdline = cmdline
         )
     } else {
@@ -96,34 +122,28 @@ set default=0
 set timeout=5
 
 menuentry "Plan 9 from Bell Labs" {{
-    # Load necessary modules for GOP graphics
     insmod part_gpt
     insmod fat
     insmod efi_gop
-    insmod efi_uga
     insmod video_fb
 
-    # Enable serial for debugging
     serial --unit=0 --speed=115200
     terminal_input serial
     terminal_output serial
 
-    # Set video mode before loading kernel (GOP)
     set gfxmode=1024x768
     set gfxpayload=keep
 
-    # Load kernel with Multiboot2 and pass command line as arguments
     multiboot2 {kernel_path} {cmdline}
 
-    # Load init process as a module (GRUB creates MODULE tag)
-    module2 {init_path}
-
-    # Boot
+    module2 {init_path} init
+{modules}
     boot
 }}
 "#,
             kernel_path = kernel_path,
             init_path = init_path,
+            modules = modules,
             cmdline = cmdline
         )
     }
@@ -131,24 +151,27 @@ menuentry "Plan 9 from Bell Labs" {{
 
 fn main() {
     let config = Config::from_args();
-    
+
     eprintln!("Generating grub.cfg:");
     eprintln!("  kernel: {}", config.kernel);
     eprintln!("  init:   {}", config.init);
     eprintln!("  cmdline: {}", config.cmdline);
     eprintln!("  output: {}", config.output);
     eprintln!("  iso_mode: {}", config.iso_mode);
-    
+    for m in &config.modules {
+        eprintln!("  module: {}", m);
+    }
+
     let kernel_path = Path::new(&config.kernel);
     let kernel_name = kernel_path.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("9kernel.elf");
-    
+
     let init_path = Path::new(&config.init);
     let init_name = init_path.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("init");
-    
+
     let (grub_kernel_path, grub_init_path) = if config.iso_mode {
         (
             format!("/plan9root/boot/{}", kernel_name),
@@ -160,17 +183,32 @@ fn main() {
             format!("/boot/{}", init_name)
         )
     };
-    
-    let content = build_grub_config(&grub_kernel_path, &grub_init_path, &config.cmdline, config.iso_mode);
-    
+
+    let module_paths: Vec<String> = config.modules.iter().map(|m| {
+        let name = Path::new(m).file_name().and_then(|n| n.to_str()).unwrap_or(m);
+        if config.iso_mode {
+            format!("/plan9root/boot/{}", name)
+        } else {
+            format!("/boot/{}", name)
+        }
+    }).collect();
+
+    let content = build_grub_config(
+        &grub_kernel_path,
+        &grub_init_path,
+        &module_paths,
+        &config.cmdline,
+        config.iso_mode,
+    );
+
     let output_path = Path::new(&config.output);
     if let Some(parent) = output_path.parent() {
         if parent.as_os_str().len() > 0 {
             fs::create_dir_all(parent).expect("Failed to create output directory");
         }
     }
-    
+
     fs::write(&config.output, content).expect("Failed to write grub.cfg");
-    
+
     eprintln!("  Written to: {}", config.output);
 }

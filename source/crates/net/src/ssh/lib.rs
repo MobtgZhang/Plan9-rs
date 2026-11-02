@@ -8,8 +8,8 @@
 extern crate alloc;
 
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
-use alloc::sync::Arc;
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -418,7 +418,7 @@ impl SshPacket {
         
         let length = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
         let padding_length = data[4];
-        let payload_length = length - padding_length as u32 - 1;
+        let payload_length = length - padding_length as usize - 1;
         
         if data.len() < 4 + length as usize {
             return None;

@@ -30,6 +30,11 @@ pub const KERNEL_BASE: u64 = 0xFFFF_8000_0000_0000;
 /// User space base
 pub const USER_BASE: u64 = 0x0000_0000_4000_00;
 
+/// Link-time image range used by the non-PIE user ELFs.  Absolute pointers
+/// found in .got / .data.rel.ro must lie in this range to be relocated.
+pub const USER_IMAGE_BASE: u64 = 0x0000_0000_0020_0000;
+pub const USER_IMAGE_LIMIT: u64 = 0x0000_0000_0030_0000;
+
 /// Stack base (high address, grows down)
 pub const USER_STACK_TOP: u64 = MAX_VADDR;
 pub const USER_STACK_BASE: u64 = MAX_VADDR - (8 * 1024 * 1024);

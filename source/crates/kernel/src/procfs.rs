@@ -478,9 +478,9 @@ impl Dev for ProcFsDev {
             return Ok(Some(Qid::new(0, 0, qidtype::DIR)));
         }
         
-        // Try to find a process with this PID
+        // Try to find a process with this PID in the scheduler table.
         if let Ok(pid) = name.parse::<i32>() {
-            if PROCESS_TABLE.get(pid).is_some() {
+            if Self::real_proc(pid).is_some() {
                 let path = proc_qid(pid, ProcQid::None);
                 return Ok(Some(Qid::new(path, 0, qidtype::DIR)));
             }
@@ -498,10 +498,10 @@ impl Dev for ProcFsDev {
         }
         
         let pid = Self::get_pid(ch).ok_or(DevError::Enoent)?;
-        if PROCESS_TABLE.get(pid).is_none() {
+        if Self::real_proc(pid).is_none() {
             return Err(DevError::Enoent);
         }
-        
+
         Ok(())
     }
     
@@ -615,6 +615,30 @@ impl Dev for ProcFsDev {
 
 // ProcFS device helper functions
 impl ProcFsDev {
+    /// Find a process in the scheduler's real process table.
+    fn real_proc(pid: i32) -> Option<&'static crate::proc::Proc> {
+        let target = pid as crate::proc::Pid;
+        crate::proc::proctable()
+            .iter()
+            .find(|p| p.pid == target)
+    }
+
+    /// Human-readable state name from the scheduler State enum.
+    fn state_str(state: crate::proc::State) -> &'static str {
+        match state {
+            crate::proc::State::Dead => "Dead",
+            crate::proc::State::Moribund => "Moribund",
+            crate::proc::State::Ready => "Ready",
+            crate::proc::State::Running => "Run",
+            crate::proc::State::Scheding => "Scheding",
+            crate::proc::State::Wakeme => "Wakeme",
+            crate::proc::State::Rendez => "Rendez",
+            crate::proc::State::Wait => "Wait",
+            crate::proc::State::Broken => "Broken",
+            crate::proc::State::Stopped => "Stop",
+        }
+    }
+
     /// Read directory listing
     fn read_dir(_ch: &Chan, buf: &mut [u8], offset: u64) -> Result<usize, DevError> {
         let mut total = 0;
@@ -625,29 +649,22 @@ impl ProcFsDev {
             index = offset as usize;
         }
         
-        // List all processes
-        for entry in &PROCESS_TABLE.entries {
-            if !entry.in_use {
-                continue;
-            }
-            
+        // List processes from the scheduler's real process table.
+        for proc in crate::proc::proctable().iter() {
             if index > 0 {
                 index -= 1;
                 continue;
             }
-            
-            if let Some(ref proc) = entry.proc {
-                // Format: "PID STATE\n"
-                let entry_str = alloc::format!("{}\n", proc.pid);
-                let entry_bytes = entry_str.as_bytes();
-                
-                if total + entry_bytes.len() > buf.len() {
-                    break;
-                }
-                
-                buf[total..total + entry_bytes.len()].copy_from_slice(entry_bytes);
-                total += entry_bytes.len();
+
+            let entry_str = alloc::format!("{}\n", proc.pid);
+            let entry_bytes = entry_str.as_bytes();
+
+            if total + entry_bytes.len() > buf.len() {
+                break;
             }
+
+            buf[total..total + entry_bytes.len()].copy_from_slice(entry_bytes);
+            total += entry_bytes.len();
         }
         
         Ok(total)
@@ -701,12 +718,12 @@ impl ProcFsDev {
     
     /// Read process status
     fn read_status(pid: i32, buf: &mut [u8], _offset: u64) -> Result<usize, DevError> {
-        let proc = PROCESS_TABLE.get(pid).ok_or(DevError::Enoent)?;
-        
+        let proc = Self::real_proc(pid).ok_or(DevError::Enoent)?;
+
         let status_str = alloc::format!(
             "PID\t{}\nState\t{}\n",
             proc.pid,
-            proc.state.as_str()
+            Self::state_str(proc.state)
         );
         
         let status_bytes = status_str.as_bytes();

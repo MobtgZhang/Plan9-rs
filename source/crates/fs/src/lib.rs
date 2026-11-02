@@ -20,11 +20,23 @@ pub mod venti;
 pub mod nfs;
 pub mod webfs;
 pub mod devfs;
+pub mod block;
+pub mod generic;
+pub mod ext;
+pub mod ntfs;
+pub mod xfs;
+pub mod fatimage;
 
 pub use vfs::{Vfs, Channel, MountPoint, Inode, FileType, DirEntry, Result};
 pub use vfs::{FileOperations, DirectoryOperations, VfsOperations};
 pub use vfs::path;
 pub use fat::{FatFileSystem, FatBootSector, FatDirEntry, FatType, FatDevice, FatFile};
+pub use block::{FsBlockReader, read_exact, read_block, le16, le32, le64, be16, be32, be64};
+pub use generic::{Filesystem, FsNode, plan9_mode};
+pub use ext::ExtFilesystem;
+pub use ntfs::NtfsFilesystem;
+pub use xfs::XfsFilesystem;
+pub use fatimage::FatImage;
 pub use ramfs::{RamFileSystem, RamfsEntry, RamfsNode, RamfsFile, RamfsDir};
 pub use mntfs::{MountEntry, MountFlags, MountTable, bind_mount, umount, lookup_mount};
 pub use procfs::{

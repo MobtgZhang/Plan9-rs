@@ -16,9 +16,11 @@
 //! - bind - bind to local address
 //! - hangup - close connection
 
+use alloc::format;
 use alloc::vec::Vec;
 use alloc::string::String;
 use crate::dev::{Chan, Qid, Error, devtype, qidtype, Dev};
+use crate::netdrv;
 use crate::plan9_common::sync::Spinlock;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -57,7 +59,7 @@ pub enum TcpState {
 }
 
 /// TCP connection
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TcpConnection {
     /// Connection ID
     pub id: u32,
@@ -76,7 +78,7 @@ pub struct TcpConnection {
 }
 
 /// UDP connection
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UdpConnection {
     /// Connection ID
     pub id: u32,
@@ -96,7 +98,10 @@ impl NetFs {
             dev_char: 'I',
             tcp_convs: Spinlock::new(Vec::new()),
             udp_convs: Spinlock::new(Vec::new()),
-            next_id: AtomicU32::new(1),
+            // Qid paths 0, 1, and 2 are reserved for /net, /net/tcp, and
+            // /net/udp directory entries.  Connection ids start above them so
+            // a connection file is never mistaken for a directory.
+            next_id: AtomicU32::new(3),
         }
     }
 
@@ -120,7 +125,9 @@ impl NetFs {
             state: TcpState::Closed,
             refcount: 1,
         };
-        convs.push(conv);
+        convs.push(conv.clone());
+        // Keep the kernel TCP data-plane state in sync with the /net qid.
+        netdrv::tcp_open(id);
         Some(conv)
     }
 
@@ -137,7 +144,7 @@ impl NetFs {
             state: TcpState::Listen,
             refcount: 1,
         };
-        convs.push(conv);
+        convs.push(conv.clone());
         Some(conv)
     }
 
@@ -154,7 +161,7 @@ impl NetFs {
             state: TcpState::SynSent,
             refcount: 1,
         };
-        convs.push(conv);
+        convs.push(conv.clone());
         Some(conv)
     }
 
@@ -162,12 +169,6 @@ impl NetFs {
     pub fn tcp_by_id(&self, id: u32) -> Option<TcpConnection> {
         let convs = self.tcp_convs.lock();
         convs.iter().find(|c| c.id == id).cloned()
-    }
-
-    /// Get mutable reference to TCP connection
-    pub fn tcp_by_id_mut(&self, id: u32) -> Option<impl core::ops::DerefMut<Target = TcpConnection> + '_> {
-        // Return a custom struct that wraps the lock guard
-        None // Simplified - full impl would return guard
     }
 
     /// Close a TCP connection
@@ -192,10 +193,16 @@ impl NetFs {
         self.tcp_convs.lock().clone()
     }
 
-    /// Parse address string (ip:port format)
+    /// Parse a Plan 9 network address.  Plan 9 uses `ip!port`; the
+    /// conventional `ip:port` spelling is accepted as well.
     pub fn parse_addr(addr: &str) -> Option<([u8; 4], u16)> {
-        let parts: Vec<&str> = addr.split(':').collect();
-        if parts.len() != 2 {
+        let addr = addr.trim();
+        let parts: Vec<&str> = if addr.contains('!') {
+            addr.split('!').collect()
+        } else {
+            addr.split(':').collect()
+        };
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
             return None;
         }
 
@@ -222,13 +229,11 @@ impl NetFs {
     /// Format connection state for reading
     pub fn format_state(&self, conv: &TcpConnection) -> String {
         format!(
-            "{} {} {} {}!{} {}!{} {}",
+            "{} {:?} {} {} {}",
             conv.id,
-            format!("{:?}", conv.state),
-            self.format_addr(&conv.local_addr, conv.local_port),
-            "",
-            self.format_addr(&conv.remote_addr, conv.remote_port),
-            "",
+            conv.state,
+            NetFs::format_addr(&conv.local_addr, conv.local_port),
+            NetFs::format_addr(&conv.remote_addr, conv.remote_port),
             conv.refcount
         )
     }
@@ -249,15 +254,31 @@ impl Dev for NetFs {
         Ok(())
     }
 
-    fn walk(&mut self, _ch: &mut Chan, name: &str) -> Result<Option<Qid>, Error> {
+    fn walk(&mut self, ch: &mut Chan, name: &str) -> Result<Option<Qid>, Error> {
         match name {
-            "tcp" => Ok(Some(Qid::new(1, 0, qidtype::DIR))),
-            "udp" => Ok(Some(Qid::new(2, 0, qidtype::DIR))),
-            "clone" => Ok(Some(Qid::new(0xFFFFFFFF, 0, 0))),
+            "tcp" => {
+                let qid = Qid::new(1, 0, qidtype::DIR);
+                ch.qid = qid;
+                Ok(Some(qid))
+            }
+            "udp" => {
+                let qid = Qid::new(2, 0, qidtype::DIR);
+                ch.qid = qid;
+                Ok(Some(qid))
+            }
+            "clone" => {
+                // A fresh clone channel has not yet been opened; the open
+                // operation allocates the connection id.
+                let qid = Qid::new(0xFFFFFFFF, 0, 0);
+                ch.qid = qid;
+                Ok(Some(qid))
+            }
             _ => {
                 if let Ok(id) = name.parse::<u32>() {
                     if self.tcp_by_id(id).is_some() {
-                        return Ok(Some(Qid::new(id as u64, 0, 0)));
+                        let qid = Qid::new(id as u64, 0, 0);
+                        ch.qid = qid;
+                        return Ok(Some(qid));
                     }
                 }
                 Err(Error::Enoent)
@@ -265,60 +286,102 @@ impl Dev for NetFs {
         }
     }
 
-    fn read(&mut self, _ch: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
-        // Read returns status information for directory entries
-        if offset > 0 {
-            return Ok(0);
+    fn read(&mut self, ch: &mut Chan, buf: &mut [u8], _offset: u64) -> Result<usize, Error> {
+        let path = ch.qid.path;
+
+        // Directory entries: /net, /net/tcp, /net/udp.
+        if path == 0 || path == 1 || path == 2 {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let mut text = String::new();
+            for conv in self.tcp_all() {
+                text.push_str(&format!("{}\n", conv.id));
+            }
+            let bytes = text.as_bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            return Ok(n);
         }
 
-        // In a full implementation, this would read connection data
-        // For now, return empty data
-        Ok(0)
+        let id = path as u32;
+        if self.tcp_by_id(id).is_none() {
+            return Err(Error::Enoent);
+        }
+        let n = netdrv::tcp_read(id, buf);
+        Ok(n)
     }
 
     fn write(&mut self, ch: &mut Chan, buf: &[u8], _offset: u64) -> Result<usize, Error> {
         let cmd = core::str::from_utf8(buf).map_err(|_| Error::Einval)?;
+        let cmd = cmd.trim();
+        let id = ch.qid.path as u32;
 
         if cmd.starts_with("connect ") {
-            let addr = &cmd[9..];
-            if let Some((ip, port)) = Self::parse_addr(addr) {
-                if let Some(conv) = self.tcp_convs.lock().iter_mut()
-                    .find(|c| c.id == ch.qid.path as u32)
-                {
+            let addr = &cmd[8..];
+            let (ip, port) = match NetFs::parse_addr(addr) {
+                Some(a) => a,
+                None => return Err(Error::Einval),
+            };
+
+            netdrv::tcp_open(id);
+            let ok = netdrv::tcp_connect(id, ip, port);
+            if !ok {
+                if let Some(conv) = self.tcp_convs.lock().iter_mut().find(|c| c.id == id) {
                     conv.remote_addr = ip;
                     conv.remote_port = port;
                     conv.state = TcpState::SynSent;
-                    // In a full implementation, this would:
-                    // 1. Create TCP socket
-                    // 2. Initiate 3-way handshake
-                    // 3. Send SYN packet
-                    return Ok(buf.len());
                 }
+                return Err(Error::Eio);
             }
-        } else if cmd.starts_with("announce ") {
-            let port_str = &cmd[9..];
-            if let Ok(port) = port_str.parse::<u16>() {
-                if let Some(conv) = self.tcp_convs.lock().iter_mut()
-                    .find(|c| c.id == ch.qid.path as u32)
-                {
-                    conv.local_port = port;
-                    conv.state = TcpState::Listen;
-                    // In a full implementation, this would:
-                    // 1. Create listening socket
-                    // 2. Bind to port
-                    // 3. Start accepting connections
-                    return Ok(buf.len());
-                }
+
+            if let Some(conv) = self.tcp_convs.lock().iter_mut().find(|c| c.id == id) {
+                conv.local_addr = [10, 0, 2, 15];
+                conv.remote_addr = ip;
+                conv.remote_port = port;
+                conv.local_port = 40000 + (id % 1000) as u16;
+                conv.state = TcpState::Established;
             }
-        } else if cmd == "hangup" || cmd == "close" {
-            self.tcp_close(ch.qid.path as u32);
+            return Ok(buf.len());
         }
 
-        Ok(buf.len())
+        if cmd.starts_with("announce ") {
+            let port_str = &cmd[9..];
+            if let Ok(port) = port_str.parse::<u16>() {
+                if let Some(conv) = self.tcp_convs.lock().iter_mut().find(|c| c.id == id) {
+                    conv.local_port = port;
+                    conv.state = TcpState::Listen;
+                    return Ok(buf.len());
+                }
+            }
+            return Err(Error::Einval);
+        }
+
+        if cmd == "hangup" || cmd == "close" {
+            netdrv::tcp_close(id);
+            self.tcp_close(id);
+            return Ok(buf.len());
+        }
+
+        // After `connect`, the connection file carries user data.  Plan 9
+        // separates control and data channels; for this implementation the
+        // same opened connection channel accepts non-control payloads once
+        // the TCP connection is established.
+        if netdrv::tcp_is_established(id) {
+            let n = netdrv::tcp_write(id, buf);
+            if n == 0 {
+                return Err(Error::Eio);
+            }
+            return Ok(n);
+        }
+
+        Err(Error::Einval)
     }
 
     fn close(&mut self, ch: &mut Chan) {
-        self.tcp_close(ch.qid.path as u32);
+        let id = ch.qid.path as u32;
+        netdrv::tcp_close(id);
+        self.tcp_close(id);
     }
 
     fn dev_char(&self) -> char {
@@ -363,10 +426,12 @@ impl Dev for TcpDev {
         Ok(())
     }
 
-    fn walk(&mut self, _ch: &mut Chan, name: &str) -> Result<Option<Qid>, Error> {
+    fn walk(&mut self, ch: &mut Chan, name: &str) -> Result<Option<Qid>, Error> {
         if let Ok(id) = name.parse::<u32>() {
             if self.parent.tcp_by_id(id).is_some() {
-                return Ok(Some(Qid::new(id as u64, 0, 0)));
+                let qid = Qid::new(id as u64, 0, 0);
+                ch.qid = qid;
+                return Ok(Some(qid));
             }
         }
         Err(Error::Enoent)
@@ -375,13 +440,12 @@ impl Dev for TcpDev {
     fn read(&mut self, ch: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
         if let Some(conv) = self.parent.tcp_by_id(ch.qid.path as u32) {
             let info = format!(
-                "{} {} {}!{} {}!{} {}\n",
+                "{} {:?} {} {} {}\n",
                 conv.id,
-                format!("{:?}", conv.state),
-                format!("{:?}", conv.local_addr),
-                conv.local_port,
-                format!("{:?}", conv.remote_addr),
-                conv.remote_port,
+                conv.state,
+                NetFs::format_addr(&conv.local_addr, conv.local_port),
+                NetFs::format_addr(&conv.remote_addr, conv.remote_port),
+                conv.refcount,
             );
             let info_bytes = info.as_bytes();
             let start = offset as usize;
@@ -401,7 +465,7 @@ impl Dev for TcpDev {
 
         if cmd.starts_with("connect ") {
             let addr = &cmd[9..];
-            if let Some((ip, port)) = Self::parse_addr(addr) {
+            if let Some((ip, port)) = NetFs::parse_addr(addr) {
                 if let Some(conv) = self.parent.tcp_convs.lock().iter_mut()
                     .find(|c| c.id == ch.qid.path as u32) 
                 {

@@ -263,6 +263,7 @@ pub struct PciDeviceIter {
     current_bus: u8,
     current_dev: u8,
     current_func: u8,
+    done: bool,
 }
 
 impl PciDeviceIter {
@@ -271,10 +272,18 @@ impl PciDeviceIter {
             current_bus: 0,
             current_dev: 0,
             current_func: 0,
+            done: false,
         }
     }
 
+    /// Scan every bus/device/function slot.  The PCI header's "multifunction"
+    /// bit is not reliable for slots that expose a single function (e.g. the
+    /// ISA bridge on device 31, function 0, while SATA is function 2), so we
+    /// iterate all eight functions explicitly.
     fn next_internal(&mut self) -> Option<PciDevice> {
+        if self.done {
+            return None;
+        }
         loop {
             let vendor = pci_vendor_id(self.current_bus, self.current_dev, self.current_func);
 
@@ -295,37 +304,26 @@ impl PciDeviceIter {
                     revision: header.revision,
                 };
 
-                // Advance to next function or device
-                if header.is_multi_function() && self.current_func < 7 {
-                    self.current_func += 1;
-                } else {
-                    self.current_func = 0;
-                    if self.current_dev < 31 {
-                        self.current_dev += 1;
-                    } else {
-                        self.current_dev = 0;
-                        if self.current_bus < 255 {
-                            self.current_bus += 1;
-                        } else {
-                            return None;
-                        }
-                    }
-                }
-
+                self.advance();
                 return Some(device);
             }
 
-            // No device at this slot, move to next
+            self.advance();
+        }
+    }
+
+    fn advance(&mut self) {
+        if self.current_func < 7 {
+            self.current_func += 1;
+        } else {
             self.current_func = 0;
             if self.current_dev < 31 {
                 self.current_dev += 1;
             } else {
-                self.current_dev = 0;
-                if self.current_bus < 255 {
-                    self.current_bus += 1;
-                } else {
-                    return None;
-                }
+                // QEMU q35 exposes all devices on bus 0.  Scan only bus 0 so
+                // the boot-time PCI walk is bounded and does not probe empty
+                // buses through the legacy CF8/CFC config mechanism.
+                self.done = true;
             }
         }
     }

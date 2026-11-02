@@ -754,12 +754,22 @@ impl Dev for UsbDev {
         Err(DevError::Eperm)
     }
 
+    fn init(&mut self) {
+        // The trait hook runs after the PCI scan, so the USB driver can
+        // select a host controller from the real device list.
+        let _ = UsbDev::init(self);
+    }
+
     fn dev_char(&self) -> char {
         self.dev_char
     }
 
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
     }
 }
 

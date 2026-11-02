@@ -94,33 +94,17 @@ pub fn puts(s: &str) {
     }
 }
 
-/// Direct output of a `&[u8]` to COM1, bypassing the iterator infrastructure.
-/// Useful during very early boot where the iterator state machine appears to
-/// hang.
+/// Direct output of a `&[u8]` to COM1.
+///
+/// A plain per-byte loop avoids the inline-asm length operand being clobbered
+/// by the `mov dx, 0x3F8` used for the port.  `putc` has a bounded TX-empty
+/// wait, so early boot output cannot wedge.
 pub fn put_bytes(b: &[u8]) {
     let len = b.len();
-    let ptr = b.as_ptr();
-    let port: u16 = 0x3F8;
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3F8",
-            "xor ecx, ecx",
-            "cmp rcx, {len}",
-            "je 9f",
-            "2:",
-            "mov al, byte ptr [rdi + rcx]",
-            "out dx, al",
-            "inc rcx",
-            "cmp rcx, {len}",
-            "jne 2b",
-            "9:",
-            len = in(reg) len as u64,
-            in("rdi") ptr,
-            out("rax") _,
-            out("rcx") _,
-            out("rdx") _,
-            options(preserves_flags),
-        );
+    let mut i = 0;
+    while i < len {
+        putc(b[i]);
+        i += 1;
     }
 }
 

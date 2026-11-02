@@ -128,6 +128,15 @@ pub mod nr {
     /// readlink - read symbolic link
     pub const READLINK: usize = 47;
 
+    /// list - list directory names (prototype extension)
+    pub const LIST: usize = 48;
+    /// puts - write a C string to the console (prototype extension)
+    pub const PUTS: usize = 49;
+    /// getpid - get current process id (prototype extension)
+    pub const GETPID: usize = 50;
+    /// wait - wait for a child process (prototype extension)
+    pub const WAIT: usize = 51;
+
     /// Total number of syscalls
     pub const NUM: usize = 64;
 }
@@ -339,6 +348,9 @@ impl SyscallTable {
         table[nr::RFORK] = Some(|nr, args| {
             sys_internalrfork(&SyscallFrame { nr, args })
         });
+        table[nr::FORK] = Some(|nr, args| {
+            sys_internalfork(&SyscallFrame { nr, args })
+        });
         table[nr::EXEC] = Some(|nr, args| {
             sys_internalexec(&SyscallFrame { nr, args })
         });
@@ -386,6 +398,10 @@ impl SyscallTable {
         table[nr::FLOCK] = Some(|nr, args| sys_internalflock(&SyscallFrame { nr, args }));
         table[nr::SYMLINK] = Some(|nr, args| sys_internalsymlink(&SyscallFrame { nr, args }));
         table[nr::READLINK] = Some(|nr, args| sys_internalreadlink(&SyscallFrame { nr, args }));
+        table[nr::LIST] = Some(|nr, args| sys_internallist(&SyscallFrame { nr, args }));
+        table[nr::PUTS] = Some(|nr, args| sys_internalputs(&SyscallFrame { nr, args }));
+        table[nr::GETPID] = Some(|nr, args| sys_internalgetpid(&SyscallFrame { nr, args }));
+        table[nr::WAIT] = Some(|nr, args| sys_internalwait(&SyscallFrame { nr, args }));
 
         Self { handlers: table }
     }
@@ -450,18 +466,8 @@ pub fn syscalls() -> &'static SyscallTable {
 }
 
 /// Adapter to convert dev::Chan to a proc::Chan implementor
-pub fn dev_to_proc_chan(_chan: crate::dev::Chan) -> impl crate::proc::Chan {
-    struct DevChanAdapter;
-    impl crate::proc::Chan for DevChanAdapter {
-        fn read(&mut self, _buf: &mut [u8]) -> crate::proc::Result<usize> { Ok(0) }
-        fn write(&mut self, _buf: &[u8]) -> crate::proc::Result<usize> { Ok(0) }
-        fn close(&mut self) {}
-        fn dev(&self) -> usize { 0 }
-        fn offset(&self) -> u64 { 0 }
-        fn set_offset(&mut self, _offset: u64) {}
-        fn dup(&self) -> Box<dyn crate::proc::Chan> { Box::new(DevChanAdapter) }
-    }
-    DevChanAdapter
+pub fn dev_to_proc_chan(chan: crate::dev::Chan) -> crate::vfs::DevChanAdapter {
+    crate::vfs::DevChanAdapter::new(chan)
 }
 
 /// Dispatch a system call from trap handler
@@ -511,6 +517,116 @@ fn sys_internalrfork(frame: &SyscallFrame) -> Result<usize> {
 /// Dummy entry function for fork
 fn dummy_entry() {}
 
+/// FORK - Plan 9 style fork (rfork with FLAGFPROC).
+fn sys_internalfork(frame: &SyscallFrame) -> Result<usize> {
+    let _ = frame;
+    let r = sys_internalrfork(&SyscallFrame {
+        nr: nr::RFORK,
+        args: [rfork::FLAGFPROC as u64, 0, 0, 0, 0, 0],
+    });
+    r
+}
+
+/// GETPID - return the current process id.
+fn sys_internalgetpid(frame: &SyscallFrame) -> Result<usize> {
+    let _ = frame;
+    let proc = curproc().ok_or(Error::Eperm)?;
+    Ok(proc.pid as usize)
+}
+
+/// WAIT - wait for a terminated child and return its exit status.
+///
+/// In the user-mode path we resume the child directly and let the child's
+/// exit handler resume the parent with the exit status in RAX.  This avoids
+/// relying on a kernel scheduler context switch across a user stack.
+fn sys_internalwait(frame: &SyscallFrame) -> Result<usize> {
+    let pid = frame.arg(0) as i32;
+    let pid = pid as crate::proc::Pid;
+
+    let parent = match curproc_mut() {
+        Some(p) => p,
+        None => return Err(Error::Eperm),
+    };
+
+
+    // A child may already have exited and left a wait entry.
+    if let Some(ref mut wq) = parent.waitq {
+        if wq.pid == pid {
+            let status = wq.status;
+            parent.waitq = wq.next.take();
+            parent.waiting_child = None;
+            parent.state = State::Ready;
+            return Ok(status as usize);
+        }
+    }
+
+    let child = match crate::proc::find_proc(pid) {
+        Some(c) => c,
+        None => return Err(Error::Enoent),
+    };
+
+    let child_frame = match child.user_frame.as_ref() {
+        Some(f) => f,
+        None => return Err(Error::Einval),
+    };
+    let child_pml4 = child.mmupdb.as_u64();
+    if child_pml4 == 0 {
+        return Err(Error::Einval);
+    }
+
+    // Mark the parent as blocked.  The trap handler already saved the
+    // parent's ring-3 frame in `parent.user_frame`.
+    parent.state = State::Wait;
+    parent.waiting_child = Some(pid);
+
+    let frame_ptr = child_frame as *const crate::proc::SavedUserFrame as u64;
+    // The child is the process whose user frame is being resumed.  Update
+    // the global current-process pointer before entering ring 3 so a later
+    // EXITS syscall from the child identifies the correct parent.
+    crate::proc::set_curproc(&mut *child);
+
+    unsafe {
+        plan9_arch::x86_64::switch_to_user::kernel_resume_user(
+            frame_ptr,
+            child_pml4,
+        );
+    }
+}
+
+/// PUTS - write a NUL-terminated string to the serial console.
+fn sys_internalputs(frame: &SyscallFrame) -> Result<usize> {
+    let ptr = frame.arg(0);
+    if ptr == 0 || !is_user_addr(ptr) {
+        return Err(Error::Ebadf);
+    }
+    let s = copy_cstring_from_user(ptr)?;
+    crate::cons::serial_puts(&s);
+    Ok(s.len())
+}
+
+/// LIST - read directory entries from a path into a user buffer.
+fn sys_internallist(frame: &SyscallFrame) -> Result<usize> {
+    let path_ptr = frame.arg(0);
+    let buf_ptr = frame.arg(1);
+    let cap = frame.arg(2) as usize;
+
+    if path_ptr == 0 || buf_ptr == 0 || cap == 0 {
+        return Err(Error::Ebadf);
+    }
+    if !is_user_addr(path_ptr) || !is_user_addr(buf_ptr) {
+        return Err(Error::Ebadf);
+    }
+
+    let path = copy_cstring_from_user(path_ptr)?;
+    let mut chan = namec(&path, crate::vfs::NamecMode::Open(0), 0, 0)?;
+
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, cap) };
+    let offset = chan.offset;
+    let n = crate::dev::dev_read(&mut chan, buf, offset).unwrap_or(0);
+    chan.offset += n as u64;
+    Ok(n)
+}
+
 /// Execute a program - public interface for internal use
 ///
 /// This function provides a direct way to execute a program from kernel context.
@@ -546,192 +662,243 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
     let arg_ptr = frame.arg(1);
     let env_ptr = frame.arg(2);
 
-    // Validate path pointer
-    if path_ptr == 0 {
+    if path_ptr == 0 || !is_user_addr(path_ptr) {
         return Err(Error::Ebadf);
     }
 
-    // Check if address is in user space
-    if !is_user_addr(path_ptr) {
-        return Err(Error::Ebadf);
-    }
-
-    // Copy path from user space
     let path = copy_cstring_from_user(path_ptr)?;
-
-    // Build argument and environment vectors
     let args = copy_argv_from_user(arg_ptr)?;
     let envp = copy_envp_from_user(env_ptr)?;
-
-    // Open the executable file
-    let amode = crate::vfs::NamecMode::Open(0); // O_RDONLY
+    let amode = crate::vfs::NamecMode::Open(0);
     let mut chan = match namec(&path, amode, 0, 0) {
         Ok(c) => c,
         Err(_) => return Err(Error::Enoent),
     };
 
-    // Read ELF header
-    let mut header = [0u8; 128];
-    let mut read_buf = [0u8; 64];
-    let mut offset = 0;
-    while offset < header.len() {
-        let n = core::cmp::min(64, header.len() - offset);
-        let _ = n;
-        match chan.read(&mut read_buf[..64]) {
-            Ok(0) => break,
-            Ok(k) => {
-                header[offset..offset + k].copy_from_slice(&read_buf[..k]);
-                offset += k;
-            }
-            Err(_) => return Err(Error::Eio),
+    // Read the entire executable into a heap buffer.  This makes section
+    // headers and .got relocation available without re-reading the device.
+    let mut data: Vec<u8> = Vec::new();
+    let mut offset: u64 = 0;
+    loop {
+        let mut buf = [0u8; 4096];
+        let n = crate::dev::dev_read(&mut chan, &mut buf, offset)?;
+        if n == 0 {
+            break;
         }
+        data.extend_from_slice(&buf[..n]);
+        offset += n as u64;
     }
+    drop(chan);
 
-    // Validate ELF magic
-    if &header[0..4] != b"\x7fELF" {
+    if data.len() < 64 || &data[0..4] != b"\x7fELF" || data[4] != 2 {
         return Err(Error::Ebadexec);
     }
-
-    // Check if 64-bit
-    if header[4] != 2 {
-        return Err(Error::Ebadexec);
-    }
-
-    // Check architecture (x86_64 = 62)
-    let machine = u16::from_le_bytes([header[18], header[19]]);
+    let machine = u16::from_le_bytes([data[18], data[19]]);
     if machine != 62 {
         return Err(Error::Ebadexec);
     }
 
-    // Get entry point
-    let entry = u64::from_le_bytes([
-        header[24], header[25], header[26], header[27],
-        header[28], header[29], header[30], header[31],
+    let entry_file = u64::from_le_bytes([
+        data[24], data[25], data[26], data[27],
+        data[28], data[29], data[30], data[31],
     ]);
+    let entry = entry_file + crate::USER_BASE;
 
-    // Get program header info
     let phoff = u64::from_le_bytes([
-        header[32], header[33], header[34], header[35],
-        header[36], header[37], header[38], header[39],
-    ]);
-    let phentsize = u16::from_le_bytes([header[54], header[55]]);
-    let phnum = u16::from_le_bytes([header[56], header[57]]);
-
+        data[32], data[33], data[34], data[35],
+        data[36], data[37], data[38], data[39],
+    ]) as usize;
+    let phentsize = u16::from_le_bytes([data[54], data[55]]) as usize;
+    let phnum = u16::from_le_bytes([data[56], data[57]]) as usize;
     if phentsize < 56 || phnum == 0 {
         return Err(Error::Ebadexec);
     }
 
-    // Get current process
-    let _proc =match curproc_mut() {
-        Some(p) => p,
-        None => return Err(Error::Eperm),
-    };
-
-    // Close the executable file - we don't need it anymore
-    drop(chan);
-
-    // Re-open for loading segments
-    let mut chan = match namec(&path, amode, 0, 0) {
-        Ok(c) => c,
-        Err(_) => return Err(Error::Enoent),
-    };
-
-    // Get current process
     let proc = match curproc_mut() {
         Some(p) => p,
         None => return Err(Error::Eperm),
     };
+    let pml4 = proc.mmupdb;
+    if pml4.as_u64() == 0 {
+        return Err(Error::Eperm);
+    }
+    let cr3 = crate::plan9_arch::x86_64::mmu::cr3_read();
+    let _ = cr3;
 
-    // Clean up old segments before loading new program
+    // Relocate absolute .got pointers into the user image.
+    patch_got(&mut data);
+
     cleanup_process_segments(proc);
 
-    // Calculate memory bounds for the new program
-    let mut min_vaddr: u64 = 0xFFFFFFFFFFFFFFFF;
-    let mut max_vaddr: u64 = 0;
+    const PAGE_SIZE: usize = 4096;
 
-    // First pass: determine memory layout
-    for i in 0..phnum as usize {
-        let ph_offset = phoff + (i as u64) * (phentsize as u64);
-        let mut ph_buf = [0u8; 56];
-
-        // Read program header
-        let mut read_offset = ph_offset;
-        let mut bytes_read = 0;
-        while bytes_read < 56 {
-            let n = crate::dev::dev_read(&mut chan, &mut ph_buf[bytes_read..], read_offset)?;
-            if n == 0 { break; }
-            bytes_read += n;
-            read_offset += n as u64;
+    for i in 0..phnum {
+        let ph_pos = phoff + i * phentsize;
+        if ph_pos + 56 > data.len() {
+            return Err(Error::Ebadexec);
         }
+        let ph = &data[ph_pos..ph_pos + 56];
+        let p_type = u32::from_le_bytes([ph[0], ph[1], ph[2], ph[3]]);
+        if p_type != PT_LOAD {
+            continue;
+        }
+        let p_flags = u32::from_le_bytes([ph[4], ph[5], ph[6], ph[7]]);
+        let p_offset = u64::from_le_bytes([
+            ph[8], ph[9], ph[10], ph[11],
+            ph[12], ph[13], ph[14], ph[15],
+        ]) as usize;
+        let p_vaddr = u64::from_le_bytes([
+            ph[16], ph[17], ph[18], ph[19],
+            ph[20], ph[21], ph[22], ph[23],
+        ]);
+        let p_filesz = u64::from_le_bytes([
+            ph[32], ph[33], ph[34], ph[35],
+            ph[36], ph[37], ph[38], ph[39],
+        ]) as usize;
+        let p_memsz = u64::from_le_bytes([
+            ph[40], ph[41], ph[42], ph[43],
+            ph[44], ph[45], ph[46], ph[47],
+        ]);
 
-        let p_type = u32::from_le_bytes([ph_buf[0], ph_buf[1], ph_buf[2], ph_buf[3]]);
+        let seg_start = p_vaddr + crate::USER_BASE;
+        let seg_end = seg_start + p_memsz;
+        let data_end = seg_start + p_filesz as u64;
 
-        if p_type == PT_LOAD {
-            let p_vaddr = u64::from_le_bytes([ph_buf[8], ph_buf[9], ph_buf[10], ph_buf[11],
-                                               ph_buf[12], ph_buf[13], ph_buf[14], ph_buf[15]]);
-            let p_memsz = u64::from_le_bytes([ph_buf[32], ph_buf[33], ph_buf[34], ph_buf[35],
-                                              ph_buf[36], ph_buf[37], ph_buf[38], ph_buf[39]]);
-
-            let seg_top = p_vaddr + p_memsz;
-            if p_vaddr < min_vaddr {
-                min_vaddr = p_vaddr;
+        let mut cur_vaddr = seg_start & !(PAGE_SIZE as u64 - 1);
+        while cur_vaddr < seg_end {
+            let frame = crate::vm::alloc_frame().ok_or(Error::Enomem)?;
+            // The kernel boot identity map covers low physical memory; write
+            // through the physical address rather than the high-half mirror,
+            // which is not guaranteed to exist in the process PML4.
+            let frame_ptr = frame.as_u64() as *mut u8;
+            unsafe {
+                core::ptr::write_bytes(frame_ptr, 0, PAGE_SIZE);
             }
-            if seg_top > max_vaddr {
-                max_vaddr = seg_top;
+
+            let page_end = cur_vaddr + PAGE_SIZE as u64;
+            let copy_start = core::cmp::max(cur_vaddr, seg_start);
+            let copy_end = core::cmp::min(page_end, data_end);
+            if copy_start < copy_end && (p_offset + (copy_start - seg_start) as usize) < data.len() {
+                let dst_off = (copy_start - cur_vaddr) as usize;
+                let src_off = p_offset + (copy_start - seg_start) as usize;
+                let copy_len = core::cmp::min(
+                    (copy_end - copy_start) as usize,
+                    data.len() - src_off,
+                );
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(src_off),
+                        frame_ptr.add(dst_off),
+                        copy_len,
+                    );
+                }
             }
+
+            let mut flags = 1u64 | 4u64; // present + user
+            if p_flags & 2 != 0 {
+                flags |= 2u64; // writable
+            }
+            if p_flags & 1 == 0 {
+                flags |= 1u64 << 63; // non-executable
+            }
+            unsafe {
+                if crate::init_loader::map_user_page(
+                    pml4, cur_vaddr, frame.as_u64(), flags,
+                ).is_none() {
+                    return Err(Error::Enomem);
+                }
+            }
+            cur_vaddr += PAGE_SIZE as u64;
         }
     }
 
-    // Align min_vaddr down to page boundary
-    let _text_base = min_vaddr & !0xFFF;
-
-    // Second pass: load each PT_LOAD segment
-    for i in 0..phnum as usize {
-        let ph_offset = phoff + (i as u64) * (phentsize as u64);
-        let mut ph_buf = [0u8; 56];
-
-        // Read program header
-        let mut read_offset = ph_offset;
-        let mut bytes_read = 0;
-        while bytes_read < 56 {
-            let n = crate::dev::dev_read(&mut chan, &mut ph_buf[bytes_read..], read_offset)?;
-            if n == 0 { break; }
-            bytes_read += n;
-            read_offset += n as u64;
-        }
-
-        let p_type = u32::from_le_bytes([ph_buf[0], ph_buf[1], ph_buf[2], ph_buf[3]]);
-
-        if p_type == PT_LOAD {
-            let p_flags = u32::from_le_bytes([ph_buf[4], ph_buf[5], ph_buf[6], ph_buf[7]]);
-            let p_offset = u64::from_le_bytes([ph_buf[8], ph_buf[9], ph_buf[10], ph_buf[11],
-                                                ph_buf[12], ph_buf[13], ph_buf[14], ph_buf[15]]);
-            let p_vaddr = u64::from_le_bytes([ph_buf[16], ph_buf[17], ph_buf[18], ph_buf[19],
-                                               ph_buf[20], ph_buf[21], ph_buf[22], ph_buf[23]]);
-            let p_filesz = u64::from_le_bytes([ph_buf[32], ph_buf[33], ph_buf[34], ph_buf[35],
-                                               ph_buf[36], ph_buf[37], ph_buf[38], ph_buf[39]]);
-            let p_memsz = u64::from_le_bytes([ph_buf[40], ph_buf[41], ph_buf[42], ph_buf[43],
-                                               ph_buf[44], ph_buf[45], ph_buf[46], ph_buf[47]]);
-            let _p_align = u64::from_le_bytes([ph_buf[48], ph_buf[49], ph_buf[50], ph_buf[51],
-                                               ph_buf[52], ph_buf[53], ph_buf[54], ph_buf[55]]);
-
-            // Load segment into memory
-            // Read segment data from file into memory
-            load_segment(p_offset, p_vaddr, p_filesz, p_memsz, p_flags, proc, &mut chan)?;
-        }
-    }
-
-    // Close the executable file after loading
-    drop(chan);
-
-    // Build user stack with arguments
+    // Build and map the user stack for the new image.
     let sp = build_exec_stack(&args, &envp, entry, proc)?;
-
-    // Set up user registers for return to user mode
-    setup_user_context(proc, entry, sp, args.len());
-
-    // Return success - the context switch will happen on return from syscall
+    proc.set_exec_context(entry, sp, args.len());
     Ok(0)
+}
+
+/// Relocate absolute pointer entries in the ELF .got and .data.rel.ro
+/// sections by the uniform user-image load base.
+fn patch_got(data: &mut [u8]) {
+    if data.len() < 64 {
+        return;
+    }
+    let e_shoff = u64::from_le_bytes([
+        data[40], data[41], data[42], data[43],
+        data[44], data[45], data[46], data[47],
+    ]) as usize;
+    let e_shentsize = u16::from_le_bytes([data[58], data[59]]) as usize;
+    let e_shnum = u16::from_le_bytes([data[60], data[61]]) as usize;
+    let e_shstrndx = u16::from_le_bytes([data[62], data[63]]) as usize;
+    if e_shoff == 0 || e_shnum == 0 || e_shstrndx >= e_shnum {
+        return;
+    }
+
+    let str_sh_pos = e_shoff + e_shstrndx * e_shentsize;
+    if str_sh_pos + 64 > data.len() {
+        return;
+    }
+    let shstr = &data[str_sh_pos..str_sh_pos + 64];
+    let strtab_off = u64::from_le_bytes([
+        shstr[24], shstr[25], shstr[26], shstr[27],
+        shstr[28], shstr[29], shstr[30], shstr[31],
+    ]) as usize;
+    let strtab_len = u64::from_le_bytes([
+        shstr[32], shstr[33], shstr[34], shstr[35],
+        shstr[36], shstr[37], shstr[38], shstr[39],
+    ]) as usize;
+
+    for i in 0..e_shnum {
+        let pos = e_shoff + i * e_shentsize;
+        if pos + 64 > data.len() {
+            break;
+        }
+        let sh = &data[pos..pos + 64];
+        let sh_name = u32::from_le_bytes([sh[0], sh[1], sh[2], sh[3]]) as usize;
+        if strtab_off + sh_name >= data.len() || sh_name >= strtab_len {
+            continue;
+        }
+        let mut name_len = 0usize;
+        while strtab_off + sh_name + name_len < data.len()
+            && data[strtab_off + sh_name + name_len] != 0
+            && name_len < strtab_len
+        {
+            name_len += 1;
+        }
+        let name = &data[strtab_off + sh_name..strtab_off + sh_name + name_len];
+
+        if name == b".got" || name == b".data.rel.ro" {
+            let off = u64::from_le_bytes([
+                sh[24], sh[25], sh[26], sh[27],
+                sh[28], sh[29], sh[30], sh[31],
+            ]) as usize;
+            let size = u64::from_le_bytes([
+                sh[32], sh[33], sh[34], sh[35],
+                sh[36], sh[37], sh[38], sh[39],
+            ]) as usize;
+            let nwords = size / 8;
+            for w in 0..nwords {
+                let p = off + w * 8;
+                if p + 8 > data.len() {
+                    break;
+                }
+                let val = u64::from_le_bytes([
+                    data[p], data[p + 1], data[p + 2], data[p + 3],
+                    data[p + 4], data[p + 5], data[p + 6], data[p + 7],
+                ]);
+                // Only relocate values that are valid low-image virtual
+                // addresses.  .data.rel.ro also contains small integers,
+                // lengths, and packed table fields that must not be touched.
+                if val >= crate::segment::USER_IMAGE_BASE
+                    && val < crate::segment::USER_IMAGE_LIMIT
+                {
+                    let relocated = val + crate::USER_BASE;
+                    data[p..p + 8].copy_from_slice(&relocated.to_le_bytes());
+                }
+            }
+        }
+    }
 }
 
 /// Copy argument vector from user space
@@ -855,196 +1022,139 @@ fn build_exec_stack(
     args: &[Vec<u8>],
     envp: &[Vec<u8>],
     entry: u64,
-    _proc: &mut Proc,
+    proc: &mut Proc,
 ) -> Result<u64> {
-    use crate::vm::alloc_frame;
-    use crate::plan9_arch::x86_64::paging::phys_to_virt;
+    const PAGE_SIZE: usize = 4096;
+    const TOP: u64 = 0x0000_7FFF_FFFF_F000;
+    const PAGES: usize = 4;
+    const SIZE: usize = PAGES * PAGE_SIZE;
 
-    // Stack starts at USER_STACK_BASE and grows down
-    const PAGE_SIZE: u64 = 4096;
-    let stack_top = USER_STACK_BASE;
-
-    // Allocate at least one page for the stack
-    let stack_frame = match alloc_frame() {
-        Some(frame) => frame,
-        None => return Err(Error::Enomem),
-    };
-
-    // Get virtual address for the stack page
-    let stack_virt = phys_to_virt(stack_frame);
-    let stack_ptr = stack_virt.as_mut_ptr::<u8>();
-
-    // Clear the stack page
-    unsafe {
-        core::ptr::write_bytes(stack_ptr, 0, PAGE_SIZE as usize);
+    let pml4 = proc.mmupdb;
+    if pml4.as_u64() == 0 {
+        return Err(Error::Eperm);
     }
 
-    // Build stack layout
-    // We'll work from high addresses downward
+    // Map the user stack pages.  The same layout is used by init_loader.
+    let base = TOP - SIZE as u64 + PAGE_SIZE as u64;
+    let mut frames: Vec<u64> = Vec::with_capacity(PAGES);
+    for page in 0..PAGES {
+        let vaddr = base + page as u64 * PAGE_SIZE as u64;
+        let frame = crate::vm::alloc_frame().ok_or(Error::Enomem)?;
+        let frame_ptr = frame.as_u64() as *mut u8;
+        unsafe {
+            core::ptr::write_bytes(frame_ptr, 0, PAGE_SIZE);
+        }
+        unsafe {
+            if crate::init_loader::map_user_page(
+                pml4, vaddr, frame.as_u64(), 1u64 | 2u64 | 4u64,
+            ).is_none() {
+                return Err(Error::Enomem);
+            }
+        }
+        frames.push(frame.as_u64());
+    }
 
-    // Calculate positions for all data
-    let argc = args.len();
+    let low = base as usize;
+    let mut sp = TOP as usize;
 
-    // Auxiliary vector entries we want to include
-    const AT_NULL: u64 = 0;
-    const AT_ENTRY: u64 = 9;
-    const AT_PHDR: u64 = 3;
-    const AT_PHNUM: u64 = 5;
-    const AT_PHENT: u64 = 4;
-    const AT_PAGESZ: u64 = 6;
-
-    // Stack pointer starts at top of stack page
-    let mut sp = stack_top as usize;
-
-    // Helper to align sp down
     let align_down = |sp: usize, align: usize| -> usize {
         (sp / align) * align
     };
-
-    // Helper to push data onto stack
-    let push_data = |data: &[u8], sp: &mut usize| -> Result<usize> {
-        let len = data.len();
-        if len == 0 {
-            return Ok(*sp);
+    // Write through the physical frame, not through the virtual address.
+    // The kernel may still have stale TLB entries for the old user stack,
+    // while the new mappings are only established by these page tables.
+    let phys_addr = |addr: usize| -> u64 {
+        let off = addr - low;
+        let page = off / PAGE_SIZE;
+        let within = off % PAGE_SIZE;
+        frames[page] + within as u64
+    };
+    let write_u64 = |addr: usize, val: u64| {
+        unsafe { core::ptr::write(phys_addr(addr) as *mut u64, val); }
+    };
+    let write_byte = |addr: usize, val: u8| {
+        unsafe { core::ptr::write(phys_addr(addr) as *mut u8, val); }
+    };
+    let write_bytes = |addr: usize, bytes: &[u8]| {
+        for (i, b) in bytes.iter().enumerate() {
+            write_byte(addr + i, *b);
         }
-        *sp -= len;
-        if *sp < (stack_top - PAGE_SIZE) as usize {
-            return Err(Error::Enomem); // Stack overflow
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), (*stack_ptr.add(*sp)) as *mut u8, len);
-        }
-        Ok(*sp)
     };
 
-    // Push alignment padding first
     sp = align_down(sp - 1, 16);
 
-    // Push null for auxiliary vector terminator
-    sp -= 16; // Two zero u64 values
-    if sp < (stack_top - PAGE_SIZE) as usize {
-        return Err(Error::Enomem);
-    }
-    unsafe {
-        core::ptr::write(stack_ptr.add(sp) as *mut u64, 0);
-        core::ptr::write(stack_ptr.add(sp + 8) as *mut u64, 0);
-    }
-
-    // Push auxiliary vector entries (AT_NULL terminator already pushed)
-    // AT_ENTRY: entry point address
+    // Auxiliary vector: AT_NULL, AT_ENTRY, AT_PAGESZ.
     sp -= 16;
-    if sp < (stack_top - PAGE_SIZE) as usize {
-        return Err(Error::Enomem);
-    }
-    unsafe {
-        core::ptr::write(stack_ptr.add(sp) as *mut u64, AT_ENTRY);
-        core::ptr::write(stack_ptr.add(sp + 8) as *mut u64, entry);
-    }
+    if sp < low { return Err(Error::Enomem); }
+    write_u64(sp, 0);
+    write_u64(sp + 8, 0);
 
-    // AT_PAGESZ: page size
     sp -= 16;
-    if sp < (stack_top - PAGE_SIZE) as usize {
-        return Err(Error::Enomem);
-    }
-    unsafe {
-        core::ptr::write(stack_ptr.add(sp) as *mut u64, AT_PAGESZ);
-        core::ptr::write(stack_ptr.add(sp + 8) as *mut u64, PAGE_SIZE);
-    }
+    if sp < low { return Err(Error::Enomem); }
+    write_u64(sp, 9);
+    write_u64(sp + 8, entry);
 
-    // Push null for environment terminator
-    sp -= 8;
-    if sp < (stack_top - PAGE_SIZE) as usize {
-        return Err(Error::Enomem);
-    }
-    unsafe {
-        core::ptr::write(stack_ptr.add(sp) as *mut u64, 0);
-    }
+    sp -= 16;
+    if sp < low { return Err(Error::Enomem); }
+    write_u64(sp, 6);
+    write_u64(sp + 8, PAGE_SIZE as u64);
 
-    // Store envp pointers (we'll fill these in later)
-    let envp_ptr_base = sp;
-    let envp_count = envp.len();
-    sp -= envp_count * 8;
-
-    // Push environment variable strings and collect their addresses
-    let mut env_addrs: Vec<u64> = Vec::with_capacity(envp_count);
+    // Environment strings.
+    let env_count = envp.len();
+    let mut env_addrs: Vec<u64> = Vec::with_capacity(env_count);
     for env in envp.iter().rev() {
-        let addr = sp as u64;
-        env_addrs.push(addr);
-        sp = push_data(env, &mut sp)?;
-        sp -= 1; // Null terminator
-        if sp < (stack_top - PAGE_SIZE) as usize {
+        let len = env.len();
+        if sp < low + len + 1 {
             return Err(Error::Enomem);
         }
-        unsafe {
-            core::ptr::write(stack_ptr.add(sp), 0);
-        }
+        sp -= len + 1;
+        let addr = sp;
+        write_bytes(addr, &env);
+        write_byte(addr + len, 0);
+        env_addrs.push(addr as u64);
     }
 
-    // Now write envp pointers
-    for (i, &addr) in env_addrs.iter().enumerate() {
-        let offset = envp_ptr_base + i * 8;
-        unsafe {
-            core::ptr::write(stack_ptr.add(offset) as *mut u64, addr);
-        }
-    }
-
-    // Push null for argv terminator
-    sp -= 8;
-    if sp < (stack_top - PAGE_SIZE) as usize {
+    // envp pointer array and null terminator, placed below the strings.
+    if sp < low + env_count * 8 + 8 {
         return Err(Error::Enomem);
     }
-    unsafe {
-        core::ptr::write(stack_ptr.add(sp) as *mut u64, 0);
+    let envp_base = sp - env_count * 8 - 8;
+    for i in 0..env_count {
+        write_u64(envp_base + i * 8, env_addrs[env_count - 1 - i]);
     }
+    write_u64(envp_base + env_count * 8, 0);
+    sp = envp_base;
 
-    // Store argv pointers
-    let argv_ptr_base = sp;
-    let argv_count = args.len();
-    sp -= argv_count * 8;
-
-    // Push argument strings and collect their addresses
-    let mut arg_addrs: Vec<u64> = Vec::with_capacity(argv_count);
+    // Argument strings.
+    let argc = args.len();
+    let mut arg_addrs: Vec<u64> = Vec::with_capacity(argc);
     for arg in args.iter().rev() {
-        let addr = sp as u64;
-        arg_addrs.push(addr);
-        sp = push_data(arg, &mut sp)?;
-        sp -= 1; // Null terminator
-        if sp < (stack_top - PAGE_SIZE) as usize {
+        let len = arg.len();
+        if sp < low + len + 1 {
             return Err(Error::Enomem);
         }
-        unsafe {
-            core::ptr::write(stack_ptr.add(sp), 0);
-        }
+        sp -= len + 1;
+        let addr = sp;
+        write_bytes(addr, arg);
+        write_byte(addr + len, 0);
+        arg_addrs.push(addr as u64);
     }
 
-    // Now write argv pointers
-    for (i, &addr) in arg_addrs.iter().enumerate() {
-        let offset = argv_ptr_base + i * 8;
-        unsafe {
-            core::ptr::write(stack_ptr.add(offset) as *mut u64, addr);
-        }
-    }
-
-    // Push argc
-    sp -= 8;
-    if sp < (stack_top - PAGE_SIZE) as usize {
+    // argv pointer array and null terminator, placed below the strings.
+    // The System V AMD64 ABI requires rsp to point at a 16-byte aligned
+    // argc slot with argv starting at rsp+8.
+    let argc_addr = align_down(sp - argc * 8 - 16, 16);
+    if argc_addr < low {
         return Err(Error::Enomem);
     }
-    unsafe {
-        core::ptr::write(stack_ptr.add(sp) as *mut u64, argc as u64);
+    let argv_base = argc_addr + 8;
+    for i in 0..argc {
+        write_u64(argv_base + i * 8, arg_addrs[argc - 1 - i]);
     }
+    write_u64(argv_base + argc * 8, 0);
+    write_u64(argc_addr, argc as u64);
 
-    // The final sp should be 16-byte aligned
-    let final_sp = align_down(sp, 16);
-
-    // In a full implementation, we would:
-    // 1. Map this stack frame into the process's page table
-    // 2. Set up the stack segment in proc->seg[]
-    // 3. Copy the data to actual user space addresses
-
-    // For now, we return the logical stack pointer
-    // The actual implementation would use copy_to_user to transfer data
-    Ok(final_sp as u64)
+    Ok(argc_addr as u64)
 }
 
 /// ELF file header constants
@@ -1146,11 +1256,59 @@ const SG_SHARED: u32 = 5;
 const SG_PHYSICAL: u32 = 6;
 const SG_MAPPED: u32 = 7;
 
-/// EXITS - terminate process
-fn sys_internalexits(_frame: &SyscallFrame) -> Result<usize> {
-    // Exit via scheduler
-    scheduler().exit(0);
-    // Should not return
+/// EXITS - terminate process.
+///
+/// If the parent is blocked in `wait`, resume the parent directly in user
+/// mode with the child's exit status in RAX.  Otherwise mark the process
+/// dead and let the scheduler decide what to run next.
+fn sys_internalexits(frame: &SyscallFrame) -> Result<usize> {
+    let status = frame.arg(0) as i32;
+
+    let child = match curproc_mut() {
+        Some(p) => p,
+        None => return Err(Error::Eperm),
+    };
+    let child_pid = child.pid;
+    child.state = State::Dead;
+
+    if let Some(parent_pid) = child.parent {
+        if let Some(parent) = crate::proc::find_proc(parent_pid) {
+            let parent_ptr: *mut Proc = core::ptr::addr_of!(*parent) as *mut Proc;
+            unsafe {
+                let p = &mut *parent_ptr;
+                if p.state == State::Wait && p.waiting_child == Some(child_pid) {
+                    p.nchild -= 1;
+                    p.waiting_child = None;
+                    p.waitq = None;
+
+                    // Resume the parent at its saved wait-syscall frame.
+                    let mut f = p.user_frame.unwrap_or_default();
+                    f.rax = status as u64;
+                    p.user_frame = Some(f);
+                    p.state = State::Ready;
+
+                    let frame_ptr = p
+                        .user_frame
+                        .as_ref()
+                        .map(|fr| fr as *const crate::proc::SavedUserFrame as u64)
+                        .unwrap_or(0);
+                    let pml4 = p.mmupdb.as_u64();
+                    if frame_ptr != 0 && pml4 != 0 {
+                        // Resume the waiting parent as the current process.
+                        crate::proc::set_curproc(p);
+                        plan9_arch::x86_64::switch_to_user::kernel_resume_user(
+                            frame_ptr,
+                            pml4,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // No waiting parent: run the scheduler (or idle) instead of returning to
+    // the dead user image.
+    scheduler().exit(status);
     Ok(0)
 }
 
@@ -1180,20 +1338,10 @@ fn sys_internalopen(frame: &SyscallFrame) -> Result<usize> {
     // Copy path from user space
     let path = copy_cstring_from_user(path_ptr)?;
     
-    // Get current process and its file descriptor group
-    let proc = curproc_mut().ok_or(Error::Eperm)?;
-
-    // Use VFS to open the file
-    let amode = crate::vfs::NamecMode::Open(omode);
-    match namec(&path, amode, omode, 0) {
-        Ok(chan) => {
-            // Allocate file descriptor
-            if let Some(fgrp_box) = proc.fgrp.as_mut() {
-                let boxed_chan: Box<dyn crate::proc::Chan> = Box::new(dev_to_proc_chan(chan));
-                let _fd = fgrp_box.alloc_fd(boxed_chan);
-            }
-            Err(Error::Ebadf)
-        }
+    // Use the VFS to open the file and allocate a descriptor.
+    match crate::vfs::sys_open(&path, omode) {
+        Ok(fd) if fd >= 0 => Ok(fd as usize),
+        Ok(_) => Err(Error::Enomem),
         Err(_) => Err(Error::Enoent),
     }
 }
@@ -1226,20 +1374,9 @@ fn sys_internalcreate(frame: &SyscallFrame) -> Result<usize> {
     // Copy path from user space
     let path = copy_cstring_from_user(path_ptr)?;
     
-    // Get current process
-    let proc = curproc_mut().ok_or(Error::Eperm)?;
-
-    // Use VFS to create the file
-    let amode = crate::vfs::NamecMode::Create(omode, perm);
-    match namec(&path, amode, omode, perm) {
-        Ok(chan) => {
-            // Allocate file descriptor
-            if let Some(fgrp_box) = proc.fgrp.as_mut() {
-                let boxed_chan: Box<dyn crate::proc::Chan> = Box::new(dev_to_proc_chan(chan));
-                let _fd = fgrp_box.alloc_fd(boxed_chan);
-            }
-            Err(Error::Ebadf)
-        }
+    match crate::vfs::sys_create(&path, omode, perm) {
+        Ok(fd) if fd >= 0 => Ok(fd as usize),
+        Ok(_) => Err(Error::Enomem),
         Err(_) => Err(Error::Ebadf),
     }
 }
@@ -1320,6 +1457,7 @@ fn sys_internalread(frame: &SyscallFrame) -> Result<usize> {
                 break;
             }
         }
+
         Ok(count)
     } else {
         // Use VFS for other file descriptors
@@ -1864,18 +2002,18 @@ fn sys_internalstat(frame: &SyscallFrame) -> Result<usize> {
     // Copy path from user space
     let path = copy_cstring_from_user(path_ptr)?;
     
-    // Use VFS to stat the file
+    // Use VFS to walk to the file, then format a simple Plan 9 stat line.
     let amode = crate::vfs::NamecMode::Walk;
-    match namec(&path, amode, 0, 0) {
-        Ok(chan) => {
-            // Get stat data from channel
-            // In a full implementation, this would call chan.stat()
-            // For now, just return the channel and close it
-            let _ = chan;
-            Err(Error::Eio) // Stat not implemented yet
-        }
-        Err(_) => Err(Error::Enoent),
-    }
+    let mut chan = namec(&path, amode, 0, 0)?;
+    let de = crate::dev::dev_stat(&mut chan)?;
+    let name = core::str::from_utf8(&de.name).unwrap_or("?");
+    let text = format!("{} {} {} {}\n", name, de.mode, de.length, de.qid.path);
+    let bytes = text.as_bytes();
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, _n) };
+    let count = core::cmp::min(bytes.len(), buf.len());
+    buf[..count].copy_from_slice(&bytes[..count]);
+    let _ = crate::dev::dev_close(&mut chan);
+    Ok(count)
 }
 
 /// FSTAT - get file status by fd
@@ -1916,14 +2054,16 @@ fn sys_internalfstat(frame: &SyscallFrame) -> Result<usize> {
         None => return Err(Error::Ebadfd),
     };
     
+    let de = chan.stat()?;
+    let name = core::str::from_utf8(&de.name).unwrap_or("?");
+    let text = format!("{} {} {} {}\n", name, de.mode, de.length, de.qid.path);
+    let bytes = text.as_bytes();
     let buf = unsafe {
         core::slice::from_raw_parts_mut(buf_ptr as *mut u8, n)
     };
-    
-    match chan.read(buf) {
-        Ok(count) => Ok(count),
-        Err(_) => Err(Error::Eio),
-    }
+    let count = core::cmp::min(bytes.len(), buf.len());
+    buf[..count].copy_from_slice(&bytes[..count]);
+    Ok(count)
 }
 
 /// FSTAT - get file status by fd
@@ -1974,7 +2114,7 @@ fn sys_internalwstat(frame: &SyscallFrame) -> Result<usize> {
 
     // For now, just close the channel
     // A full implementation would call chan.wstat(&stat_buf)?;
-    let _ = chan.close();
+    let _ = crate::dev::dev_close(&mut chan);
 
     Ok(0)
 }
@@ -2058,7 +2198,7 @@ fn sys_internalremove(frame: &SyscallFrame) -> Result<usize> {
     let mut chan = namec(&path, amode, 0, 0)?;
 
     // Close the channel (remove is completed by namec)
-    let _ = chan.close();
+    let _ = crate::dev::dev_close(&mut chan);
 
     Ok(0)
 }
@@ -2817,9 +2957,11 @@ fn sys_internalthreadwait(frame: &SyscallFrame) -> Result<usize> {
     Err(Error::Ebadf)
 }
 
-/// YIELD - yield processor
+/// YIELD - yield processor.
+///
+/// The prototype does not perform user-mode preemption, so a yield is
+/// recorded but does not schedule another user process.
 fn sys_internalyield(_frame: &SyscallFrame) -> Result<usize> {
-    sched_yield();
     Ok(0)
 }
 
@@ -3147,7 +3289,7 @@ fn sys_internalflock(frame: &SyscallFrame) -> Result<usize> {
     }
     
     // Call the VFS flock function
-    match crate::vfs::sys_flock(fd, operation) {
+    match crate::vfs::sys_flock(fd, operation as i32) {
         Ok(()) => Ok(0),
         Err(_) => Err(Error::Eagain), // Would block or error
     }

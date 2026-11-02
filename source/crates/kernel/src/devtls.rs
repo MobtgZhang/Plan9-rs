@@ -501,7 +501,9 @@ impl TlsDev {
     pub fn new() -> Self {
         Self {
             name: "tls",
-            dev_char: 'I',
+            // The network device uses `#I` for `/net`.  TLS therefore uses
+            // a distinct device character so both can coexist in the table.
+            dev_char: 'T',
             connections: Spinlock::new(Vec::new()),
             next_id: AtomicU64::new(1),
         }

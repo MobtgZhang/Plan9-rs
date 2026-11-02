@@ -420,8 +420,19 @@ impl SdDev {
         Ok(())
     }
     
-    /// Get global SD device instance
+    /// Get the SD device instance registered in the kernel's device table.
+    ///
+    /// Devices are registered as `Box<dyn Dev>`; this downcast recovers the
+    /// concrete `SdDev` so the filesystem device reads from the same units
+    /// that `init()` populated with AHCI backends.
     pub fn get_global() -> &'static SdDev {
+        if let Some(idx) = crate::dev::devs().find_by_char('s') {
+            if let Some(dev) = crate::dev::devs().get(idx) {
+                if let Some(sd) = dev.as_any().downcast_ref::<SdDev>() {
+                    return sd;
+                }
+            }
+        }
         unsafe {
             struct SyncCell<T>(core::cell::UnsafeCell<T>);
             unsafe impl<T> Sync for SyncCell<T> {}
@@ -436,6 +447,24 @@ impl SdDev {
 }
 
 impl Dev for SdDev {
+    fn init(&mut self) {
+        // Probe ATA, AHCI, and NVMe backends.  Each discovered backend is
+        // assigned to its own storage unit in order.
+        let backends = crate::storage_backend::probe_all();
+        for (unit, backend) in backends.into_iter().enumerate() {
+            if unit >= SD_MAX_UNITS {
+                break;
+            }
+            let _ = self.register_backend(unit, backend);
+            crate::serial::put_bytes(b"[sd] unit registered\n");
+        }
+        crate::serial::put_bytes(b"[sd] backends probed\n");
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     fn attach(&mut self, _spec: Option<&str>) -> Result<Chan, DevError> {
         // Attach to #s - top level directory
         Ok(Chan::new(

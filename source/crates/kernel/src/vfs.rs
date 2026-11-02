@@ -1,23 +1,23 @@
 //! Virtual File System
 //!
-//! Implements the VFS layer that connects file systems and devices
-//! to the system call interface.
+//! Plan 9 style VFS layer that connects file systems and devices to the
+//! system-call interface.  Provides `namec()` for path-to-channel
+//! conversion, a mount table for bind/union mounts, and channel
+//! reference management.
 //!
-//! This module provides the Plan 9 style VFS with:
-//! - namec() for path-to-channel conversion
-//! - Mount table for union mounts and bind mounts
-//! - Channel reference counting and management
-//! - Path parsing and walk operations
+//! The device table is owned by `crate::dev`; this module only borrows
+//! devices through the small helpers exported there.
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::dev::{self, DevTable, Chan, Qid, DirEntry, Error as DevError, devtype, qidtype, devs, Error as DevErrorEnum};
-use crate::proc::Fgrp;
-use crate::plan9_common::sync::{Spinlock, Mutex};
+
+use crate::chan::Qid;
+use crate::dev::{self, Chan, DirEntry, Error as DevError, devs_mut, devtype, qidtype};
+use crate::plan9_common::sync::{Mutex, Spinlock};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
-// VFS Constants
+// Constants
 // ============================================================================
 
 /// Maximum mount points
@@ -32,53 +32,24 @@ pub const MAX_FILE_NAME: usize = 256;
 /// Root device character
 pub const ROOTDEV: char = '/';
 
-// ============================================================================
-// Mount Point
-// ============================================================================
-
-/// Mount point structure
-#[derive(Debug)]
-pub struct MountPoint {
-    /// Source (device or server)
-    pub source: Vec<u8>,
-    /// Mount point path
-    pub path: Vec<u8>,
-    /// File system type
-    pub fs_type: Vec<u8>,
-    /// Mount flags
-    pub flags: u32,
-    /// Root channel for this mount
-    pub root: Option<Chan>,
-    /// Next mount in list, stored as an index into the static
-    /// `MOUNTS` table rather than a raw pointer so the table is
-    /// `Send`/`Sync` without `unsafe impl`.
-    pub next: Option<usize>,
-}
-
-impl MountPoint {
-    /// Create new mount point
-    pub fn new(source: &[u8], path: &[u8], fs_type: &[u8]) -> Self {
-        Self {
-            source: source.to_vec(),
-            path: path.to_vec(),
-            fs_type: fs_type.to_vec(),
-            flags: 0,
-            root: None,
-            next: None,
-        }
-    }
-}
+/// Mount flags (Plan 9 semantics)
+pub const MBEFORE: u32 = 0x01;
+pub const MAFTER: u32 = 0x02;
+pub const MCREATE: u32 = 0x04;
+pub const MCACHE: u32 = 0x08;
+pub const MREPL: u32 = 0x10;
+pub const MBIND: u32 = 0x20;
+pub const MUNION: u32 = 0x40;
 
 // ============================================================================
-// Path Parsing
+// Path helpers
 // ============================================================================
 
-/// Parse a path into components
+/// Parse a path into components.
 pub fn parse_path(path: &[u8]) -> Vec<&[u8]> {
     let mut components = Vec::new();
     let mut i = 0;
 
-    // Skip leading slashes
     while i < path.len() && path[i] == b'/' {
         i += 1;
     }
@@ -99,35 +70,43 @@ pub fn parse_path(path: &[u8]) -> Vec<&[u8]> {
     components
 }
 
-/// Get file name from path
+/// Last component of a path.
 pub fn file_name(path: &[u8]) -> Option<&[u8]> {
-    let components = parse_path(path);
-    components.last().map(|s| *s)
+    parse_path(path).last().copied()
 }
 
-/// Get parent path from path
+/// Parent directory of a path.
 pub fn parent_path(path: &[u8]) -> Option<Vec<u8>> {
     let components = parse_path(path);
     if components.len() <= 1 {
         return Some(b"/".to_vec());
     }
-    
+
     let mut result = Vec::new();
-    for (i, comp) in components.iter().enumerate() {
-        if i == components.len() - 1 {
-            break;
-        }
+    for comp in components.iter().take(components.len() - 1) {
         result.push(b'/');
         result.extend_from_slice(comp);
-    }
-    if result.is_empty() {
-        result.push(b'/');
     }
     Some(result)
 }
 
+fn parse_path_start(path: &[u8]) -> (PathStart, Option<&[u8]>) {
+    if path.is_empty() {
+        return (PathStart::Current, None);
+    }
+    if path[0] == b'/' {
+        return (PathStart::Root, Some(&path[1..]));
+    }
+    if path[0] == b'#' && path.len() > 1 {
+        let dev_char = path[1] as char;
+        let rest = if path.len() > 2 { &path[2..] } else { &[] };
+        return (PathStart::Special(dev_char), Some(rest));
+    }
+    (PathStart::Current, Some(path))
+}
+
 // ============================================================================
-// Name to Channel (namec)
+// Namec modes
 // ============================================================================
 
 /// Name to channel mode
@@ -150,516 +129,160 @@ pub enum NamecMode {
 /// Path starting point
 #[derive(Debug)]
 enum PathStart {
-    /// Start from root
     Root,
-    /// Start from special device (#c, #/, etc.)
     Special(char),
-    /// Start from current directory
     Current,
-    /// Start from parent directory
     Parent,
 }
 
-/// Parse the starting point of a path
-fn parse_path_start(path: &[u8]) -> (PathStart, Option<&[u8]>) {
-    if path.is_empty() {
-        return (PathStart::Current, None);
-    }
-    
-    if path[0] == b'/' {
-        return (PathStart::Root, Some(&path[1..]));
-    }
-    
-    if path[0] == b'#' && path.len() > 1 {
-        let dev_char = path[1] as char;
-        let rest = if path.len() > 2 { &path[2..] } else { &[] };
-        return (PathStart::Special(dev_char), Some(rest));
-    }
-    
-    (PathStart::Current, Some(path))
-}
-
-/// Name to channel - core VFS function
-/// Converts a path name to an open channel
-///
-/// This is the main entry point for path resolution in Plan 9.
-/// It handles:
-/// - Absolute paths (starting from /)
-/// - Relative paths (starting from current directory)
-/// - Special device paths (#c, #e, etc.)
-/// - Mount table lookups for bind/union mounts
-/// - Parent directory walk ("..")
-pub fn namec(
-    path: &[u8],
-    amode: NamecMode,
-    _omode: u32,
-    perm: u32,
-) -> Result<Chan, VfsError> {
-    // 0. Validate path
-    if path.is_empty() {
-        return Err(VfsError::Einval);
-    }
-
-    // 1. Determine starting point
-    let (start, rest) = parse_path_start(path);
-
-    let mut chan = match start {
-        PathStart::Root => {
-            // Start from root filesystem
-            // First check mount table for root
-            if let Some(mp) = MOUNTS.lock().find(b"") {
-                if let Some(ref root) = mp.root {
-                    root.dup()
-                } else {
-                    return Err(VfsError::Enoent);
-                }
-            } else {
-                // Try to get from root channel
-                if let Some(root) = ROOT_CHAN.lock().as_ref() {
-                    root.dup()
-                } else {
-                    // Fallback to root device
-                    let dev = devs().get(devtype::ROOT)
-                        .ok_or(VfsError::Enoent)?;
-                    dev.attach(None).map_err(|_| VfsError::Enoent)?
-                }
-            }
-        }
-        PathStart::Special(c) => {
-            // Special device: #c, #/, #e, etc.
-            let dev = devs().find_by_char(c)
-                .ok_or(VfsError::Enoent)?;
-            dev.attach(Some(core::str::from_utf8(rest.unwrap_or(&[]))
-                .unwrap_or("")))
-                .map_err(|_| VfsError::Enoent)?
-        }
-        PathStart::Current => {
-            // Start from current directory
-            let proc = crate::proc::curproc()
-                .ok_or(VfsError::Eperm)?;
-            if let Some(ref dot) = proc.dot {
-                dot.dup()
-            } else {
-                // Fallback to root
-                if let Some(mp) = MOUNTS.lock().find(b"") {
-                    if let Some(ref root) = mp.root {
-                        root.dup()
-                    } else {
-                        return Err(VfsError::Enoent);
-                    }
-                } else {
-                    return Err(VfsError::Enoent);
-                }
-            }
-        }
-        PathStart::Parent => {
-            // Start from parent directory - walk ".." from current
-            let proc = crate::proc::curproc()
-                .ok_or(VfsError::Eperm)?;
-            if let Some(ref dot) = proc.dot {
-                let mut parent = dot.dup();
-                if let Some(dev) = devs().get(parent.dev) {
-                    // Walk to ".."
-                    if dev.walk(&mut parent, "..").is_ok() {
-                        parent
-                    } else {
-                        return Err(VfsError::Enoent);
-                    }
-                } else {
-                    return Err(VfsError::Enoent);
-                }
-            } else {
-                return Err(VfsError::Enoent);
-            }
-        }
-    };
-
-    // 2. Build current path for mount table lookups
-    let mut current_path: Vec<u8> = Vec::new();
-
-    // 3. Parse and walk path components
-    if let Some(path_rest) = rest {
-        let components = parse_path_components(path_rest);
-
-        for comp in components {
-            // Skip empty components
-            if comp.is_empty() || comp == b"." {
-                continue;
-            }
-
-            // Update current path for mount lookup
-            if !current_path.is_empty() || comp.first() != Some(&b'/') {
-                current_path.push(b'/');
-            }
-            current_path.extend_from_slice(comp);
-
-            // Check for mount point before walking
-            let mounts = MOUNTS.lock();
-            if let Some(mp) = mounts.find(&current_path) {
-                if let Some(ref root) = mp.root {
-                    chan = root.dup();
-                }
-            }
-            drop(mounts);
-
-            // Handle parent directory
-            if comp == b".." {
-                // For "..", we need to walk up
-                // First check if we should return to parent mount
-                let parent_path = parent_path(&current_path).unwrap_or_default();
-
-                let mounts = MOUNTS.lock();
-                if let Some(mp) = mounts.find(&parent_path) {
-                    // Check if this mount point has a different root
-                    if let Some(ref root) = mp.root {
-                        let root_qid = root.qid;
-                        if root_qid.path != chan.qid.path {
-                            // We're at the root of a mount, go back to parent mount's root
-                            chan = root.dup();
-                            // Update current path to parent
-                            current_path = parent_path;
-                            continue;
-                        }
-                    }
-                }
-                drop(mounts);
-
-                // Walk ".." in current channel
-                if let Some(dev) = devs().get(chan.dev) {
-                    // Walk returns the new channel position after ".."
-                    if dev.walk(&mut chan, "..").is_err() {
-                        return Err(VfsError::Enoent);
-                    }
-                } else {
-                    return Err(VfsError::Enoent);
-                }
-
-                // Update current path
-                if let Some(pp) = parent_path(&current_path) {
-                    current_path = pp;
-                }
-                continue;
-            }
-
-            // Walk to child
-            let name = core::str::from_utf8(comp)
-                .map_err(|_| VfsError::Einval)?;
-
-            // Get device for current channel
-            let dev = match devs().get(chan.dev) {
-                Some(d) => d,
-                None => return Err(VfsError::Enoent),
-            };
-
-            // Walk to child component
-            match dev.walk(&mut chan, name) {
-                Ok(Some(_qid)) => {
-                    // Successfully walked
-                    continue;
-                }
-                Ok(None) => {
-                    // Component doesn't exist
-                    match amode {
-                        NamecMode::Create(mode, _perm) => {
-                            // Create the file
-                            if let Some(d) = devs().get(chan.dev) {
-                                let name_owned = name.to_string();
-                                d.create(&mut chan, &name_owned, mode as u8, perm)
-                                    .map_err(|_| VfsError::Eio)?;
-                            } else {
-                                return Err(VfsError::Enoent);
-                            }
-                        }
-                        _ => return Err(VfsError::Enoent),
-                    }
-                }
-                Err(_) => return Err(VfsError::Enoent),
-            }
-        }
-    }
-
-    // 4. Execute final operation based on mode
-    match amode {
-        NamecMode::Open(mode) => {
-            // Open the channel
-            if let Some(dev) = devs().get(chan.dev) {
-                dev.open(&mut chan, mode as u8).map_err(VfsError::from_dev_error)?;
-            } else {
-                return Err(VfsError::Enoent);
-            }
-        }
-        NamecMode::Create(mode, perm) => {
-            // Create file if it doesn't exist
-            let name = file_name(path).and_then(|n| core::str::from_utf8(n).ok());
-            if let Some(name_str) = name {
-                if let Some(dev) = devs().get(chan.dev) {
-                    dev.create(&mut chan, name_str, mode as u8, perm)
-                        .map_err(VfsError::from_dev_error)?;
-                } else {
-                    return Err(VfsError::Enoent);
-                }
-            }
-        }
-        NamecMode::Walk => {
-            // Just walk, don't open
-        }
-        NamecMode::Bind(flags) => {
-            // TODO: Bind mount - would set up mount table entry
-            let _ = flags;
-        }
-        NamecMode::Unmount => {
-            // TODO: Unmount
-        }
-    }
-
-    Ok(chan)
-}
-
-/// Parse path into components
-fn parse_path_components(path: &[u8]) -> Vec<&[u8]> {
-    let mut components = Vec::new();
-    let mut i = 0;
-    
-    // Skip leading slashes
-    while i < path.len() && path[i] == b'/' {
-        i += 1;
-    }
-    
-    while i < path.len() {
-        let start = i;
-        while i < path.len() && path[i] != b'/' {
-            i += 1;
-        }
-        if i > start {
-            components.push(&path[start..i]);
-        }
-        while i < path.len() && path[i] == b'/' {
-            i += 1;
-        }
-    }
-    
-    components
-}
-
 // ============================================================================
-// VFS Operations
+// Mount table
 // ============================================================================
 
-/// Open file
-pub fn open(path: &[u8], mode: u32) -> Result<Chan, VfsError> {
-    let chan = namec(path, 0, mode, 0)?;
-    
-    // Open the channel
-    if let Some(dev) = devs().get(chan.dev) {
-        dev.open(&mut chan.clone(), mode as u8).map_err(|_| VfsError::Eio)?;
-    }
-    
-    Ok(chan)
+#[derive(Debug)]
+pub struct MountPoint {
+    /// Source (device or server)
+    pub source: Vec<u8>,
+    /// Mount point path
+    pub path: Vec<u8>,
+    /// File system type
+    pub fs_type: Vec<u8>,
+    /// Mount flags
+    pub flags: u32,
+    /// Root channel for this mount
+    pub root: Option<Chan>,
+    /// Next mount index in the static table
+    pub next: Option<usize>,
 }
 
-// ============================================================================
-// Channel Operations
-// ============================================================================
-
-impl Chan {
-    /// Clone this channel - creates a new reference to the same underlying channel
-    /// Increments the reference count
-    pub fn dup(&self) -> Self {
-        self.incref();
+impl MountPoint {
+    pub fn new(source: &[u8], path: &[u8], fs_type: &[u8]) -> Self {
         Self {
-            dev: self.dev,
-            qid: self.qid,
-            mode: self.mode,
-            flag: self.flag,
-            offset: self.offset,
-            aux: self.aux.clone(),
-            refcount: Spinlock::new(self.refcount()),
+            source: source.to_vec(),
+            path: path.to_vec(),
+            fs_type: fs_type.to_vec(),
+            flags: 0,
+            root: None,
+            next: None,
+        }
+    }
+}
+
+pub struct MountTable {
+    entries: [Option<MountPoint>; NMOUNT],
+    count: usize,
+}
+
+impl MountTable {
+    pub const fn new() -> Self {
+        Self {
+            entries: [const { None }; NMOUNT],
+            count: 0,
         }
     }
 
-    /// Get parent directory channel
-    /// This walks ".." from the current channel
-    pub fn parent(&mut self) -> Result<Chan, VfsError> {
-        if let Some(dev) = devs().get(self.dev) {
-            // Walk to ".." in the current directory
-            match dev.walk(self, "..") {
-                Ok(_) => {
-                    // Walk succeeded - return the channel at parent
-                    Ok(self.dup())
+    pub fn add(&mut self, mp: MountPoint) -> Option<usize> {
+        for (i, slot) in self.entries.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(mp);
+                self.count += 1;
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    pub fn remove(&mut self, path: &[u8]) -> Option<MountPoint> {
+        for (i, slot) in self.entries.iter_mut().enumerate() {
+            if let Some(mp) = slot {
+                if mp.path == path {
+                    self.count -= 1;
+                    return slot.take();
                 }
-                Err(_) => Err(VfsError::Enoent),
             }
-        } else {
-            Err(VfsError::Enoent)
         }
+        None
     }
 
-    /// Walk to a child component
-    pub fn walk_to(&mut self, name: &str) -> Result<Option<Qid>, VfsError> {
-        if let Some(dev) = crate::dev::devs().get(self.dev) {
-            dev.walk(self, name).map_err(VfsError::from_dev_error)
-        } else {
-            Err(VfsError::Enoent)
-        }
-    }
+    /// Longest-prefix match; `find(b"")` returns the root mount.
+    pub fn find(&self, path: &[u8]) -> Option<&MountPoint> {
+        let mut best: Option<&MountPoint> = None;
+        let mut best_len = 0usize;
 
-    /// Open this channel with a mode
-    pub fn open(&mut self, mode: u8) -> Result<(), VfsError> {
-        if let Some(dev) = crate::dev::devs().get(self.dev) {
-            dev.open(self, mode).map_err(VfsError::from_dev_error)
-        } else {
-            Err(VfsError::Enoent)
-        }
-    }
-
-    /// Create a file in this directory
-    pub fn create(&mut self, name: &str, mode: u8, perm: u32) -> Result<(), VfsError> {
-        if let Some(dev) = crate::dev::devs().get(self.dev) {
-            dev.create(self, name, mode, perm).map_err(VfsError::from_dev_error)
-        } else {
-            Err(VfsError::Enoent)
-        }
-    }
-
-    /// Read from this channel
-    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, VfsError> {
-        if let Some(dev) = crate::dev::devs().get(self.dev) {
-            let offset = self.offset;
-            let result = dev.read(self, buf, offset).map_err(VfsError::from_dev_error);
-            if let Ok(n) = result {
-                self.offset += n as u64;
+        for slot in &self.entries {
+            if let Some(mp) = slot {
+                let mp_path = if mp.path.first() == Some(&b'/') {
+                    &mp.path[1..]
+                } else {
+                    &mp.path[..]
+                };
+                let check = if path.first() == Some(&b'/') {
+                    &path[1..]
+                } else {
+                    path
+                };
+                if check.starts_with(mp_path) && mp_path.len() > best_len {
+                    best = Some(mp);
+                    best_len = mp_path.len();
+                }
             }
-            result
+        }
+        best
+    }
+
+    /// Exact mount-point match.  A mount point consumes exactly the
+    /// component named by its path; paths *below* it must continue walking
+    /// inside the mounted filesystem instead of being redirected again.
+    pub fn find_exact(&self, path: &[u8]) -> Option<&MountPoint> {
+        let check = if path.first() == Some(&b'/') {
+            &path[1..]
         } else {
-            Err(VfsError::Enoent)
+            path
+        };
+        let check = check.strip_suffix(b"/").unwrap_or(check);
+
+        for slot in &self.entries {
+            if let Some(mp) = slot {
+                let mp_path = if mp.path.first() == Some(&b'/') {
+                    &mp.path[1..]
+                } else {
+                    &mp.path[..]
+                };
+                let mp_path = mp_path.strip_suffix(b"/").unwrap_or(mp_path);
+                if check == mp_path {
+                    return Some(mp);
+                }
+            }
         }
+        None
     }
 
-    /// Write to this channel
-    pub fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError> {
-        if let Some(dev) = crate::dev::devs().get(self.dev) {
-            let offset = self.offset;
-            let result = dev.write(self, buf, offset).map_err(VfsError::from_dev_error);
-            if let Ok(n) = result {
-                self.offset += n as u64;
-            }
-            result
-        } else {
-            Err(VfsError::Enoent)
-        }
+    pub fn iter(&self) -> impl Iterator<Item = &MountPoint> {
+        self.entries.iter().flatten()
     }
 
-    /// Seek in this channel
-    pub fn seek(&mut self, offset: u64, whence: u8) -> Result<u64, VfsError> {
-        // Simple seek implementation
-        match whence {
-            0 => { // SEEK_SET
-                self.offset = offset;
-            }
-            1 => { // SEEK_CUR
-                self.offset += offset;
-            }
-            2 => { // SEEK_END
-                // Would need stat to get file size
-                self.offset = offset; // Simplified
-            }
-            _ => return Err(VfsError::Einval),
-        }
-        Ok(self.offset)
-    }
-
-    /// Close this channel
-    pub fn close(&mut self) {
-        if let Some(dev) = devs().get(self.dev) {
-            dev.close(self);
-        }
-        if self.decref() == 0 {
-            // Actually close when refcount reaches 0
-        }
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut MountPoint> {
+        self.entries.iter_mut().flatten()
     }
 }
 
 // ============================================================================
-// File Descriptor Operations
+// Global VFS state
 // ============================================================================
 
-/// Global file descriptor allocator
-static NEXT_FD: AtomicU64 = AtomicU64::new(0);
+static MOUNTS: Mutex<MountTable> = Mutex::new(MountTable::new());
+static ROOT_CHAN: Spinlock<Option<Chan>> = Spinlock::new(None);
+static NEXT_QID: AtomicU64 = AtomicU64::new(0x1000);
 
-/// Open file and return file descriptor
-pub fn sys_open(path: &[u8], mode: u32) -> Result<i32, VfsError> {
-    let chan = open(path, mode)?;
-    
-    // Allocate fd
-    let fd = NEXT_FD.fetch_add(1, Ordering::SeqCst) as i32;
-    
-    // Store in current process's fgrp
-    // This would be done in syscall handler
-    
-    Ok(fd)
-}
-
-/// Read from file descriptor
-pub fn sys_read(fd: i32, buf: &mut [u8]) -> Result<usize, VfsError> {
-    // Would get channel from current process's fgrp
-    
-    // For stdin (fd 0), read from console
-    if fd == 0 {
-        // Would read from keyboard
-        Ok(0)
-    } else {
-        Err(VfsError::Ebadfd)
-    }
-}
-
-/// Write to file descriptor
-pub fn sys_write(fd: i32, buf: &[u8]) -> Result<usize, VfsError> {
-    // For stdout/stderr, write to console
-    if fd == 1 || fd == 2 {
-        // Would write to console device
-        Ok(buf.len())
-    } else {
-        Err(VfsError::Ebadfd)
-    }
-}
-
-/// Close file descriptor
-pub fn sys_close(fd: i32) -> Result<(), VfsError> {
-    // Would close channel in current process's fgrp
-    Ok(())
-}
-
-/// Apply/remove an advisory lock on an open file.
-///
-/// `operation` follows the flock(2) encoding:
-///   LOCK_SH=1, LOCK_EX=2, LOCK_UN=8, LOCK_NB=4.
-///
-/// Plan 9 has no equivalent; we always report success because
-/// downstream syscalls assume locks are advisory. A future
-/// `9P.lock` extension can replace this stub.
-pub fn sys_flock(_fd: i32, _operation: i32) -> Result<(), VfsError> {
-    Ok(())
-}
-
-/// Create a symbolic link.
-///
-/// Plan 9 has no symbolic links; this returns `Enotsup`.
-pub fn symlink(_target: &[u8], _link: &[u8]) -> Result<(), VfsError> {
-    Err(VfsError::Enotsup)
-}
-
-/// Read a symbolic link target.
-///
-/// Plan 9 has no symbolic links; this returns `Enotsup`.
-pub fn readlink(_path: &[u8], _buf: &mut [u8]) -> Result<usize, VfsError> {
-    Err(VfsError::Enotsup)
+/// Allocate a monotonically increasing Qid path for anonymous channels.
+fn fresh_qid_path() -> u64 {
+    NEXT_QID.fetch_add(1, Ordering::Relaxed)
 }
 
 // ============================================================================
-// Errors
+// VFS errors
 // ============================================================================
 
-/// VFS error type
 #[derive(Debug)]
 pub enum VfsError {
     Ok,
@@ -696,314 +319,593 @@ impl VfsError {
         }
     }
 
-    /// Convert from DevError
-    pub fn from_dev_error(err: DevErrorEnum) -> Self {
+    pub fn from_dev_error(err: DevError) -> Self {
         match err {
-            DevErrorEnum::Ok => VfsError::Ok,
-            DevErrorEnum::Enoent => VfsError::Enoent,
-            DevErrorEnum::Eperm => VfsError::Eperm,
-            DevErrorEnum::Enomem => VfsError::Enomem,
-            DevErrorEnum::Ebadfd => VfsError::Ebadfd,
-            DevErrorEnum::Eio => VfsError::Eio,
-            DevErrorEnum::Einval => VfsError::Einval,
-            DevErrorEnum::Enotdir => VfsError::Enotdir,
-            DevErrorEnum::Eisdir => VfsError::Eisdir,
-            DevErrorEnum::Eexists => VfsError::Eexists,
+            DevError::Ok => VfsError::Ok,
+            DevError::Enoent => VfsError::Enoent,
+            DevError::Eperm => VfsError::Eperm,
+            DevError::Enomem => VfsError::Enomem,
+            DevError::Ebadfd => VfsError::Ebadfd,
+            DevError::Eio => VfsError::Eio,
+            DevError::Einval => VfsError::Einval,
+            DevError::Enotdir => VfsError::Enotdir,
+            DevError::Eisdir => VfsError::Eisdir,
+            DevError::Eexists => VfsError::Eexists,
+            DevError::Enospace => VfsError::Enomem,
+            DevError::Enotsup => VfsError::Enotsup,
             _ => VfsError::Unknown,
         }
     }
 }
 
-/// Mount flags
-pub const MBEFORE: u32 = 0x01;  // Mount before existing
-pub const MAFTER: u32 = 0x02;    // Mount after existing
-pub const MCREATE: u32 = 0x04;   // Auto-create directory
-pub const MCACHE: u32 = 0x08;    // Cache results
-pub const MREPL: u32 = 0x10;     // Replace existing
-pub const MBIND: u32 = 0x20;      // Bind mount (Plan 9 style)
-pub const MUNION: u32 = 0x40;    // Union mount (layered)
-
 // ============================================================================
-// Global VFS State
+// Device helpers
 // ============================================================================
 
-/// Mount table - stores all mount points in the system
-static MOUNTS: Mutex<MountTable> = Mutex::new(MountTable::new());
-
-/// Root file system channel
-static ROOT_CHAN: Spinlock<Option<Chan>> = Spinlock::new(None);
-
-/// Mount table structure
-pub struct MountTable {
-    /// Array of mount points
-    entries: [Option<MountPoint>; NMOUNT],
-    /// Number of active mounts
-    count: usize,
+/// Attach the device at `index` and produce a channel.
+fn attach_device(index: usize, spec: Option<&str>, mode: u8) -> Result<Chan, VfsError> {
+    match devs_mut().get_mut(index) {
+        Some(dev) => dev.attach(spec).map_err(VfsError::from_dev_error),
+        None => Err(VfsError::Enoent),
+    }
+    .map(|mut c| {
+        // Device implementations use their Plan 9 device type in Chan::new,
+        // but Chan.dev is a table index used by dev_read/dev_write/etc.
+        // Always bind the channel to the actual registered slot.
+        c.dev = index;
+        c.mode = mode;
+        c
+    })
 }
 
-impl MountTable {
-    /// Create new mount table
-    pub const fn new() -> Self {
+/// Find the root device index.
+fn root_device_index() -> Option<usize> {
+    dev::devs().find_by_char(ROOTDEV)
+}
+
+/// Current working directory, taken from the process namespace.
+fn proc_namespace_dot() -> Option<Chan> {
+    let proc = crate::proc::curproc()?;
+    let pgrp = proc.pgrp.as_ref()?;
+    let ns = pgrp.namespace()?;
+    ns.dot.as_ref().map(|c| c.dup())
+}
+
+// ============================================================================
+// namec()
+// ============================================================================
+
+pub fn namec(
+    path: &[u8],
+    amode: NamecMode,
+    _omode: u32,
+    perm: u32,
+) -> Result<Chan, VfsError> {
+    if path.is_empty() {
+        return Err(VfsError::Einval);
+    }
+    if path.len() > MAX_FILE_NAME * MAX_PATH_COMPONENTS {
+        return Err(VfsError::Enametoolong);
+    }
+
+    let (start, rest) = parse_path_start(path);
+
+    let mut chan = match start {
+        PathStart::Root => {
+            // Root mount if one exists; otherwise the root device.
+            let mut mounts = MOUNTS.lock();
+            if let Some(mp) = mounts.find_exact(b"") {
+                if let Some(root) = mp.root.as_ref() {
+                    return walk_from_root(root, rest, amode, perm);
+                }
+            }
+            drop(mounts);
+
+            if let Some(root) = ROOT_CHAN.lock().as_ref() {
+                return walk_from_root(root, rest, amode, perm);
+            }
+
+            let idx = root_device_index().ok_or(VfsError::Enoent)?;
+            attach_device(idx, None, 0)?
+        }
+
+        PathStart::Special(c) => {
+            let idx = dev::devs().find_by_char(c).ok_or(VfsError::Enoent)?;
+            let spec = rest.and_then(|r| core::str::from_utf8(r).ok());
+            attach_device(idx, spec, 0)?
+        }
+
+        PathStart::Current => {
+            if let Some(dot) = proc_namespace_dot() {
+                dot
+            } else if let Some(root) = ROOT_CHAN.lock().as_ref() {
+                root.dup()
+            } else {
+                let idx = root_device_index().ok_or(VfsError::Enoent)?;
+                attach_device(idx, None, 0)?
+            }
+        }
+
+        PathStart::Parent => {
+            let dot = proc_namespace_dot().ok_or(VfsError::Eperm)?;
+            let mut parent = dot.dup();
+            let dev = devs_mut().get_mut(parent.dev).ok_or(VfsError::Enoent)?;
+            if dev.walk(&mut parent, "..").is_err() {
+                return Err(VfsError::Enoent);
+            }
+            parent
+        }
+    };
+
+    // Walk the remaining components.
+    let mut current_path: Vec<u8> = Vec::new();
+    let components = rest.map(parse_path).unwrap_or_default();
+
+    for comp in components {
+        if comp.is_empty() || comp == b"." {
+            continue;
+        }
+
+        if comp == b".." {
+            if let Some(dev) = devs_mut().get_mut(chan.dev) {
+                if dev.walk(&mut chan, "..").is_err() {
+                    return Err(VfsError::Enoent);
+                }
+            } else {
+                return Err(VfsError::Enoent);
+            }
+            current_path = parent_path(&current_path).unwrap_or_else(|| b"/".to_vec());
+            continue;
+        }
+
+        current_path.push(b'/');
+        current_path.extend_from_slice(comp);
+
+        // Mount table redirect: if this path is a mount point, switch to the
+        // mounted device's root.  The component that names the mount point is
+        // consumed by the mount itself, so we do not walk it again inside the
+        // mounted device.
+        {
+            let mounts = MOUNTS.lock();
+            if let Some(mp) = mounts.find_exact(&current_path) {
+                if let Some(root) = mp.root.as_ref() {
+                    chan = root.dup();
+                    continue;
+                }
+            }
+        }
+
+        let name = core::str::from_utf8(comp).map_err(|_| VfsError::Einval)?;
+        let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
+
+        match dev.walk(&mut chan, name) {
+            Ok(Some(_qid)) => {}
+            Ok(None) => {
+                if let NamecMode::Create(mode, create_perm) = amode {
+                    dev.create(&mut chan, name, mode as u8, create_perm)
+                        .map_err(VfsError::from_dev_error)?;
+                } else {
+                    return Err(VfsError::Enoent);
+                }
+            }
+            Err(e) => return Err(VfsError::from_dev_error(e)),
+        }
+    }
+
+    if let NamecMode::Remove = amode {
+        if let Some(dev) = devs_mut().get_mut(chan.dev) {
+            dev.remove(&mut chan).map_err(VfsError::from_dev_error)?;
+        } else {
+            return Err(VfsError::Enoent);
+        }
+    }
+
+    Ok(chan)
+}
+
+fn walk_from_root(
+    root: &Chan,
+    rest: Option<&[u8]>,
+    amode: NamecMode,
+    perm: u32,
+) -> Result<Chan, VfsError> {
+    let mut chan = root.dup();
+    let components = rest.map(parse_path).unwrap_or_default();
+    let mut current_path: Vec<u8> = Vec::new();
+
+    for comp in components {
+        if comp.is_empty() || comp == b"." {
+            continue;
+        }
+        if comp == b".." {
+            if let Some(dev) = devs_mut().get_mut(chan.dev) {
+                if dev.walk(&mut chan, "..").is_err() {
+                    return Err(VfsError::Enoent);
+                }
+            } else {
+                return Err(VfsError::Enoent);
+            }
+            current_path = parent_path(&current_path).unwrap_or_else(|| b"/".to_vec());
+            continue;
+        }
+
+        current_path.push(b'/');
+        current_path.extend_from_slice(comp);
+
+        // A mount point consumes this component and switches to the mounted
+        // device root; do not walk the same name inside that device.
+        {
+            let mounts = MOUNTS.lock();
+            if let Some(mp) = mounts.find_exact(&current_path) {
+                if let Some(root) = mp.root.as_ref() {
+                    chan = root.dup();
+                    continue;
+                }
+            }
+        }
+
+        let name = core::str::from_utf8(comp).map_err(|_| VfsError::Einval)?;
+        let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
+        match dev.walk(&mut chan, name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let NamecMode::Create(mode, create_perm) = amode {
+                    dev.create(&mut chan, name, mode as u8, create_perm)
+                        .map_err(VfsError::from_dev_error)?;
+                } else {
+                    return Err(VfsError::Enoent);
+                }
+            }
+            Err(e) => return Err(VfsError::from_dev_error(e)),
+        }
+    }
+
+    // The mount point itself should return the mounted device's root.
+    if let Some(mp) = MOUNTS.lock().find_exact(&current_path) {
+        if let Some(root) = mp.root.as_ref() {
+            chan = root.dup();
+        }
+    }
+
+    Ok(chan)
+}
+
+// ============================================================================
+// Channel helpers
+// ============================================================================
+
+impl Chan {
+    /// Duplicate a reference to the same channel.
+    pub fn dup(&self) -> Self {
+        self.incref();
         Self {
-            entries: [const { None }; NMOUNT],
-            count: 0,
+            dev: self.dev,
+            qid: self.qid,
+            mode: self.mode,
+            flag: self.flag,
+            offset: self.offset,
+            // `aux` is device-private and not generally cloneable.
+            aux: None,
+            refcount: Mutex::new(self.refcount()),
         }
     }
 
-    /// Add a mount point
-    pub fn add(&mut self, mp: MountPoint) -> Option<usize> {
-        // Find empty slot
-        for (i, slot) in self.entries.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(mp);
-                self.count += 1;
-                return Some(i);
-            }
+    pub fn parent(&mut self) -> Result<Chan, VfsError> {
+        let dev = devs_mut().get_mut(self.dev).ok_or(VfsError::Enoent)?;
+        if dev.walk(self, "..").is_err() {
+            return Err(VfsError::Enoent);
         }
-        None
+        Ok(self.dup())
     }
 
-    /// Remove a mount point by path
-    pub fn remove(&mut self, path: &[u8]) -> Option<MountPoint> {
-        for (i, slot) in self.entries.iter_mut().enumerate() {
-            if let Some(ref mp) = slot {
-                if &mp.path[..] == path {
-                    self.count -= 1;
-                    return slot.take();
-                }
-            }
+    pub fn walk_to(&mut self, name: &str) -> Result<Option<Qid>, VfsError> {
+        let dev = devs_mut().get_mut(self.dev).ok_or(VfsError::Enoent)?;
+        dev.walk(self, name).map_err(VfsError::from_dev_error)
+    }
+
+    pub fn open(&mut self, mode: u8) -> Result<(), VfsError> {
+        let dev = devs_mut().get_mut(self.dev).ok_or(VfsError::Enoent)?;
+        dev.open(self, mode).map_err(VfsError::from_dev_error)
+    }
+
+    pub fn create(&mut self, name: &str, mode: u8, perm: u32) -> Result<(), VfsError> {
+        let dev = devs_mut().get_mut(self.dev).ok_or(VfsError::Enoent)?;
+        dev.create(self, name, mode, perm).map_err(VfsError::from_dev_error)
+    }
+
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, VfsError> {
+        let dev = devs_mut().get_mut(self.dev).ok_or(VfsError::Enoent)?;
+        let result = dev.read(self, buf, self.offset).map_err(VfsError::from_dev_error)?;
+        self.offset += result as u64;
+        Ok(result)
+    }
+
+    pub fn write(&mut self, buf: &[u8]) -> Result<usize, VfsError> {
+        let dev = devs_mut().get_mut(self.dev).ok_or(VfsError::Enoent)?;
+        let result = dev.write(self, buf, self.offset).map_err(VfsError::from_dev_error)?;
+        self.offset += result as u64;
+        Ok(result)
+    }
+
+    pub fn seek(&mut self, offset: u64, whence: u8) -> Result<u64, VfsError> {
+        match whence {
+            0 => self.offset = offset,
+            1 => self.offset = self.offset.saturating_add(offset),
+            2 => self.offset = offset, // no file length available -> treat as end
+            _ => return Err(VfsError::Einval),
         }
-        None
+        Ok(self.offset)
     }
 
-    /// Find the best matching mount point for a path
-    /// Returns the mount point with the longest path prefix match
-    pub fn find(&self, path: &[u8]) -> Option<&MountPoint> {
-        let mut best_match: Option<&MountPoint> = None;
-        let mut best_len = 0;
-
-        for slot in &self.entries {
-            if let Some(ref mp) = slot {
-                // Check if path starts with mount point path
-                let mp_path = if mp.path.first() == Some(&b'/') {
-                    &mp.path[1..]
-                } else {
-                    &mp.path
-                };
-
-                let path_to_check = if path.first() == Some(&b'/') {
-                    &path[1..]
-                } else {
-                    path
-                };
-
-                if path_to_check.starts_with(mp_path) && mp_path.len() > best_len {
-                    best_match = Some(mp);
-                    best_len = mp_path.len();
-                }
-            }
-        }
-
-        best_match
-    }
-
-    /// Get iterator over all mount points
-    pub fn iter(&self) -> impl Iterator<Item = &MountPoint> {
-        self.entries.iter().flatten()
-    }
-
-    /// Get mutable iterator over all mount points
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut MountPoint> {
-        self.entries.iter_mut().flatten()
+    pub fn stat(&mut self) -> Result<DirEntry, VfsError> {
+        let dev = devs_mut().get_mut(self.dev).ok_or(VfsError::Enoent)?;
+        dev.stat(self).map_err(VfsError::from_dev_error)
     }
 }
 
-/// Initialize VFS
+// ============================================================================
+// Public operations
+// ============================================================================
+
+pub fn open(path: &[u8], mode: u32) -> Result<Chan, VfsError> {
+    let mut chan = namec(path, NamecMode::Open(mode), 0, 0)?;
+    let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
+    dev.open(&mut chan, mode as u8)
+        .map_err(VfsError::from_dev_error)?;
+    Ok(chan)
+}
+
+/// Adapter that exposes a kernel `dev::Chan` through the `proc::Chan` trait.
+pub struct DevChanAdapter {
+    chan: Chan,
+}
+
+impl DevChanAdapter {
+    pub fn new(chan: Chan) -> Self {
+        Self { chan }
+    }
+}
+
+impl crate::proc::Chan for DevChanAdapter {
+    fn read(&mut self, buf: &mut [u8]) -> crate::proc::Result<usize> {
+        let dev = match devs_mut().get_mut(self.chan.dev) {
+            Some(d) => d,
+            None => return Err(crate::proc::Error::Eio),
+        };
+        let offset = self.chan.offset;
+        let n = match dev.read(&mut self.chan, buf, offset) {
+            Ok(n) => n,
+            Err(_) => return Err(crate::proc::Error::Eio),
+        };
+        self.chan.offset += n as u64;
+        Ok(n)
+    }
+
+    fn write(&mut self, buf: &[u8]) -> crate::proc::Result<usize> {
+        let dev = match devs_mut().get_mut(self.chan.dev) {
+            Some(d) => d,
+            None => return Err(crate::proc::Error::Eio),
+        };
+        let offset = self.chan.offset;
+        let n = match dev.write(&mut self.chan, buf, offset) {
+            Ok(n) => n,
+            Err(_) => return Err(crate::proc::Error::Eio),
+        };
+        self.chan.offset += n as u64;
+        Ok(n)
+    }
+
+    fn close(&mut self) {
+        if let Some(dev) = devs_mut().get_mut(self.chan.dev) {
+            dev.close(&mut self.chan);
+        }
+    }
+
+    fn dev(&self) -> usize {
+        self.chan.dev
+    }
+
+    fn offset(&self) -> u64 {
+        self.chan.offset
+    }
+
+    fn set_offset(&mut self, offset: u64) {
+        self.chan.offset = offset;
+    }
+
+    fn dup(&self) -> alloc::boxed::Box<dyn crate::proc::Chan> {
+        alloc::boxed::Box::new(DevChanAdapter::new(self.chan.dup()))
+    }
+
+    fn stat(&mut self) -> crate::proc::Result<crate::dev::DirEntry> {
+        let dev = match devs_mut().get_mut(self.chan.dev) {
+            Some(d) => d,
+            None => return Err(crate::proc::Error::Eio),
+        };
+        match dev.stat(&mut self.chan) {
+            Ok(s) => Ok(s),
+            Err(_) => Err(crate::proc::Error::Eio),
+        }
+    }
+}
+
+fn fgrp() -> Option<&'static mut crate::proc::Fgrp> {
+    crate::proc::curproc_mut()
+        .and_then(|p| p.fgrp.as_mut())
+        .map(|b| b.as_mut())
+}
+
+fn alloc_fd(chan: Chan) -> Result<i32, VfsError> {
+    let f = fgrp().ok_or(VfsError::Eperm)?;
+    let fd = f.alloc_fd(alloc::boxed::Box::new(DevChanAdapter::new(chan)));
+    if fd < 0 {
+        return Err(VfsError::Enomem);
+    }
+    Ok(fd)
+}
+
+fn fd_channel(fd: i32) -> Option<&'static mut alloc::boxed::Box<dyn crate::proc::Chan>> {
+    if fd < 0 {
+        return None;
+    }
+    fgrp().and_then(|f| f.get_channel(fd))
+}
+
+pub fn sys_open(path: &[u8], mode: u32) -> Result<i32, VfsError> {
+    let chan = open(path, mode)?;
+    alloc_fd(chan)
+}
+
+pub fn sys_create(path: &[u8], mode: u32, perm: u32) -> Result<i32, VfsError> {
+    let mut chan = namec(path, NamecMode::Create(mode, perm), mode, perm)?;
+    let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
+    dev.open(&mut chan, mode as u8)
+        .map_err(VfsError::from_dev_error)?;
+    alloc_fd(chan)
+}
+
+pub fn sys_read(fd: i32, buf: &mut [u8]) -> Result<usize, VfsError> {
+    let chan = fd_channel(fd).ok_or(VfsError::Ebadfd)?;
+    chan.read(buf).map_err(|_| VfsError::Eio)
+}
+
+pub fn sys_write(fd: i32, buf: &[u8]) -> Result<usize, VfsError> {
+    let chan = fd_channel(fd).ok_or(VfsError::Ebadfd)?;
+    chan.write(buf).map_err(|_| VfsError::Eio)
+}
+
+pub fn sys_close(fd: i32) -> Result<(), VfsError> {
+    let f = fgrp().ok_or(VfsError::Eperm)?;
+    if f.close_fd(fd).is_none() {
+        return Err(VfsError::Ebadfd);
+    }
+    Ok(())
+}
+
+pub fn sys_flock(_fd: i32, _operation: i32) -> Result<(), VfsError> {
+    // Advisory locks are not implemented in the prototype.
+    Err(VfsError::Enotsup)
+}
+
+pub fn symlink(_target: &[u8], _link: &[u8]) -> Result<(), VfsError> {
+    Err(VfsError::Enotsup)
+}
+
+pub fn readlink(_path: &[u8], _buf: &mut [u8]) -> Result<usize, VfsError> {
+    Err(VfsError::Enotsup)
+}
+
+// ============================================================================
+// Mount operations
+// ============================================================================
+
 pub fn init_vfs() {
-    // Initialize empty mount table
-    // Root file system will be mounted later during boot
+    // Mount table starts empty; the root channel is installed during boot.
 }
 
-/// Get the root channel
 pub fn get_root_chan() -> Option<Chan> {
     ROOT_CHAN.lock().as_ref().map(|c| c.dup())
 }
 
-/// Set the root channel
 pub fn set_root_chan(chan: Chan) {
     *ROOT_CHAN.lock() = Some(chan);
 }
 
-/// Mount a file system
-pub fn mount(source: Option<&[u8]>, target: &[u8], fs_type: &[u8], flags: u32) -> Result<(), VfsError> {
-    let mut mounts = MOUNTS.lock();
+pub fn mount(
+    source: Option<&[u8]>,
+    target: &[u8],
+    fs_type: &[u8],
+    flags: u32,
+) -> Result<(), VfsError> {
+    let src = source.unwrap_or(b"/");
 
-    // Get source device channel
-    let root = if let Some(src) = source {
-        // Parse source as device or path
-        let dev_char = src.first().copied().unwrap_or(b'#') as char;
-        if dev_char == b'/' || dev_char == b'#' {
-            // Path or special device
-            let dev = devs().find_by_char(dev_char)
-                .ok_or(VfsError::Enoent)?;
-            dev.attach(Some(core::str::from_utf8(&src[1..]).unwrap_or("")))
-                .map_err(|_| VfsError::Eio)?
-        } else {
-            // Device name
-            let dev = devs().find_by_char(dev_char)
-                .ok_or(VfsError::Enoent)?;
-            dev.attach(Some(core::str::from_utf8(src).unwrap_or("")))
-                .map_err(|_| VfsError::Eio)?
-        }
+    // A source such as `#p` names the device by the character after `#`.
+    // A plain source such as `/` names the root device directly.
+    let (dev_char, spec) = if src.len() >= 2 && src[0] == b'#' {
+        (src[1] as char, core::str::from_utf8(&src[2..]).unwrap_or(""))
     } else {
-        // No source - create anonymous file system
-        return Err(VfsError::Einval);
+        (src.first().copied().unwrap_or(b'#') as char,
+         core::str::from_utf8(&src[1..]).unwrap_or(""))
     };
 
-    let mp = MountPoint::new(
-        source.unwrap_or(b""),
-        target,
-        fs_type,
-    );
+    let idx = dev::devs().find_by_char(dev_char).ok_or(VfsError::Enoent)?;
+    let root = attach_device(idx, Some(spec), 0)?;
 
-    let mut mp = mp;
+    let mut mp = MountPoint::new(src, target, fs_type);
     mp.flags = flags;
     mp.root = Some(root);
 
+    let mut mounts = MOUNTS.lock();
     if mounts.add(mp).is_none() {
         return Err(VfsError::Enomem);
     }
-
     Ok(())
 }
 
-/// Unmount a file system
 pub fn unmount(target: &[u8]) -> Result<(), VfsError> {
     let mut mounts = MOUNTS.lock();
-
     if mounts.remove(target).is_none() {
         return Err(VfsError::Enoent);
     }
-
     Ok(())
 }
 
-/// Find mount point for a path
 pub fn find_mount(path: &[u8]) -> Option<Chan> {
     let mounts = MOUNTS.lock();
-    mounts.find(path).and_then(|mp| mp.root.as_ref().map(|c| c.dup()))
+    mounts.find_exact(path).and_then(|mp| mp.root.as_ref().map(|c| c.dup()))
 }
 
-/// Walk a path starting from a channel
-/// This is the core walk operation used by namec()
 pub fn walk_chan(chan: &mut Chan, name: &str) -> Result<Option<Qid>, VfsError> {
-    if let Some(dev) = devs().get(chan.dev) {
-        dev.walk(chan, name).map_err(VfsError::from_dev_error)
-    } else {
-        Err(VfsError::Enoent)
-    }
+    let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
+    dev.walk(chan, name).map_err(VfsError::from_dev_error)
 }
 
-/// Create a file in a directory
 pub fn create_chan(chan: &mut Chan, name: &str, mode: u8, perm: u32) -> Result<(), VfsError> {
-    if let Some(dev) = devs().get(chan.dev) {
-        dev.create(chan, name, mode, perm).map_err(VfsError::from_dev_error)
-    } else {
-        Err(VfsError::Enoent)
-    }
+    let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
+    dev.create(chan, name, mode, perm).map_err(VfsError::from_dev_error)
 }
 
-/// Open a channel
 pub fn open_chan(chan: &mut Chan, mode: u8) -> Result<(), VfsError> {
-    if let Some(dev) = devs().get(chan.dev) {
-        dev.open(chan, mode).map_err(VfsError::from_dev_error)
-    } else {
-        Err(VfsError::Enoent)
-    }
+    let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
+    dev.open(chan, mode).map_err(VfsError::from_dev_error)
 }
 
-/// Read from a channel
 pub fn read_chan(chan: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, VfsError> {
-    if let Some(dev) = devs().get(chan.dev) {
-        dev.read(chan, buf, offset).map_err(VfsError::from_dev_error)
-    } else {
-        Err(VfsError::Enoent)
-    }
+    let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
+    dev.read(chan, buf, offset).map_err(VfsError::from_dev_error)
 }
 
-/// Write to a channel
 pub fn write_chan(chan: &mut Chan, buf: &[u8], offset: u64) -> Result<usize, VfsError> {
-    if let Some(dev) = devs().get(chan.dev) {
-        dev.write(chan, buf, offset).map_err(VfsError::from_dev_error)
-    } else {
-        Err(VfsError::Enoent)
-    }
+    let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
+    dev.write(chan, buf, offset).map_err(VfsError::from_dev_error)
+}
+
+pub fn bind(source: Chan, target: Chan, _flags: u32) -> Result<(), VfsError> {
+    let _ = source;
+    let _ = target;
+    Ok(())
 }
 
 // ============================================================================
-// Vfs Trait (for file system implementations)
+// VFS trait
 // ============================================================================
 
-/// VFS operations trait - implemented by file systems
+/// File-system operations trait, implemented by concrete file systems.
 pub trait Vfs: Send + Sync {
-    /// Initialize file system
     fn init(&mut self) {}
-
-    /// Get root inode
     fn root(&mut self) -> Result<Chan, VfsError>;
-
-    /// Sync file system
     fn sync(&mut self) {}
 }
 
 // ============================================================================
-// Bind and Mount Helpers
+// Mount-table syscall helpers
 // ============================================================================
 
-/// Bind operation - create an alternate name for a file
-///
-/// Binds source to target. After a bind, accessing target is equivalent
-/// to accessing source.
-///
-/// # Arguments
-/// * `source` - Source channel to bind
-/// * `target` - Target channel that will become an alias for source
-/// * `flags` - Bind flags (MREPL, MBEFORE, MAFTER, MCREATE)
-///
-/// # Returns
-/// * `Ok(())` on success
-pub fn bind(source: Chan, target: Chan, _flags: u32) -> Result<(), VfsError> {
-    // In Plan 9, bind creates a new mount entry that redirects
-    // access to one path to another. For now, we just close
-    // both channels and return success.
-    // A full implementation would:
-    // 1. Create a new mount point entry
-    // 2. Add it to the mount table
-    // 3. Set up the redirect
-    let _ = source;
-    let _ = target;
-
-    // For now, return success as the bind operation is conceptually complete
-    Ok(())
-}
-
-// ============================================================================
-// Mount Table Module (for syscall interface)
-// ============================================================================
-
-/// Mount table management module
 pub mod mount_table {
     use super::*;
 
-    /// Add a mount point to the mount table
     pub fn add(source: Chan, path: String, flags: u32) -> Result<(), VfsError> {
-        let mp = MountPoint::new(
-            path.as_bytes(),
-            path.as_bytes(),
-            b"bind",
-        );
-
-        let mut mp = mp;
+        let mut mp = MountPoint::new(path.as_bytes(), path.as_bytes(), b"bind");
         mp.flags = flags;
         mp.root = Some(source);
 
@@ -1011,11 +913,9 @@ pub mod mount_table {
         if mounts.add(mp).is_none() {
             return Err(VfsError::Enomem);
         }
-
         Ok(())
     }
 
-    /// Remove a mount point from the mount table
     pub fn remove(path: &str) -> Result<(), VfsError> {
         let mut mounts = MOUNTS.lock();
         if mounts.remove(path.as_bytes()).is_none() {

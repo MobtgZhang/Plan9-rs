@@ -235,6 +235,26 @@ impl Builder {
         self.rootfs_dir().join("boot").join("init")
     }
 
+    fn bash_elf_source(&self) -> PathBuf {
+        self.source_dir
+            .join("target")
+            .join(self.target_triple())
+            .join("release")
+            .join("bash")
+    }
+
+    fn ssh_elf_source(&self) -> PathBuf {
+        self.source_dir
+            .join("target")
+            .join(self.target_triple())
+            .join("release")
+            .join("ssh")
+    }
+
+    fn rootfs_cpio(&self) -> PathBuf {
+        self.build_dir.join("rootfs.cpio")
+    }
+
     fn rootfs_dir(&self) -> PathBuf {
         self.build_dir.join("plan9root")
     }
@@ -316,8 +336,14 @@ impl Builder {
                 self.init_elf_source().display()
             );
         }
+        if !self.bash_elf_source().exists() {
+            anyhow::bail!("bash binary not found at {}", self.bash_elf_source().display());
+        }
+        if !self.ssh_elf_source().exists() {
+            anyhow::bail!("ssh binary not found at {}", self.ssh_elf_source().display());
+        }
         
-        println!("[BUILD] plan9-init built successfully");
+        println!("[BUILD] plan9-init, bash and ssh built successfully");
         Ok(())
     }
 
@@ -359,15 +385,18 @@ impl Builder {
     }
 
     fn build_grub_cfg_tool(&self) -> Result<()> {
-        // Build the grub-cfg tool if not present (host tool, no target needed)
-        if !self.grub_cfg_bin().exists() {
-            println!("[BUILD] Building grub-cfg tool...");
-            let mut cmd = std::process::Command::new("cargo");
-            cmd.arg("build").current_dir(self.source_dir.join("crates/grub-cfg"));
-            let status = cmd.status().context("Failed to build grub-cfg")?;
-            if !status.success() {
-                anyhow::bail!("grub-cfg build failed");
-            }
+        // Always build the host grub-cfg tool so the generated config does
+        // not use a stale binary from a previous checkout.
+        println!("[BUILD] Building grub-cfg tool...");
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.arg("build")
+           .arg("--manifest-path")
+           .arg(self.source_dir.join("Cargo.toml"))
+           .arg("-p")
+           .arg("grub-cfg");
+        let status = cmd.status().context("Failed to build grub-cfg")?;
+        if !status.success() {
+            anyhow::bail!("grub-cfg build failed");
         }
         Ok(())
     }
@@ -382,9 +411,13 @@ impl Builder {
            .arg(&self.init_boot_elf())
            .arg(cmdline)
            .arg(output);
-        
+
         if iso_mode {
             cmd.arg("--iso");
+        }
+        if self.rootfs_cpio().exists() {
+            cmd.arg("--module");
+            cmd.arg(&self.rootfs_cpio());
         }
 
         let status = cmd.status().context("Failed to run grub-cfg")?;
@@ -400,16 +433,20 @@ impl Builder {
     fn build_esp(&self) -> Result<()> {
         println!("[BUILD] Building EFI System Partition...");
         self.ensure_dirs()?;
-        
-        // Ensure kernel and init are built
-        if !self.kernel_elf().exists() {
-            self.build_kernel()?;
-        }
-        
-        // Copy kernel and init to boot directory
-        std::fs::copy(&self.kernel_elf(), &self.kernel_boot_elf())?;
-        std::fs::copy(&self.init_elf_source(), &self.init_boot_elf())?;
-        
+
+        // The ESP needs the kernel, init and the rootfs archive together.
+        self.build_rootfs()?;
+
+        let esp_boot = self.esp_dir().join("boot");
+        std::fs::create_dir_all(&esp_boot)?;
+        std::fs::copy(&self.kernel_elf(), esp_boot.join("9kernel.elf"))?;
+        std::fs::copy(&self.init_elf_source(), esp_boot.join("init"))?;
+        std::fs::copy(&self.rootfs_cpio(), esp_boot.join("rootfs.cpio"))?;
+
+        // Copy user programs and boot files into the ESP for completeness.
+        std::fs::copy(&self.bash_elf_source(), esp_boot.join("bash"))?;
+        std::fs::copy(&self.ssh_elf_source(), esp_boot.join("ssh"))?;
+
         // Generate grub.cfg for ESP
         self.generate_grub_cfg(&self.grub_cfg_esp(), false)?;
         
@@ -421,6 +458,7 @@ impl Builder {
         )?;
 
         let mut cmd = Command::new("grub-mkstandalone");
+        cmd.current_dir(tmp_dir.path());
         cmd.arg("-O")
            .arg(self.grub_platform())
            .arg("--locales=")
@@ -428,7 +466,12 @@ impl Builder {
            .arg("--install-modules=efi_gop all_video font gfxterm gfxmenu png terminal terminfo serial multiboot2 normal regexp cat ls echo test sleep configfile search search_fs_uuid search_fs_file part_gpt part_msdos fat ext2")
            .arg("-o")
            .arg(&self.grub_efi())
-           .arg(tmp_dir.path());
+           .arg("boot/grub/grub.cfg=grub.cfg")
+           .arg(format!("boot/9kernel.elf={}", self.kernel_elf().display()))
+           .arg(format!("boot/init={}", self.init_elf_source().display()))
+           .arg(format!("boot/rootfs.cpio={}", self.rootfs_cpio().display()))
+           .arg(format!("boot/bash={}", self.bash_elf_source().display()))
+           .arg(format!("boot/ssh={}", self.ssh_elf_source().display()));
 
         let status = cmd.status().context("Failed to run grub-mkstandalone")?;
         
@@ -480,14 +523,21 @@ impl Builder {
         // Sync base rootfs
         self.sync_rootfs()?;
         
-        // Ensure kernel and init are built
-        if !self.kernel_elf().exists() {
-            self.build_kernel()?;
-        }
-        
+        // Always rebuild the kernel and user programs so a source change is
+        // reflected in the boot image and the root archive.
+        self.build_kernel()?;
+        self.build_init()?;
+
         // Install kernel and init to boot
         std::fs::copy(&self.kernel_elf(), &self.kernel_boot_elf())?;
         std::fs::copy(&self.init_elf_source(), &self.init_boot_elf())?;
+
+        // Install the Bash and SSH ports into /bin.
+        std::fs::create_dir_all(self.rootfs_dir().join("bin"))?;
+        std::fs::copy(&self.bash_elf_source(), self.rootfs_dir().join("bin").join("bash"))?;
+        std::fs::copy(&self.ssh_elf_source(), self.rootfs_dir().join("bin").join("ssh"))?;
+        std::fs::create_dir_all(self.rootfs_dir().join("rc").join("bin"))?;
+        std::fs::copy(&self.bash_elf_source(), self.rootfs_dir().join("rc").join("bin").join("rc"))?;
         
         // Make them executable
         #[cfg(unix)]
@@ -500,6 +550,16 @@ impl Builder {
             let mut perms = std::fs::metadata(&self.init_boot_elf())?.permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&self.init_boot_elf(), perms)?;
+
+            for p in [
+                self.rootfs_dir().join("bin").join("bash"),
+                self.rootfs_dir().join("bin").join("ssh"),
+                self.rootfs_dir().join("rc").join("bin").join("rc"),
+            ] {
+                let mut perms = std::fs::metadata(&p)?.permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&p, perms)?;
+            }
         }
 
         // Copy grub.cfg to boot/grub
@@ -511,7 +571,22 @@ impl Builder {
             )?;
         }
 
+        // Package the root tree as a newc cpio archive. GRUB loads it as
+        // a Multiboot2 module, and the kernel imports it into the RAM root.
+        println!("[BUILD] Creating rootfs.cpio...");
+        let cpio = self.rootfs_cpio();
+        let status = Command::new("bash")
+            .arg("-c")
+            .arg(format!("find . -print | cpio -o -H newc -O '{}'", cpio.display()))
+            .current_dir(self.rootfs_dir())
+            .status()
+            .context("Failed to create rootfs.cpio")?;
+        if !status.success() {
+            anyhow::bail!("cpio failed");
+        }
+
         println!("[BUILD] Rootfs built: {}", self.rootfs_dir().display());
+        println!("[BUILD] Rootfs archive: {}", cpio.display());
         Ok(())
     }
 

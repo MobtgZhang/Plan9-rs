@@ -628,6 +628,31 @@ pub type Pid = u32;
 // Label for Context Switching
 // ============================================================================
 
+/// A saved ring-3 register/IRET frame.
+///
+/// The assembly syscall stub copies these fields from the kernel stack
+/// after the user registers and the CPU's IRET frame.  `frame_ptr` points
+/// at the first saved register (R15); the IRET fields start at +80 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SavedUserFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rax: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
 /// Label for context switching (setjmp/longjmp style)
 /// Stores the minimal state needed to restore execution
 #[derive(Debug, Clone, Copy, Default)]
@@ -700,7 +725,13 @@ impl Fgrp {
     /// Allocate a new file descriptor
     /// Returns the fd number, or -1 if no free fd
     pub fn alloc_fd(&mut self, chan: Box<dyn Chan>) -> i32 {
+        // Plan 9 reserves fd 0 (stdin), 1 (stdout), and 2 (stderr) for the
+        // console.  File opens therefore start at fd 3 so a file descriptor
+        // is never mistaken for the serial stdin path.
         for (i, slot) in self.channels.iter_mut().enumerate() {
+            if i < 3 {
+                continue;
+            }
             if slot.is_none() {
                 *slot = Some(chan);
                 return i as i32;
@@ -814,6 +845,10 @@ pub trait Chan: Send + Sync {
     }
     /// Duplicate channel
     fn dup(&self) -> Box<dyn Chan>;
+    /// Get file status (Plan 9 stat shape)
+    fn stat(&mut self) -> Result<crate::dev::DirEntry> {
+        Err(Error::General)
+    }
 }
 
 /// Simple result type for channel operations
@@ -1508,8 +1543,12 @@ pub struct Proc {
     pub kstack: u64,
     /// Kernel stack size
     pub kstack_size: usize,
-    /// Memory segments (T, D, B, S)
-    pub seg: [Option<ProcSegment>; NSEG],
+    /// Memory segments (T, D, B, S).  A Vec keeps the Proc struct small:
+    /// the ten option slots themselves are only 8 bytes each, and the
+    /// ~4 KiB ProcSegment payload lives on the heap only when a segment
+    /// actually exists.  A fixed `[Option<ProcSegment>; NSEG]` would make
+    /// every Proc ~42 KiB and force huge stack copies during fork.
+    pub seg: Vec<Option<ProcSegment>>,
     /// Page directory physical address
     pub mmupdb: PhysAddr,
 
@@ -1522,6 +1561,8 @@ pub struct Proc {
     pub nwait: i32,
     /// Wait queue for exiting children
     pub waitq: Option<Box<Waitq>>,
+    /// Child pid this process is currently blocked waiting for
+    pub waiting_child: Option<Pid>,
 
     // === Resources ===
     /// File descriptor group
@@ -1623,6 +1664,11 @@ pub struct Proc {
     pub exec_stack: u64,
     /// Argument count for exec'd program
     pub exec_argc: usize,
+
+    // === User-mode context ===
+    /// Ring-3 register/IRET frame used to resume this process in user mode.
+    /// Populated by the syscall stub on each trap from ring 3.
+    pub user_frame: Option<SavedUserFrame>,
 }
 
 impl Proc {
@@ -1640,12 +1686,13 @@ impl Proc {
             delaysched: 0,
             kstack: 0,
             kstack_size: 0,
-            seg: [const { None }; NSEG],
+            seg: (0..NSEG).map(|_| None).collect(),
             mmupdb: PhysAddr::new(0),
             parent: None,
             nchild: 0,
             nwait: 0,
             waitq: None,
+            waiting_child: None,
             fgrp: None,
             pgrp: None,
             egrp: None,
@@ -1681,6 +1728,7 @@ impl Proc {
             exec_entry: 0,
             exec_stack: 0,
             exec_argc: 0,
+            user_frame: None,
         }
     }
 
@@ -3944,7 +3992,9 @@ pub fn wakeup_parent(parent_pid: Pid, child_pid: Pid, status: i32, time: u64) {
 /// # Returns
 /// * `Option<&'static mut Proc>` - Reference to process if found
 pub fn find_proc(pid: Pid) -> Option<&'static mut Proc> {
-    proctable_mut().get_mut_proc(pid)
+    // The scheduler owns the single Plan 9 process table; every fork and
+    // the initial idle process are registered there.
+    crate::sched::scheduler().procs.get_mut_proc(pid)
 }
 
 // ============================================================================
@@ -4073,22 +4123,14 @@ pub fn do_fork(parent: &Proc, _options: ForkOptions) -> Option<ForkResult> {
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-static PROC_TABLE: AtomicPtr<ProcTable> = AtomicPtr::new(core::ptr::null_mut());
-
-/// Initialize the global process table
-pub fn init_proctable() {
-    let table = Box::new(ProcTable::new());
-    PROC_TABLE.store(Box::into_raw(table), Ordering::SeqCst);
-}
-
-/// Get global process table
+/// Get the scheduler's global process table.
 pub fn proctable() -> &'static ProcTable {
-    unsafe { &*PROC_TABLE.load(Ordering::SeqCst) }
+    &crate::sched::scheduler().procs
 }
 
-/// Get mutable global process table
+/// Get the scheduler's mutable global process table.
 pub fn proctable_mut() -> &'static mut ProcTable {
-    unsafe { &mut *PROC_TABLE.load(Ordering::SeqCst) }
+    &mut crate::sched::scheduler().procs
 }
 
 // ============================================================================

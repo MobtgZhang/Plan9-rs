@@ -12,6 +12,13 @@ use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::storage::{StorageBackend, SdError, SdResult};
+use plan9_common::types::PhysAddr;
+use plan9_arch::x86_64::paging::phys_to_virt;
+
+// Temporary diagnostic byte to the serial port.
+fn dbg(c: u8) {
+    plan9_arch::x86_64::outb(0x3F8, c);
+}
 
 // ============================================================================
 // AHCI Constants
@@ -38,8 +45,8 @@ pub mod port {
     // Port registers (offset from port base)
     pub const CMD_LIST_BASE: usize = 0x00;  // Command List Base (32-bit)
     pub const CMD_LIST_BASE_HI: usize = 0x04; // Command List Base (64-bit upper)
-    pub const FIS_BASE: usize = 0x20;       // FIS Base (32-bit)
-    pub const FIS_BASE_HI: usize = 0x24;   // FIS Base (64-bit upper)
+    pub const FIS_BASE: usize = 0x08;       // FIS Base (32-bit)
+    pub const FIS_BASE_HI: usize = 0x0C;   // FIS Base (64-bit upper)
     pub const IRQ_STAT: usize = 0x10;       // Interrupt Status
     pub const IRQ_EN: usize = 0x14;        // Interrupt Enable
     pub const CMD: usize = 0x18;            // Command
@@ -66,15 +73,14 @@ pub mod port {
 }
 
 // Port Command bits
-pub const CMD_CR: u32 = 1 << 15;          // Command List Running
-pub const CMD_FR: u32 = 1 << 14;          // FIS Receive Running
+pub const CMD_ST: u32 = 1 << 0;           // Interface Started
+pub const CMD_CR: u32 = 1 << 3;           // Command List Running
+pub const CMD_FRE: u32 = 1 << 4;          // FIS Receive Enable
+pub const CMD_CLO: u32 = 1 << 3;          // Command List Override
 pub const CMD_DLAE: u32 = 1 << 7;        // Drive LED On ATAPI
-pub const CMD_ATAPI: u32 = 1 << 6;        // ATAPI
-pub const CMD_APSTE: u32 = 1 << 5;        // Ambient Presence Sts Enable
-pub const CMD_CPD: u32 = 1 << 4;          // Cold Presence Detection
-pub const CMD_IS: u32 = 1 << 0;           // Interface Started
-pub const CMD_FRE: u32 = 1 << 4;         // FIS Receive Enable
-pub const CMD_CLO: u32 = 1 << 3;         // Command List Override
+pub const CMD_ATAPI: u32 = 1 << 5;        // ATAPI
+pub const CMD_APSTE: u32 = 1 << 6;        // Ambient Presence Sts Enable
+pub const CMD_CPD: u32 = 1 << 5;          // Cold Presence Detection         // Command List Override
 
 // SATA Signature values
 pub const SATA_SIG_ATA: u32 = 0x00000101;
@@ -181,7 +187,7 @@ impl FisRegH2D {
     pub fn new_read(sector: u64, count: u16) -> Self {
         Self {
             fis_type: FIS_TYPE_REG_H2D,
-            port_mul: 0,
+            port_mul: 0x80,
             command: 0x25, // READ DMA EXT
             featurel: 0,
             lba0: sector as u8,
@@ -210,7 +216,7 @@ impl FisRegH2D {
     pub fn new_identify() -> Self {
         Self {
             fis_type: FIS_TYPE_REG_H2D,
-            port_mul: 0,
+            port_mul: 0x80,
             command: 0xEC, // IDENTIFY
             featurel: 0,
             lba0: 0,
@@ -232,7 +238,7 @@ impl FisRegH2D {
     pub fn new_flush() -> Self {
         Self {
             fis_type: FIS_TYPE_REG_H2D,
-            port_mul: 0,
+            port_mul: 0x80,
             command: 0xEA, // FLUSH CACHE EXT
             featurel: 0,
             lba0: 0,
@@ -463,13 +469,23 @@ pub struct IdentifyData {
 }
 
 impl IdentifyData {
-    /// Get total sectors (for 48-bit LBA devices)
+    /// Get total sectors.  ATA-8 reports the 48-bit LBA capacity in
+    /// words 100..103; words 60/61 hold the legacy 28-bit capacity.
+    /// Prefer the 48-bit field when it is populated, and fall back to the
+    /// 28-bit field for older devices.
     pub fn lba_capacity(&self) -> u64 {
+        let cap48 = (self.words[100] as u64)
+            | ((self.words[101] as u64) << 16)
+            | ((self.words[102] as u64) << 32)
+            | ((self.words[103] as u64) << 48);
+        if cap48 != 0 {
+            return cap48;
+        }
         let low = self.words[60] as u64;
         let high = self.words[61] as u64;
         (high << 16) | low
     }
-    
+
     /// Get sectors (for 28-bit LBA devices)
     pub fn lba_capacity_28(&self) -> u32 {
         let low = self.words[60] as u32;
@@ -541,14 +557,18 @@ pub struct AhciPort {
     port_base: usize,
     /// MMIO accessor
     mmio: SimpleMmio,
-    /// Command header physical address
+    /// Command list base physical address
     cl_base: u64,
     /// FIS receive area physical address
     fb_base: u64,
-    /// Command header virtual address
+    /// Command table physical address
+    cmd_table_base: u64,
+    /// Command list virtual address
     cmd_headers: *mut HbacmdHeader,
     /// FIS receive area virtual address
     fis_area: *mut u8,
+    /// Command table virtual address
+    cmd_table: *mut u8,
     /// Identify data
     pub identify: Option<IdentifyData>,
     /// Is initialized
@@ -570,8 +590,10 @@ impl AhciPort {
             mmio: SimpleMmio::new(port_base),
             cl_base: 0,
             fb_base: 0,
+            cmd_table_base: 0,
             cmd_headers: core::ptr::null_mut(),
             fis_area: core::ptr::null_mut(),
+            cmd_table: core::ptr::null_mut(),
             identify: None,
             initialized: false,
             busy: AtomicBool::new(false),
@@ -629,12 +651,9 @@ impl AhciPort {
     /// Stop port DMA/FIS operations
     pub fn stop(&mut self) {
         let cmd = self.read_reg(port::CMD);
-        // Clear FRE, CR bits
-        self.write_reg(port::CMD, cmd & !(CMD_FR | CMD_CR));
-        
-        // Wait for CR to clear
+        self.write_reg(port::CMD, cmd & !(CMD_FRE | CMD_ST));
         for _ in 0..500 {
-            if self.read_reg(port::CMD) & CMD_CR == 0 {
+            if self.read_reg(port::CMD) & CMD_ST == 0 {
                 break;
             }
         }
@@ -643,36 +662,46 @@ impl AhciPort {
     /// Start port DMA/FIS operations
     pub fn start(&mut self) {
         let cmd = self.read_reg(port::CMD);
-        // Set FRE, CR bits
-        self.write_reg(port::CMD, cmd | CMD_FR | CMD_CR);
+        self.write_reg(port::CMD, cmd | CMD_FRE | CMD_ST);
+        for _ in 0..1000 {
+            if self.read_reg(port::CMD) & CMD_ST != 0 {
+                break;
+            }
+        }
     }
     
     /// Initialize port for DMA operations
-    pub fn init(&mut self, cl_base: u64, fb_base: u64) {
+    pub fn init(&mut self, cl_base: u64, fb_base: u64, cmd_table_base: u64) {
         self.cl_base = cl_base;
         self.fb_base = fb_base;
-        
+        self.cmd_table_base = cmd_table_base;
+
+        // The boot kernel keeps a low identity mapping for the frame pool;
+        // these DMA structures are below the 64 MiB window.
+        self.cmd_headers = cl_base as *mut HbacmdHeader;
+        self.fis_area = fb_base as *mut u8;
+        self.cmd_table = cmd_table_base as *mut u8;
+
         // Stop port first
         self.stop();
-        
+
         // Clear interrupt status
         self.write_reg(port::IRQ_STAT, 0xFFFFFFFF);
-        
+
         // Write command list base
         self.write_reg(port::CMD_LIST_BASE, (cl_base & 0xFFFFFFFF) as u32);
         if cl_base >> 32 != 0 {
             self.write_reg(port::CMD_LIST_BASE_HI, ((cl_base >> 32) & 0xFFFFFFFF) as u32);
         }
-        
+
         // Write FIS base
         self.write_reg(port::FIS_BASE, (fb_base & 0xFFFFFFFF) as u32);
         if fb_base >> 32 != 0 {
             self.write_reg(port::FIS_BASE_HI, ((fb_base >> 32) & 0xFFFFFFFF) as u32);
         }
-        
-        // Clear pending interrupts
+
         self.clear_irq();
-        
+        self.start();
         self.initialized = true;
     }
     
@@ -684,6 +713,48 @@ impl AhciPort {
     /// Get interrupt status
     pub fn irq_status(&self) -> u32 {
         self.read_reg(port::IRQ_STAT)
+    }
+
+    /// Get port command register
+    pub fn cmd_status(&self) -> u32 {
+        self.read_reg(port::CMD)
+    }
+
+    /// Get command issue register
+    pub fn cmd_issue_status(&self) -> u32 {
+        self.read_reg(port::CMD_ISSUE)
+    }
+
+    /// Get FIS base register
+    pub fn fis_base_status(&self) -> u32 {
+        self.read_reg(port::FIS_BASE)
+    }
+
+    /// Get command list base register
+    pub fn cmd_list_base_status(&self) -> u32 {
+        self.read_reg(port::CMD_LIST_BASE)
+    }
+
+    /// Dump the first command header as 8 dwords.
+    pub fn header_dwords(&self) -> [u32; 8] {
+        let mut out = [0u32; 8];
+        unsafe {
+            for i in 0..8 {
+                out[i] = core::ptr::read_volatile((self.cmd_headers as *const u8).add(i * 4) as *const u32);
+            }
+        }
+        out
+    }
+
+    /// Dump the first 32 dwords of the command table.
+    pub fn cmd_table_dwords(&self) -> [u32; 32] {
+        let mut out = [0u32; 32];
+        unsafe {
+            for i in 0..32 {
+                out[i] = core::ptr::read_volatile((self.cmd_table as *const u8).add(i * 4) as *const u32);
+            }
+        }
+        out
     }
     
     /// Get task file data
@@ -747,14 +818,15 @@ impl AhciPort {
         self.busy.load(Ordering::SeqCst) || self.is_cmd_busy(0)
     }
     
-    /// Probe and identify device
-    pub fn identify_device(&mut self) -> SdResult<()> {
-        if !self.is_present() {
+    /// Probe the device and issue an IDENTIFY command whose 512-byte result
+    /// is written to `buffer_phys`.
+    pub fn identify_device(&mut self, buffer_phys: u64) -> SdResult<IdentifyData> {
+        if !self.is_present() || !self.initialized {
             self.dev_type = DeviceType::None;
             return Err(SdError::NoDevice);
         }
-        
-        // Check signature
+
+        dbg(b'i');
         let sig = self.signature();
         match sig {
             SATA_SIG_ATA => self.dev_type = DeviceType::SATA,
@@ -764,10 +836,111 @@ impl AhciPort {
                 return Err(SdError::NoDevice);
             }
         }
-        
-        // TODO: Issue IDENTIFY command and read identify data
-        // This requires setting up command table, PRD, etc.
-        
+
+        dbg(b's');
+        self.issue_command(0xEC, 0, 0, buffer_phys, 512, false)?;
+        dbg(b'r');
+
+        // IDENTIFY data is 512 bytes = 256 little-endian words.
+        let base = buffer_phys as *const u16;
+        let mut words = [0u16; 256];
+        for i in 0..256 {
+            words[i] = unsafe { core::ptr::read_volatile(base.add(i)) };
+        }
+        Ok(IdentifyData { words })
+    }
+
+    /// Submit a command to slot 0.  `buffer_phys` is a physical DMA address.
+    fn issue_command(
+        &mut self,
+        fis_command: u8,
+        lba: u64,
+        count: u16,
+        buffer_phys: u64,
+        bytes: u32,
+        write: bool,
+    ) -> SdResult<()> {
+        if !self.initialized {
+            return Err(SdError::Invalid);
+        }
+
+        dbg(b'w');
+        self.wait_ready(30000)?;
+        dbg(b'h');
+        self.set_busy();
+        self.write_reg(port::IRQ_STAT, 0xFFFFFFFF);
+
+        // Command header slot 0.  Commands that carry no data (IDENTIFY
+        // has a data buffer, FLUSH CACHE does not) must set prdtl to 0.
+        let has_prd = bytes > 0;
+        let header = unsafe { &mut *self.cmd_headers };
+        header.flags = HbacmdHeader::CFL_32BIT | if write { 0x40 } else { 0 };
+        header.prdtl = if has_prd { 1 } else { 0 };
+        header.prdbc = 0;
+        header.ctba = self.cmd_table_base;
+
+        dbg(b'f');
+        // Command FIS at offset 0 of the command table.
+        unsafe {
+            core::ptr::write_bytes(self.cmd_table, 0, 0x40);
+        }
+        let fis = match fis_command {
+            0xEC => FisRegH2D::new_identify(),
+            0x25 => FisRegH2D::new_read(lba, count),
+            0x35 => FisRegH2D::new_write(lba, count),
+            0xEA => FisRegH2D::new_flush(),
+            _ => return Err(SdError::Invalid),
+        };
+        unsafe {
+            let fis_bytes = core::slice::from_raw_parts(
+                &fis as *const FisRegH2D as *const u8,
+                16,
+            );
+            for (i, b) in fis_bytes.iter().enumerate() {
+                core::ptr::write(self.cmd_table.add(i), *b);
+            }
+        }
+
+        // AHCI command table layout: CFIS 0x00..0x3F, ACMD 0x40..0x5F,
+        // reserved 0x60..0x7F, PRDT starts at 0x80.
+        if has_prd {
+            let prd = HbaprdEntry::with_interrupt(buffer_phys, bytes, true);
+            dbg(b'p');
+            unsafe {
+                core::ptr::write_volatile(self.cmd_table.add(0x80) as *mut u64, prd.dba);
+                core::ptr::write_volatile(self.cmd_table.add(0x88) as *mut u32, prd.reserved);
+                core::ptr::write_volatile(self.cmd_table.add(0x8C) as *mut u32, prd.dbc_i);
+            }
+        }
+
+        dbg(b'c');
+        self.issue_cmd(0);
+        dbg(b'q');
+        self.wait_completion(30000)?;
+        dbg(b'd');
+        self.clear_busy();
+        Ok(())
+    }
+
+    /// Read sectors through DMA into a physical buffer.
+    pub fn read_sectors_phys(&mut self, lba: u64, count: usize, buffer_phys: u64) -> SdResult<usize> {
+        let count = count.min(256);
+        let bytes = count * 512;
+        self.issue_command(0x25, lba, count as u16, buffer_phys, bytes as u32, false)?;
+        Ok(bytes)
+    }
+
+    /// Write sectors through DMA from a physical buffer.
+    pub fn write_sectors_phys(&mut self, lba: u64, count: usize, buffer_phys: u64) -> SdResult<usize> {
+        let count = count.min(256);
+        let bytes = count * 512;
+        self.issue_command(0x35, lba, count as u16, buffer_phys, bytes as u32, true)?;
+        Ok(bytes)
+    }
+
+    /// Flush the device cache.
+    pub fn flush_cache_phys(&mut self) -> SdResult<()> {
+        self.issue_command(0xEA, 0, 0, 0, 0, false)?;
         Ok(())
     }
     

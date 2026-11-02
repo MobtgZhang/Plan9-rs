@@ -56,10 +56,9 @@ impl GdtEntry {
             base_mid: 0,
             // access = present(1) | ring0(00) | S(1) | exec(1) | rw/c(0) = 0x9A
             access: 0x9A,
-            // flags = granularity(1) | 32bit-default(0, we use 64bit via L=1) | limit_high=0xF
-            // In 64-bit mode the L bit is encoded in the access byte (0x9A already has it).
-            // 0xA0 = G=1, D/B=0 (32-bit default but L bit overrides in 64-bit mode), limit_hi=0
-            flags_limit: 0xA0,
+            // flags = limit_hi=0xF | G=1 | L=1 | D/B=0.
+            // 0xAF = 0b1010_1111: G=1, L=1, D/B=0, limit_hi=0xF.
+            flags_limit: 0xAF,
             base_high: 0,
         }
     }
@@ -72,7 +71,8 @@ impl GdtEntry {
             base_mid: 0,
             // access = present(1) | ring0(00) | S(1) | exec(0) | rw(1) = 0x92
             access: 0x92,
-            flags_limit: 0xC0, // G=1, D/B=1 (32-bit ops, but harmless in long mode), limit_hi=0
+            // flags = limit_hi=0xF | G=1 | D/B=1 => full 4 GiB flat segment.
+            flags_limit: 0xCF,
             base_high: 0,
         }
     }
@@ -85,7 +85,8 @@ impl GdtEntry {
             base_mid: 0,
             // access = present(1) | ring3(11) | S(1) | exec(0) | rw(1) = 0xF2
             access: 0xF2,
-            flags_limit: 0xC0,
+            // flags = limit_hi=0xF | G=1 | D/B=1 => full 4 GiB flat segment.
+            flags_limit: 0xCF,
             base_high: 0,
         }
     }
@@ -98,7 +99,8 @@ impl GdtEntry {
             base_mid: 0,
             // access = present(1) | ring3(11) | S(1) | exec(1) | rw(0) = 0xFA
             access: 0xFA,
-            flags_limit: 0xA0,
+            // flags = limit_hi=0xF | G=1 | L=1 | D/B=0 => 0xAF.
+            flags_limit: 0xAF,
             base_high: 0,
         }
     }
@@ -107,7 +109,8 @@ impl GdtEntry {
 /// Full GDT table. Keep it 8-byte aligned.
 #[repr(C, align(16))]
 pub struct GdtTable {
-    pub entries: [GdtEntry; 7],
+    // Index 6..7 together form the 16-byte 64-bit TSS descriptor.
+    pub entries: [GdtEntry; 8],
 }
 
 impl GdtTable {
@@ -120,7 +123,8 @@ impl GdtTable {
                 GdtEntry::user_data(),   // index 3
                 GdtEntry::user_code(),   // index 4
                 GdtEntry::user_data(),   // index 5 (alias)
-                GdtEntry::null(),         // index 6 (TSS slot, filled later)
+                GdtEntry::null(),         // index 6: TSS descriptor low half
+                GdtEntry::null(),         // index 7: TSS descriptor high half
             ],
         }
     }
@@ -186,18 +190,86 @@ pub unsafe fn reload_segments() {
     reload_segments_trampoline();
 }
 
-/// Mark the currently-running task as the "main" TSS by loading a dummy
-/// TSS selector. This prevents #GP faults if the CPU ever attempts to
-/// perform a hardware task switch (e.g. via an IRQ whose stub does `int $n`
-/// without an IST entry). A full TSS descriptor is not required for the
-/// boot path — the bootloader loads us with a valid GDT that includes a
-/// null slot at index 6, and we explicitly point LTR there.
+// ============================================================================
+// TSS (Task State Segment)
+// ============================================================================
+
+/// 64-bit TSS layout (104 bytes), matching Intel's documented structure.
+/// The packed representation is important: `ltr` reads the raw bytes.
+#[repr(C, packed)]
+struct Tss {
+    reserved1: u32,
+    rsp0: u64,
+    rsp1: u64,
+    rsp2: u64,
+    reserved2: u64,
+    ist: [u64; 7],
+    reserved3: u64,
+    reserved4: u16,
+    iomap_base: u16,
+}
+
+impl Tss {
+    const fn new() -> Self {
+        Self {
+            reserved1: 0,
+            rsp0: 0,
+            rsp1: 0,
+            rsp2: 0,
+            reserved2: 0,
+            ist: [0; 7],
+            reserved3: 0,
+            reserved4: 0,
+            iomap_base: 0,
+        }
+    }
+}
+
+/// Static TSS. Lives in the kernel image's low (identity-mapped) region.
+static mut TSS: Tss = Tss::new();
+
+/// Kernel stack used by interrupts that enter from ring 3. The CPU loads
+/// RSP0 from the TSS whenever it switches from user mode to kernel mode.
+static mut INTERRUPT_STACK: [u8; 16384] = [0; 16384];
+
+/// Write the 16-byte TSS descriptor at GDT slots 6 and 7.
+unsafe fn set_tss_descriptor(base: u64) {
+    // TSS limit = 103 (0x67); descriptor bytes are:
+    //   limit[15:0], base[15:0], base[23:16], access (0x89 = present,
+    //   DPL 0, type 1001b = available 64-bit TSS), limit[19:16], base[31:24]
+    //   base[63:32], reserved.
+    let limit = 0x0067u16;
+    GDT.entries[6] = GdtEntry {
+        limit_low: limit,
+        base_low: base as u16,
+        base_mid: ((base >> 16) & 0xFF) as u8,
+        access: 0x89,
+        flags_limit: 0,
+        base_high: ((base >> 24) & 0xFF) as u8,
+    };
+    GDT.entries[7] = GdtEntry {
+        limit_low: (base >> 32) as u16,
+        base_low: ((base >> 48) & 0xFFFF) as u16,
+        base_mid: 0,
+        access: 0,
+        flags_limit: 0,
+        base_high: 0,
+    };
+}
+
+/// Install a real TSS and load it with `ltr`.
 ///
-/// We deliberately skip `ltr` here because a zero TSS is invalid for x86_64;
-/// the LTR call is made by `tss_init` once a real TSS is allocated. We
-/// suppress the dead-code warning to document the intent.
-#[allow(dead_code)]
-pub unsafe fn try_load_tss() {
+/// Must be called after `gdt_init()` (so the GDT is active) and before
+/// entering ring 3. Without a TSS, the first `int 0x80` from user mode
+/// causes an invalid-TSS fault because the CPU cannot switch stacks.
+pub unsafe fn tss_init() {
+    let stack_top = (&raw mut INTERRUPT_STACK) as u64 + INTERRUPT_STACK.len() as u64 - 16;
+    TSS.rsp0 = stack_top;
+    TSS.rsp1 = stack_top;
+    TSS.rsp2 = stack_top;
+
+    let base = &raw mut TSS as u64;
+    set_tss_descriptor(base);
     ltr(SEL_TSS);
 }
 

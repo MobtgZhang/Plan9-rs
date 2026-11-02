@@ -65,6 +65,8 @@ pub mod dhcp;
 pub mod dns;
 pub mod ipsec;
 pub mod netstack;
+#[path = "ssh/lib.rs"]
+pub mod ssh;
 
 // ============================================================================
 // Re-exports from Ethernet

@@ -107,6 +107,24 @@ extern "C" {
     static __isr_stub_20: u8;
     static __isr_stub_30: u8;
     static __isr_stub_num_stubs: u8; // sentinel: number of stubs we emitted
+
+    // Hardware IRQ stubs supplied by idt_asm.S.
+    static __irq_stub_32: u8;
+    static __irq_stub_33: u8;
+    static __irq_stub_34: u8;
+    static __irq_stub_35: u8;
+    static __irq_stub_36: u8;
+    static __irq_stub_37: u8;
+    static __irq_stub_38: u8;
+    static __irq_stub_39: u8;
+    static __irq_stub_40: u8;
+    static __irq_stub_41: u8;
+    static __irq_stub_42: u8;
+    static __irq_stub_43: u8;
+    static __irq_stub_44: u8;
+    static __irq_stub_45: u8;
+    static __irq_stub_46: u8;
+    static __irq_stub_47: u8;
 }
 
 /// Statically allocated IDT.
@@ -122,8 +140,13 @@ pub unsafe fn idt_init() {
     // Direct serial byte output without macros.
     unsafe fn dbg(b: u8) {
         core::arch::asm!(
-            "mov dx, 0x3F8; mov al, {v}; out dx, al",
+            "mov r10w, dx",
+            "mov dx, 0x3F8",
+            "mov al, {v}",
+            "out dx, al",
+            "mov dx, r10w",
             v = in(reg_byte) b,
+            out("r10") _,
             options(nostack, preserves_flags),
         );
     }
@@ -152,6 +175,22 @@ pub unsafe fn idt_init() {
         (19, &__isr_stub_19 as *const _ as u64),
         (20, &__isr_stub_20 as *const _ as u64),
         (30, &__isr_stub_30 as *const _ as u64),
+        (32, &__irq_stub_32 as *const _ as u64),
+        (33, &__irq_stub_33 as *const _ as u64),
+        (34, &__irq_stub_34 as *const _ as u64),
+        (35, &__irq_stub_35 as *const _ as u64),
+        (36, &__irq_stub_36 as *const _ as u64),
+        (37, &__irq_stub_37 as *const _ as u64),
+        (38, &__irq_stub_38 as *const _ as u64),
+        (39, &__irq_stub_39 as *const _ as u64),
+        (40, &__irq_stub_40 as *const _ as u64),
+        (41, &__irq_stub_41 as *const _ as u64),
+        (42, &__irq_stub_42 as *const _ as u64),
+        (43, &__irq_stub_43 as *const _ as u64),
+        (44, &__irq_stub_44 as *const _ as u64),
+        (45, &__irq_stub_45 as *const _ as u64),
+        (46, &__irq_stub_46 as *const _ as u64),
+        (47, &__irq_stub_47 as *const _ as u64),
     ];
     unsafe { dbg(b'1'); }
     // Force the linker to keep the sentinel alive.
@@ -174,10 +213,11 @@ pub unsafe fn idt_init() {
     unsafe { dbg(b'5'); }
 
     // Install syscall handler at vector 0x80 (128)
-    // Use a trap gate (0x8F = present, DPL 3, 64-bit trap gate) so user mode can call it
-    let syscall_handler = syscall_stub_entry as u64;
+    // 0xEF = present, DPL 3, 64-bit trap gate.  DPL 3 is required because
+    // `int 0x80` is issued from ring 3; 0x8F would set DPL 0 and cause #GP.
+    let syscall_handler = &syscall_stub_entry as *const u8 as u64;
     let syscall_entry = &mut *IDT.entries.get_unchecked_mut(0x80);
-    syscall_entry.set_handler(syscall_handler, SEL_KERNEL_CS, 0, 0x8F);
+    syscall_entry.set_handler(syscall_handler, SEL_KERNEL_CS, 0, 0xEF);
 
     unsafe { dbg(b'6'); }
     let ptr = IdtPointer {
@@ -186,21 +226,43 @@ pub unsafe fn idt_init() {
     };
     unsafe { dbg(b'7'); }
     // MARKER: 'X' right before lidt
-    core::arch::asm!("mov dx, 0x3F8; mov al, 'X'; out dx, al", options(nostack, preserves_flags));
+    core::arch::asm!(
+        "mov r10w, dx",
+        "mov dx, 0x3F8",
+        "mov al, 'X'",
+        "out dx, al",
+        "mov dx, r10w",
+        out("r10") _,
+        options(nostack, preserves_flags),
+    );
     lidt(&ptr as *const _ as u64);
     // MARKER: 'Y' right after lidt (if we reach here, lidt succeeded)
-    core::arch::asm!("mov dx, 0x3F8; mov al, 'Y'; out dx, al", options(nostack, preserves_flags));
+    core::arch::asm!(
+        "mov r10w, dx",
+        "mov dx, 0x3F8",
+        "mov al, 'Y'",
+        "out dx, al",
+        "mov dx, r10w",
+        out("r10") _,
+        options(nostack, preserves_flags),
+    );
 }
 
 /// Direct COM1 hex printout helper.
 fn arch_log(s: &[u8]) {
     for &b in s {
         unsafe {
+            // Preserve RDX: the exception handler receives `rip` in RDX and
+            // must not overwrite it while emitting diagnostics.  R10 is a
+            // scratch register used only inside the asm block.
             core::arch::asm!(
+                "mov r10w, dx",
                 "mov dx, 0x3F8",
                 "mov al, {v}",
                 "out dx, al",
+                "mov dx, r10w",
                 v = in(reg_byte) b,
+                out("r10") _,
                 options(nostack, preserves_flags),
             );
         }
@@ -227,8 +289,14 @@ fn arch_log_hex(prefix: &[u8], val: u64) {
 /// vector/error_code/rip in hex, and halts.
 #[no_mangle]
 pub unsafe extern "C" fn default_exception_handler(
-    _vector: u64, _error_code: u64, _rip: u64
+    vector: u64, error_code: u64, rip: u64
 ) -> ! {
+    arch_log(b"\n[FAULT] vector=");
+    arch_log_dec(vector);
+    arch_log(b" error=");
+    arch_log_dec(error_code);
+    arch_log_hex(b" rip=", rip);
+    arch_log(b"\n");
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, preserves_flags)); }
     }
@@ -324,149 +392,16 @@ fn emit_str(s: &[u8]) {
     emit_serial(s);
 }
 
-/// Handle a minimal set of syscalls during boot.
-/// This is a fallback handler that works without the full kernel infrastructure.
-fn handle_syscall(syscall_num: usize, arg0: u64, arg1: u64, arg2: u64) -> i64 {
-    match syscall_num {
-        SYS_WRITE => {
-            // write(fd, buf, count)
-            let fd = arg0 as i64;
-            let buf = arg1 as *const u8;
-            let count = arg2 as usize;
-            if fd == 1 || fd == 2 {
-                // Write to serial console
-                let slice = unsafe { core::slice::from_raw_parts(buf, count) };
-                emit_str(slice);
-                count as i64
-            } else {
-                -1 // Unsupported fd
-            }
-        }
-        SYS_READ => {
-            // read(fd, buf, count) - no input in boot mode, return EOF
-            let _fd = arg0 as i64;
-            let _buf = arg1 as *mut u8;
-            let _count = arg2 as usize;
-            0 // Return EOF (no input available)
-        }
-        SYS_EXIT => {
-            // exit(code)
-            let code = arg0 as i32;
-            emit_str(b"\n[init] exiting with code ");
-            emit_str(itoa(arg0 as u64));
-            emit_str(b"\n[boot] halting\n");
-            loop {
-                unsafe { core::arch::asm!("hlt", options(nostack, preserves_flags)); }
-            }
-        }
-        SYS_GETPID => {
-            1 // Return pid 1 for init
-        }
-        SYS_YIELD => {
-            0
-        }
-        SYS_PUTS => {
-            // puts(buf) - write null-terminated string
-            let buf = arg0 as *const u8;
-            let mut len = 0usize;
-            unsafe {
-                while *buf.add(len) != 0 && len < 4096 {
-                    len += 1;
-                }
-                let slice = core::slice::from_raw_parts(buf, len);
-                emit_str(slice);
-            }
-            len as i64
-        }
-        SYS_OPEN | SYS_CLOSE | SYS_STAT | SYS_BRK | SYS_FORK |
-        SYS_EXEC | SYS_WAIT | SYS_DUP | SYS_CHDIR | SYS_LIST => {
-            // These are not supported in boot mode
-            emit_str(b"[syscall] syscall ");
-            emit_str(itoa(syscall_num as u64));
-            emit_str(b" not implemented\n");
-            -1
-        }
-        _ => {
-            emit_str(b"[syscall] unknown ");
-            emit_str(itoa(syscall_num as u64));
-            emit_str(b"\n");
-            -1
-        }
-    }
-}
+extern "C" {
+    /// Provided by the kernel crate (`trap.rs`).  The architecture crate
+    /// cannot depend on the kernel crate directly, so the symbol is declared
+    /// externally and resolved when the kernel binary is linked.
+    fn kernel_syscall_from_user(num: u64, a0: u64, a1: u64, a2: u64, frame_ptr: u64) -> i64;
 
-/// Convert u64 to decimal string (simple implementation)
-fn itoa(mut v: u64) -> &'static [u8] {
-    static mut BUF: [u8; 32] = [0u8; 32];
-    if v == 0 {
-        return b"0";
-    }
-    let mut len = 0usize;
-    while v > 0 && len < 31 {
-        unsafe {
-            BUF[30 - len] = b'0' + (v % 10) as u8;
-        }
-        v /= 10;
-        len += 1;
-    }
-    unsafe {
-        &BUF[31 - len..31]
-    }
-}
+    /// Kernel hardware-interrupt dispatcher.  Declared extern so the
+    /// architecture crate does not need to depend on the kernel crate.
+    fn kernel_interrupt_from_user(vector: u64);
 
-/// Syscall handler wrapper that matches the calling convention
-unsafe fn syscall_handler_inner(num: usize, arg0: u64, arg1: u64, arg2: u64) -> i64 {
-    handle_syscall(num, arg0, arg1, arg2)
-}
-
-/// Syscall entry stub.
-///
-/// Reads the syscall number and up to three arguments from the user
-/// registers (Linux x86_64 convention: rax=num, rdi/rsi/rdx=args),
-/// calls `handle_syscall`, then returns to user mode via `iretq` with
-/// the result in `rax`.
-///
-/// # Safety
-/// Called from user mode via `int 0x80`.
-#[no_mangle]
-pub unsafe extern "C" fn syscall_stub_entry() {
-    // Linux x86_64 syscall ABI:
-    //   rax = syscall number, rdi/rsi/rdx = args 0..2.
-    // r10/r8/r9 are args 3..4 in the syscall ABI but we don't need
-    // them for the initial syscall set.
-    let (num, arg0, arg1, arg2): (usize, u64, u64, u64);
-    core::arch::asm!(
-        "push rbx",
-        "push rbp",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "mov {num}, rax",
-        "mov {arg0}, rdi",
-        "mov {arg1}, rsi",
-        "mov {arg2}, rdx",
-        num  = out(reg) num,
-        arg0 = out(reg) arg0,
-        arg1 = out(reg) arg1,
-        arg2 = out(reg) arg2,
-        options(nostack, preserves_flags),
-    );
-
-    let ret = handle_syscall(num, arg0, arg1, arg2);
-
-    // Return to user mode via iretq with rax = syscall result.
-    core::arch::asm!(
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbp",
-        "pop rbx",
-        "mov rax, {ret}",
-        "iretq",
-        ret = in(reg) ret,
-        options(nostack, preserves_flags),
-    );
-    core::hint::unreachable_unchecked();
+    /// Assembly syscall entry stub defined in `idt_asm.S`.
+    static syscall_stub_entry: u8;
 }

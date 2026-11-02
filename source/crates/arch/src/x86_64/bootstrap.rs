@@ -28,6 +28,7 @@ pub fn early_init_for(_mode: BootMode) {
     // write to static CPU tables and call into `lgdt`/`lidt`.
     unsafe {
         crate::x86_64::gdt::gdt_init();
+        crate::x86_64::gdt::tss_init();
         crate::x86_64::gdt::reload_segments();
         crate::x86_64::idt::idt_init();
     }
