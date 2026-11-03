@@ -771,6 +771,26 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     install_rootfs(&boot_info);
     mount_standard_devices();
 
+    // Bring up the graphical text console that /dev/console uses for the
+    // Ring3 terminal page.  Fall back to the serial/VGA text path when no
+    // GPU framebuffer is available (e.g. QEMU -display none).
+    serial::put_bytes(b"[kstart] gpu::manager::init_from_bootinfo\n");
+    crate::gpu::manager::init_from_bootinfo(fb_cfg.as_ref());
+    serial::put_bytes(b"[kstart] console::init_console\n");
+    crate::console::init_console();
+
+    if !crate::console::is_initialised() {
+        serial::put_bytes(b"[kstart] vga_init fallback\n");
+        crate::vga::vga_init();
+        if let Some(idx) = crate::dev::devs().find_by_char('c') {
+            if let Some(dev) = crate::dev::devs_mut().get_mut(idx) {
+                if let Some(cons) = dev.as_any().downcast_ref::<crate::dev::ConsDev>() {
+                    cons.set_vga_available(true);
+                }
+            }
+        }
+    }
+
     // Step 4 — ACPI + timer. We do this after the heap because the
     // tables are allocated from it.
     serial::put_bytes(b"[kstart] acpi::init_acpi\n");

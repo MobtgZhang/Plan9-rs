@@ -33,7 +33,7 @@ static mut BG_COLOR: gpu::Color = gpu::Color::BLACK;
 static mut COLS: usize = 0;
 static mut ROWS: usize = 0;
 
-/// Whether `init_console()` has been called.
+/// Whether `init_console()` has completed successfully on a real framebuffer.
 static mut CONSOLE_INIT: bool = false;
 
 // ============================================================================
@@ -50,6 +50,15 @@ pub fn init_console() {
         let info = engine.info();
         let cols = info.width / 8;
         let rows = info.height / 16;
+
+        // The null engine has a zero-sized framebuffer.  Do not mark the
+        // graphical console as usable in that case; `/dev/console` will
+        // fall back to the serial/VGA text path instead.
+        if cols == 0 || rows == 0 {
+            unsafe { CONSOLE_INIT = false; }
+            crate::serial::put_bytes(b"[console] no usable framebuffer; using serial/VGA fallback\n");
+            return;
+        }
 
         unsafe {
             COLS = cols as usize;
@@ -80,8 +89,8 @@ pub fn init_console() {
     });
 }
 
-/// Returns whether `init_console()` has completed.
-fn is_initialised() -> bool {
+/// Returns whether `init_console()` has completed successfully.
+pub fn is_initialised() -> bool {
     unsafe { CONSOLE_INIT }
 }
 
@@ -93,6 +102,13 @@ fn is_initialised() -> bool {
 pub fn putchar(c: u8) {
     if !is_initialised() {
         return;
+    }
+
+    // Defensive guard: a usable engine always has at least one cell.
+    unsafe {
+        if COLS == 0 || ROWS == 0 {
+            return;
+        }
     }
 
     gpu::manager::with_mut(|engine| {
@@ -182,11 +198,16 @@ pub fn putchar(c: u8) {
     });
 }
 
-/// Write a null-terminated string to the console.
-pub fn puts(s: &str) {
-    for &b in s.as_bytes() {
+/// Write a byte slice to the console.
+pub fn puts_bytes(bytes: &[u8]) {
+    for &b in bytes {
         putchar(b);
     }
+}
+
+/// Write a string to the console.
+pub fn puts(s: &str) {
+    puts_bytes(s.as_bytes());
 }
 
 /// Write an unsigned 64-bit integer in decimal.

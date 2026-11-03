@@ -647,11 +647,17 @@ impl ConsDev {
     fn put_chars(&self, data: &[u8]) {
         let _guard = self.output_lock.lock();
 
-        // Always write to serial console
+        // Prefer the graphical text console (the Ring3 terminal page) when
+        // the GPU framebuffer console is available.  Serial output is still
+        // mirrored so the QEMU serial log remains a complete diagnostic
+        // transcript.  VGA text is the fallback when no graphical console
+        // exists.
+        if crate::console::is_initialised() {
+            crate::console::puts_bytes(data);
+        }
+
         crate::cons::serial_puts(data);
 
-        // Write to VGA text buffer only if VGA is available
-        // This provides graceful degradation when VGA is not initialized
         if *self.vga_available.lock() {
             crate::vga::vga_puts(data);
         }
@@ -716,6 +722,10 @@ impl Dev for ConsDev {
 
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
     }
 }
 

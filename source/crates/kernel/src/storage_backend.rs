@@ -740,7 +740,10 @@ pub fn probe_ahci(device: &PciDeviceInfo) -> Vec<Arc<dyn StorageBackend>> {
                     serial: port.identify.as_ref().map(|i| i.serial()).unwrap_or([0u8; 20]),
                 };
 
-                // Validate the physical-DMA path as soon as the port is ready.
+                // Validate the physical-DMA path with a read-only probe.
+                // Boot probing must not write to user disks; a failed test
+                // may corrupt data if the pattern is left behind.
+                let mut read_ok = false;
                 if sectors > 0 {
                     let mut buf = [0u8; 512];
                     crate::serial::put_bytes(b"[sd] dma read test\n");
@@ -751,6 +754,7 @@ pub fn probe_ahci(device: &PciDeviceInfo) -> Vec<Arc<dyn StorageBackend>> {
                             crate::serial::put_bytes(b" first=");
                             crate::serial::put_hex_u32(buf[0] as u32);
                             crate::serial::put_bytes(b"\n");
+                            read_ok = true;
                         }
                         Err(e) => {
                             crate::serial::put_bytes(b"[sd] dma read failed code=");
@@ -758,50 +762,19 @@ pub fn probe_ahci(device: &PciDeviceInfo) -> Vec<Arc<dyn StorageBackend>> {
                             crate::serial::put_bytes(b"\n");
                         }
                     }
-
-                    let mut original = [0u8; 512];
-                    if backend.read_sectors(sectors - 1, 1, &mut original).is_ok() {
-                        crate::serial::put_bytes(b"[sd] dma write test\n");
-                        let mut pattern = original;
-                        pattern[0] = 0x5A;
-                        pattern[511] = 0xA5;
-                        match backend.write_sectors(sectors - 1, 1, &pattern) {
-                            Ok(n) => {
-                                crate::serial::put_bytes(b"[sd] dma write ok n=");
-                                crate::serial::put_hex_u32(n as u32);
-                                crate::serial::put_bytes(b"\n");
-                            }
-                            Err(e) => {
-                                crate::serial::put_bytes(b"[sd] dma write failed code=");
-                                crate::serial::put_hex_u32(ahci_error_code(e) as u32);
-                                crate::serial::put_bytes(b"\n");
-                            }
-                        }
-                        crate::serial::put_bytes(b"[sd] dma flush test\n");
-                        match backend.flush() {
-                            Ok(()) => crate::serial::put_bytes(b"[sd] dma flush ok\n"),
-                            Err(e) => {
-                                crate::serial::put_bytes(b"[sd] dma flush failed code=");
-                                crate::serial::put_hex_u32(ahci_error_code(e) as u32);
-                                crate::serial::put_bytes(b"\n");
-                            }
-                        }
-                        let mut verify = [0u8; 512];
-                        if backend.read_sectors(sectors - 1, 1, &mut verify).is_ok() {
-                            crate::serial::put_bytes(b"[sd] dma verify first=");
-                            crate::serial::put_hex_u32(verify[0] as u32);
-                            crate::serial::put_bytes(b" last=");
-                            crate::serial::put_hex_u32(verify[511] as u32);
-                            crate::serial::put_bytes(b"\n");
-                            // Restore the sector so the test does not damage the
-                            // filesystem image used by the boot.
-                            let _ = backend.write_sectors(sectors - 1, 1, &original);
-                            let _ = backend.flush();
-                        }
-                    }
                 }
 
-                out.push(Arc::new(backend));
+                // Only publish ports that identified as ATA disks and passed
+                // the read-only DMA probe.  Plan 9 numbers `sdN` units only
+                // for working devices; publishing a failed port would shift
+                // later disks to the wrong index and break `#f/sd1` on
+                // machines whose AHCI reports an unimplemented/ATAPI port in
+                // between.
+                if read_ok {
+                    out.push(Arc::new(backend));
+                } else {
+                    crate::serial::put_bytes(b"[sd] skipping unusable port\n");
+                }
             }
         }
     }

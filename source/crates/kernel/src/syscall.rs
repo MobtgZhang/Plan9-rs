@@ -593,15 +593,34 @@ fn sys_internalwait(frame: &SyscallFrame) -> Result<usize> {
     }
 }
 
-/// PUTS - write a NUL-terminated string to the serial console.
+/// PUTS - write a NUL-terminated string to stdout (fd 1).
+///
+/// This prototype extension follows Plan 9's "everything through a channel"
+/// model: fd 1 is the process's `/dev/console` channel, so the graphical
+/// Ring3 terminal and the serial mirror both receive the text.
 fn sys_internalputs(frame: &SyscallFrame) -> Result<usize> {
     let ptr = frame.arg(0);
     if ptr == 0 || !is_user_addr(ptr) {
         return Err(Error::Ebadf);
     }
     let s = copy_cstring_from_user(ptr)?;
-    crate::cons::serial_puts(&s);
-    Ok(s.len())
+
+    let proc = curproc_mut().ok_or(Error::Ebadfd)?;
+    let fgrp = match proc.fgrp.as_mut() {
+        Some(f) => f,
+        None => return Err(Error::Ebadfd),
+    };
+
+    if let Some(chan) = fgrp.get_channel(1) {
+        match chan.write(&s) {
+            Ok(n) => Ok(n),
+            Err(_) => Err(Error::Eio),
+        }
+    } else {
+        // Boot-time fallback when stdio was not installed.
+        crate::cons::serial_puts(&s);
+        Ok(s.len())
+    }
 }
 
 /// LIST - read directory entries from a path into a user buffer.
@@ -1430,7 +1449,7 @@ fn sys_internalread(frame: &SyscallFrame) -> Result<usize> {
     let buf_ptr = frame.arg(1);
     let n = frame.arg(2) as usize;
 
-    if buf_ptr == 0 || n == 0 {
+    if fd < 0 || buf_ptr == 0 || n == 0 {
         return Err(Error::Ebadf);
     }
 
@@ -1438,49 +1457,28 @@ fn sys_internalread(frame: &SyscallFrame) -> Result<usize> {
         return Err(Error::Ebadf);
     }
 
-    // For stdin (fd=0), read from keyboard/serial
-    if fd == 0 {
-        use crate::cons::serial_getchar;
-        let mut count = 0;
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(buf_ptr as *mut u8, n)
-        };
+    // All descriptors, including fd 0, are Plan 9 channels.  In the boot
+    // process fd 0 is the `/dev/console` channel installed by
+    // `Fgrp::set_stdio`, so reads go through the device instead of a
+    // hard-coded serial path.
+    let proc = curproc_mut().ok_or(Error::Ebadfd)?;
+    let fgrp = match proc.fgrp.as_mut() {
+        Some(f) => f,
+        None => return Err(Error::Ebadfd),
+    };
 
-        for byte in buf.iter_mut() {
-            if let Some(c) = serial_getchar() {
-                *byte = c;
-                count += 1;
-                if c == b'\n' {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
+    let chan = match fgrp.get_channel(fd) {
+        Some(c) => c,
+        None => return Err(Error::Ebadfd),
+    };
 
-        Ok(count)
-    } else {
-        // Use VFS for other file descriptors
-        let proc = curproc().ok_or(Error::Ebadfd)?;
-        let proc_mut = unsafe { &mut *(core::ptr::addr_of!(*proc) as *mut Proc) };
-        let fgrp = match proc_mut.fgrp.as_mut() {
-            Some(f) => f,
-            None => return Err(Error::Ebadfd),
-        };
-        
-        let chan = match fgrp.get_channel(fd) {
-            Some(c) => c,
-            None => return Err(Error::Ebadfd),
-        };
-        
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(buf_ptr as *mut u8, n)
-        };
-        
-        match chan.read(buf) {
-            Ok(count) => Ok(count),
-            Err(_) => Err(Error::Eio),
-        }
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(buf_ptr as *mut u8, n)
+    };
+
+    match chan.read(buf) {
+        Ok(count) => Ok(count),
+        Err(_) => Err(Error::Eio),
     }
 }
 
@@ -1500,7 +1498,7 @@ fn sys_internalwrite(frame: &SyscallFrame) -> Result<usize> {
     let buf_ptr = frame.arg(1);
     let n = frame.arg(2) as usize;
 
-    if buf_ptr == 0 || n == 0 {
+    if fd < 0 || buf_ptr == 0 || n == 0 {
         return Err(Error::Ebadf);
     }
 
@@ -1512,32 +1510,23 @@ fn sys_internalwrite(frame: &SyscallFrame) -> Result<usize> {
         core::slice::from_raw_parts(buf_ptr as *const u8, n)
     };
 
-    match fd {
-        1 | 2 => {
-            // stdout/stderr - write to serial
-            use crate::cons::serial_puts;
-            serial_puts(buf);
-            Ok(n)
-        }
-        _ => {
-            // Use VFS for other file descriptors
-            let proc = curproc().ok_or(Error::Ebadfd)?;
-            let proc_mut = unsafe { &mut *(core::ptr::addr_of!(*proc) as *mut Proc) };
-            let fgrp = match proc_mut.fgrp.as_mut() {
-                Some(f) => f,
-                None => return Err(Error::Ebadfd),
-            };
-            
-            let chan = match fgrp.get_channel(fd) {
-                Some(c) => c,
-                None => return Err(Error::Ebadfd),
-            };
-            
-            match chan.write(buf) {
-                Ok(count) => Ok(count),
-                Err(_) => Err(Error::Eio),
-            }
-        }
+    // stdout/stderr are ordinary Plan 9 channels fd 1 and fd 2.  Writing
+    // them reaches `ConsDev`, which renders into the graphical console and
+    // mirrors to serial/VGA as appropriate.
+    let proc = curproc_mut().ok_or(Error::Ebadfd)?;
+    let fgrp = match proc.fgrp.as_mut() {
+        Some(f) => f,
+        None => return Err(Error::Ebadfd),
+    };
+
+    let chan = match fgrp.get_channel(fd) {
+        Some(c) => c,
+        None => return Err(Error::Ebadfd),
+    };
+
+    match chan.write(buf) {
+        Ok(count) => Ok(count),
+        Err(_) => Err(Error::Eio),
     }
 }
 
@@ -1552,24 +1541,21 @@ fn sys_internalwrite(frame: &SyscallFrame) -> Result<usize> {
 /// * `0` on success
 fn sys_internalclose(frame: &SyscallFrame) -> Result<usize> {
     let fd = frame.arg(0) as i32;
-    
-    // Don't allow closing stdin/stdout/stderr for safety
-    if fd < 0 || fd > 2 {
+
+    // Plan 9 allows closing any descriptor, including 0, 1 and 2.
+    if fd < 0 {
         return Err(Error::Ebadfd);
     }
-    
-    // Get current process
+
     let proc = curproc_mut().ok_or(Error::Eperm)?;
 
-    // Get file descriptor group
-    if let Some(fgrp_box) = proc.fgrp.as_mut() {
-        // Close and remove the fd
-        if let Some(_chan) = fgrp_box.close_fd(fd) {
-            // Channel will be dropped and closed automatically
+    if let Some(fgrp) = proc.fgrp.as_mut() {
+        if let Some(mut chan) = fgrp.close_fd(fd) {
+            chan.close();
             return Ok(0);
         }
     }
-    
+
     Err(Error::Ebadfd)
 }
 
@@ -1623,38 +1609,37 @@ fn sys_internaldup(frame: &SyscallFrame) -> Result<usize> {
     let fd = frame.arg(0) as i32;
     let newfd = frame.arg(1) as i32;
 
-    // Get current process
     let proc = curproc_mut().ok_or(Error::Ebadfd)?;
     let fgrp = match proc.fgrp.as_mut() {
         Some(f) => f,
         None => return Err(Error::Ebadfd),
     };
-    
-    // Get the channel for the source fd
-    let chan = match fgrp.get_channel(fd) {
-        Some(c) => c,
-        None => return Err(Error::Ebadfd),
-    };
-    
-    // Duplicate the channel
-    let dup_chan = chan.dup();
 
-    // Allocate a new fd
+    // Duplicate the source channel first, so the borrow of `fgrp` ends
+    // before we mutate the descriptor table.
+    let dup_chan = {
+        match fgrp.get_channel(fd) {
+            Some(c) => c.dup(),
+            None => return Err(Error::Ebadfd),
+        }
+    };
+
     if newfd < 0 {
-        // Find first available fd
         let allocated = fgrp.alloc_fd(dup_chan);
         if allocated < 0 {
             return Err(Error::Ebadf);
         }
         Ok(allocated as usize)
     } else {
-        // Use specific fd
-        // This would require a set_fd method
-        let allocated = fgrp.alloc_fd(dup_chan);
-        if allocated < 0 {
-            return Err(Error::Ebadf);
+        // Plan 9 `dup(fd, newfd)` installs the duplicate at `newfd`,
+        // replacing any descriptor already there.
+        if let Some(mut old) = fgrp.close_fd(newfd) {
+            old.close();
         }
-        Ok(allocated as usize)
+        if !fgrp.set_fd(newfd, dup_chan) {
+            return Err(Error::Ebadfd);
+        }
+        Ok(newfd as usize)
     }
 }
 

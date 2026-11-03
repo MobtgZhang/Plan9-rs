@@ -722,16 +722,15 @@ impl Fgrp {
         }
     }
 
-    /// Allocate a new file descriptor
-    /// Returns the fd number, or -1 if no free fd
+    /// Allocate a new file descriptor.
+    ///
+    /// Plan 9's `fdalloc` scans the descriptor table from 0.  The standard
+    /// descriptors 0, 1 and 2 are normally already occupied by the console,
+    /// so the first `open` after `set_stdio()` naturally returns fd 3.
+    /// If one of the standard descriptors is closed, a later open may reuse
+    /// that slot, which matches Plan 9 fd allocation semantics.
     pub fn alloc_fd(&mut self, chan: Box<dyn Chan>) -> i32 {
-        // Plan 9 reserves fd 0 (stdin), 1 (stdout), and 2 (stderr) for the
-        // console.  File opens therefore start at fd 3 so a file descriptor
-        // is never mistaken for the serial stdin path.
         for (i, slot) in self.channels.iter_mut().enumerate() {
-            if i < 3 {
-                continue;
-            }
             if slot.is_none() {
                 *slot = Some(chan);
                 return i as i32;
@@ -758,15 +757,61 @@ impl Fgrp {
         }
     }
 
-    /// Duplicate a file descriptor
-    pub fn dup(&mut self, fd: i32) -> Option<i32> {
-        if let Some(_chan) = self.get_channel(fd) {
-            // Clone the channel and allocate new fd
-            // For now, just return the same fd
-            Some(fd)
-        } else {
-            None
+    /// Install a channel at a specific file descriptor.  Returns false for an
+    /// out-of-range descriptor.
+    pub fn set_fd(&mut self, fd: i32, chan: Box<dyn Chan>) -> bool {
+        if fd < 0 || (fd as usize) >= NFD {
+            return false;
         }
+        self.channels[fd as usize] = Some(chan);
+        true
+    }
+
+    /// Initialize the Plan 9 standard descriptors 0 (stdin), 1 (stdout) and
+    /// 2 (stderr) from a single console channel.  Each descriptor gets a
+    /// duplicate channel so the process owns three independent fd entries,
+    /// just as Plan 9's init does after opening `/dev/console`.
+    pub fn set_stdio(&mut self, chan: Box<dyn Chan>) -> bool {
+        for i in 0..3usize {
+            if let Some(mut old) = self.channels[i].take() {
+                old.close();
+            }
+            self.channels[i] = Some(chan.dup());
+        }
+        true
+    }
+
+    /// Duplicate a file descriptor.  Returns the new fd number, or -1 if the
+    /// source descriptor is invalid.  If `newfd` is supplied, that slot is
+    /// used; otherwise the first free descriptor is allocated.
+    pub fn dup(&mut self, fd: i32, newfd: i32) -> Option<i32> {
+        let dup_chan = {
+            let chan = self.get_channel(fd)?;
+            chan.dup()
+        };
+
+        let slot = if newfd >= 0 {
+            if newfd as usize >= NFD {
+                return None;
+            }
+            newfd
+        } else {
+            // Find the first free slot, including 0..2 if they are free.
+            let mut found = -1;
+            for (i, slot) in self.channels.iter().enumerate() {
+                if slot.is_none() {
+                    found = i as i32;
+                    break;
+                }
+            }
+            if found < 0 {
+                return None;
+            }
+            found
+        };
+
+        self.channels[slot as usize] = Some(dup_chan);
+        Some(slot)
     }
 
     /// Close all file descriptors

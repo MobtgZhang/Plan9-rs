@@ -234,6 +234,24 @@ impl Scheduler {
         // a valid context when user mode is entered.
         set_curproc(proc_owned);
 
+        // Plan 9's init starts with fds 0, 1 and 2 bound to /dev/console.
+        // Establish those standard descriptors here, after the namespace
+        // mounts are installed and before any user-mode syscall runs.
+        let p = unsafe { &mut *proc_ptr };
+        if let Some(fgrp) = p.fgrp.as_mut() {
+            match crate::vfs::open(b"/dev/console", 2) {
+                Ok(chan) => {
+                    let adapter = Box::new(crate::vfs::DevChanAdapter::new(chan));
+                    if fgrp.set_stdio(adapter) {
+                        crate::serial::put_bytes(b"[sched] stdin/stdout/stderr = /dev/console\n");
+                    }
+                }
+                Err(_) => {
+                    crate::serial::put_bytes(b"[sched] could not open /dev/console for stdio\n");
+                }
+            }
+        }
+
         let p = unsafe { &*proc_ptr };
         let idx = (PRI_KPROC as usize).min(NPRIQ - 1);
         self.run_queues[idx].lock().push(p);
