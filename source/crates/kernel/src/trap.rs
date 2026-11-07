@@ -340,18 +340,87 @@ fn check_and_deliver_alarms() {
 }
 
 /// Keyboard interrupt handler
+///
+/// Reads a PS/2 scancode from port 0x60, maps the common alphanumeric keys
+/// to ASCII, and pushes the character into the console device's input buffer
+/// so that reads on `/dev/console` (fd 0) can return typed characters.
 fn keyboard_interrupt() {
-    // Read keyboard scancode from PS/2 controller
-    // For now, just acknowledge the interrupt
-    
-    // Send EOI if using PIC
-    // pic_eoi(1); // IRQ1 for keyboard
-    
-    // The scancode would be added to a keyboard buffer here.
-    // In a full implementation, this would:
-    // 1. Read the scancode from the PS/2 keyboard controller
-    // 2. Convert it to a key code or character
-    // 3. Add it to a keyboard buffer for consumption by the keyboard driver
+    // Diagnostic: mark that we entered the keyboard interrupt.
+    crate::serial::put_bytes(b"[kbd] irq\n");
+
+    // Read scancode from PS/2 keyboard data port.
+    let scan: u8 = unsafe {
+        let val: u8;
+        core::arch::asm!(
+            "in al, dx",
+            out("al") val,
+            in("dx") 0x60u16,
+            options(nostack, preserves_flags),
+        );
+        val
+    };
+
+    crate::serial::put_bytes(b"[kbd] scan=");
+    crate::serial::put_hex_u32(scan as u32);
+    crate::serial::put_bytes(b"\n");
+
+    // Ignore break codes (bit 7 set) and the 0xE0 extended prefix.
+    let is_press = (scan & 0x80) == 0;
+    let scan = scan & 0x7F;
+    if scan == 0xE0 || !is_press {
+        // Send EOI and wait for the next scan code.
+        pic_eoi(1);
+        return;
+    }
+
+    // Scan-code set 1 -> ASCII (lowercase, no modifier tracking).
+    let ascii = match scan {
+        0x02 => Some(b'1'), 0x03 => Some(b'2'), 0x04 => Some(b'3'), 0x05 => Some(b'4'),
+        0x06 => Some(b'5'), 0x07 => Some(b'6'), 0x08 => Some(b'7'), 0x09 => Some(b'8'),
+        0x0A => Some(b'9'), 0x0B => Some(b'0'), 0x0C => Some(b'-'), 0x0D => Some(b'='),
+        0x0E => Some(0x7F), // Backspace
+        0x0F => Some(b'\t'), // Tab
+        0x10 => Some(b'q'), 0x11 => Some(b'w'), 0x12 => Some(b'e'), 0x13 => Some(b'r'),
+        0x14 => Some(b't'), 0x15 => Some(b'y'), 0x16 => Some(b'u'), 0x17 => Some(b'i'),
+        0x18 => Some(b'o'), 0x19 => Some(b'p'), 0x1A => Some(b'['), 0x1B => Some(b']'),
+        0x1C => Some(b'\n'), // Enter
+        0x1E => Some(b'a'), 0x1F => Some(b's'), 0x20 => Some(b'd'), 0x21 => Some(b'f'),
+        0x22 => Some(b'g'), 0x23 => Some(b'h'), 0x24 => Some(b'j'), 0x25 => Some(b'k'),
+        0x26 => Some(b'l'), 0x27 => Some(b';'), 0x28 => Some(b'\''), 0x29 => Some(b'`'),
+        0x2B => Some(b'\\'), 0x2C => Some(b'z'), 0x2D => Some(b'x'), 0x2E => Some(b'c'),
+        0x2F => Some(b'v'), 0x30 => Some(b'b'), 0x31 => Some(b'n'), 0x32 => Some(b'm'),
+        0x33 => Some(b','), 0x34 => Some(b'.'), 0x35 => Some(b'/'),
+        0x39 => Some(b' '), // Space
+        _ => None,
+    };
+
+    if let Some(c) = ascii {
+        // Deliver to the console device so `/dev/console` reads return input.
+        if let Some(idx) = crate::dev::devs().find_by_char('c') {
+            if let Some(dev) = crate::dev::devs_mut().get_mut(idx) {
+                if let Some(cons) =
+                    dev.as_any_mut().downcast_mut::<crate::dev::ConsDev>()
+                {
+                    cons.add_input(&[c]);
+                }
+            }
+        }
+    }
+
+    // Acknowledge the keyboard interrupt on the PIC (IRQ1).
+    pic_eoi(1);
+}
+
+/// Send End-Of-Interrupt to the master PIC for the given IRQ line.
+fn pic_eoi(_irq: u8) {
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x20u16,
+            in("al") 0x20u8,
+            options(nostack, preserves_flags),
+        );
+    }
 }
 
 /// Spurious interrupt handler

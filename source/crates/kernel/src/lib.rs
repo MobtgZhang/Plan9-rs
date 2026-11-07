@@ -23,6 +23,7 @@ pub mod vm;
 pub mod lapic;
 pub mod user_regs;
 pub mod console;
+pub mod font;
 pub mod serial;
 
 // Process management

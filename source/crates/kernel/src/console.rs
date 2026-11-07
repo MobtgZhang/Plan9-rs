@@ -1,35 +1,38 @@
 //! On-screen text console driver.
 //!
-//! Renders a fixed-pitch 8x16 bitmap-font text terminal into the GPU
-//! framebuffer via the `gpu::manager`. Works on any `DisplayEngine` backend
-//! (GOP, Bochs VBE, virtio-gpu) as long as the engine has been initialised
-//! by `gpu::manager::init_from_bootinfo()`.
+//! Renders a scalable text terminal into the GPU framebuffer via the
+//! `gpu::manager`.  Works on any `DisplayEngine` backend (GOP, Bochs VBE,
+//! virtio-gpu) as long as the engine has been initialised by
+//! `gpu::manager::init_from_bootinfo()`.
 //!
-//! The console is completely stateless — every `putchar()` call reads the
-//! engine state through the GPU manager's `with_mut`. This avoids needing
-//! a global mutable reference to the engine and keeps the implementation
-//! safe and simple for the early-boot single-threaded context.
-//!
-//! Character cell size is fixed at 8x16 pixels (the bitmap font dimensions).
-//! The grid size is derived from the framebuffer dimensions:
-//! `cols = fb_width / 8`, `rows = fb_height / 16`.
+//! Character output now goes through the vector-font layer in
+//! `crate::font`, so the terminal can be scaled independently of the
+//! framebuffer resolution.  The default face is the built-in 8x16 bitmap
+//! font scaled to the requested pixel size; a real deployment should load
+//! a full TTF (e.g. Sarasa-Gothic) from the initramfs/ESP and install it
+//! with `crate::font::set_font`.
 
 use core::fmt::{self, Write};
+use alloc::boxed::Box;
 use crate::gpu;
-use crate::gpu::font8x16 as font;
+use crate::gpu::Color;
+use crate::font::{self, ScaledFont, BuiltinBitmapFont};
 
 /// Cursor state for the text terminal.
-static mut CURSOR_X: usize = 0;
-static mut CURSOR_Y: usize = 0;
+static mut CURSOR_X: i32 = 0;
+static mut CURSOR_Y: i32 = 0;
 /// Whether the cursor has been drawn (to avoid drawing it at (0,0) before text starts).
 static mut CURSOR_DRAWN: bool = false;
 
 /// Foreground colour for rendered characters.
-static mut FG_COLOR: gpu::Color = gpu::Color::WHITE;
+static mut FG_COLOR: Color = Color::new(0xCC, 0xCC, 0xCC); // light grey
 /// Background colour for rendered characters and cleared areas.
-static mut BG_COLOR: gpu::Color = gpu::Color::BLACK;
+static mut BG_COLOR: Color = Color::BLACK;
 
-/// Number of text columns and rows (derived from framebuffer size).
+/// Pixel size of the font (in framebuffer pixels).
+static mut FONT_PX: u32 = 16;
+
+/// Number of text columns and rows (derived from framebuffer and font size).
 static mut COLS: usize = 0;
 static mut ROWS: usize = 0;
 
@@ -44,12 +47,14 @@ static mut CONSOLE_INIT: bool = false;
 ///
 /// Clears the framebuffer to the background colour, resets the cursor to (0, 0),
 /// and computes the number of text columns and rows from the engine's
-/// framebuffer dimensions. Safe to call after `gpu::manager::init_from_bootinfo()`.
+/// framebuffer dimensions and the current font pixel size. Safe to call after
+/// `gpu::manager::init_from_bootinfo()`.
 pub fn init_console() {
     gpu::manager::with_mut(|engine| {
         let info = engine.info();
-        let cols = info.width / 8;
-        let rows = info.height / 16;
+        let px = unsafe { FONT_PX.max(8) };
+        let cols = (info.width as u64 / px as u64) as usize;
+        let rows = (info.height as u64 / px as u64) as usize;
 
         // The null engine has a zero-sized framebuffer.  Do not mark the
         // graphical console as usable in that case; `/dev/console` will
@@ -60,31 +65,40 @@ pub fn init_console() {
             return;
         }
 
+        // Install the default scaled font (built-in bitmap font scaled to
+        // `px` pixels).  A real deployment can replace this with a Sarasa
+        // Gothic TTF loaded at boot.
+        let font = Box::leak(Box::new(ScaledFont::new(
+            &BuiltinBitmapFont as &dyn font::Font,
+            px,
+        )));
+        font::set_font(font);
+
         unsafe {
-            COLS = cols as usize;
-            ROWS = rows as usize;
+            COLS = cols;
+            ROWS = rows;
             CURSOR_X = 0;
             CURSOR_Y = 0;
-            FG_COLOR = gpu::Color::new(0xCC, 0xCC, 0xCC); // light grey
-            BG_COLOR = gpu::Color::BLACK;
+            FG_COLOR = Color::new(0xCC, 0xCC, 0xCC);
+            BG_COLOR = Color::BLACK;
         }
 
         // Clear the framebuffer to black.
         engine.fill_rect(
             gpu::Rect::new(0, 0, info.width, info.height),
-            gpu::Color::BLACK,
+            Color::BLACK,
         );
-        // Do NOT draw the cursor here — it will be drawn after the first character.
-
         engine.flush();
 
         unsafe { CONSOLE_INIT = true; }
 
         // Log the console dimensions.
         crate::serial::put_bytes(b"[console] cols=");
-        crate::serial::put_hex_u32(cols);
+        crate::serial::put_hex_u32(cols as u32);
         crate::serial::put_bytes(b" rows=");
-        crate::serial::put_hex_u32(rows);
+        crate::serial::put_hex_u32(rows as u32);
+        crate::serial::put_bytes(b" font_px=");
+        crate::serial::put_hex_u32(px);
         crate::serial::put_bytes(b"\n");
     });
 }
@@ -92,6 +106,16 @@ pub fn init_console() {
 /// Returns whether `init_console()` has completed successfully.
 pub fn is_initialised() -> bool {
     unsafe { CONSOLE_INIT }
+}
+
+/// Set the font pixel size (must be called before `init_console`).
+pub fn set_font_px(px: u32) {
+    unsafe { FONT_PX = px.max(8); }
+}
+
+/// Returns the current font pixel size.
+pub fn font_px() -> u32 {
+    unsafe { FONT_PX }
 }
 
 // ============================================================================
@@ -112,81 +136,73 @@ pub fn putchar(c: u8) {
     }
 
     gpu::manager::with_mut(|engine| {
-        let (mut cx, mut cy) = (0usize, 0usize);
-        let (mut cols, mut rows) = (0usize, 0usize);
-        let mut fg = gpu::Color::WHITE;
-        let mut bg = gpu::Color::BLACK;
-        let mut cursor_drawn = false;
-
-        unsafe {
-            cx = CURSOR_X;
-            cy = CURSOR_Y;
-            cols = COLS;
-            rows = ROWS;
-            fg = FG_COLOR;
-            bg = BG_COLOR;
-            cursor_drawn = CURSOR_DRAWN;
-        }
+        let mut cx = unsafe { CURSOR_X };
+        let mut cy = unsafe { CURSOR_Y };
+        let (cols, rows) = unsafe { (COLS as i32, ROWS as i32) };
+        let fg = unsafe { FG_COLOR };
+        let bg = unsafe { BG_COLOR };
+        let cursor_drawn = unsafe { CURSOR_DRAWN };
 
         match c {
             b'\n' => {
-                // Erase old cursor if drawn.
                 if cursor_drawn {
-                    draw_cursor_at(engine, cx as u32, cy as u32, bg);
+                    draw_cursor(engine, cx, cy, bg);
                 }
                 cx = 0;
-                cy += 1;
+                cy += font_px() as i32;
             }
             b'\r' => {
                 cx = 0;
             }
             b'\t' => {
-                cx = (cx + 8) & !7usize;
-                if cx >= cols {
+                let tab_w = font_px() as i32 * 8;
+                cx = (cx + tab_w) & !(tab_w - 1);
+                if cx >= cols * font_px() as i32 {
                     cx = 0;
-                    cy += 1;
+                    cy += font_px() as i32;
                 }
             }
             b'\x08' => {
                 // Backspace: erase the previous character cell.
+                let cell_w = font_px() as i32;
                 if cx > 0 {
-                    cx -= 1;
+                    cx -= cell_w;
                 }
-                let px = (cx * 8) as u32;
-                let py = (cy * 16) as u32;
+                let px = cx as u32;
+                let py = cy as u32;
                 engine.fill_rect(
-                    gpu::Rect::new(px, py, 8, 16),
+                    gpu::Rect::new(px, py, font_px(), font_px()),
                     bg,
                 );
                 unsafe { CURSOR_X = cx; }
                 return;
             }
             _ => {
-                // Erase old cursor if drawn (before moving to new position).
                 if cursor_drawn {
-                    draw_cursor_at(engine, cx as u32, cy as u32, bg);
+                    draw_cursor(engine, cx, cy, bg);
                 }
-                // Render the glyph.
-                let px = (cx * 8) as u32;
-                let py = (cy * 16) as u32;
-                render_glyph(engine, c, px, py, fg, bg);
-
-                cx += 1;
-                if cx >= cols {
+                let px = cx as u32;
+                let py = cy as u32;
+                let ch = c as char;
+                let mut utf8 = [0u8; 4];
+                let s = ch.encode_utf8(&mut utf8);
+                font::draw_text(engine, cx, cy, s, fg);
+                cx += font_px() as i32;
+                if cx >= cols * font_px() as i32 {
                     cx = 0;
-                    cy += 1;
+                    cy += font_px() as i32;
                 }
             }
         }
 
         // Handle scrolling.
-        if cy >= rows {
-            cy = rows - 1;
-            engine.scroll_up(16, bg);
+        if cy >= rows * font_px() as i32 {
+            cy = (rows - 1) * font_px() as i32;
+            engine.scroll_up(font_px(), bg);
         }
 
         // Draw cursor at new position.
-        draw_cursor_at(engine, cx as u32, cy as u32, fg);
+        draw_cursor(engine, cx, cy, fg);
         unsafe { CURSOR_DRAWN = true; }
 
         engine.flush();
@@ -227,57 +243,25 @@ pub fn putu(mut v: u64) {
 }
 
 // ============================================================================
-// Glyph rendering
-// ============================================================================
-
-/// Render an 8x16 glyph for ASCII character `c` at pixel position (px, py).
-/// Uses `fg` for foreground pixels (bits = 1) and `bg` for background (bits = 0).
-fn render_glyph(
-    engine: &mut dyn gpu::DisplayEngine,
-    c: u8,
-    px: u32,
-    py: u32,
-    fg: gpu::Color,
-    bg: gpu::Color,
-) {
-    let Some(glyph_rows) = font::glyph(c) else {
-        // Unknown glyph — just fill the cell with the background.
-        engine.fill_rect(gpu::Rect::new(px, py, 8, 16), bg);
-        return;
-    };
-
-    for row in 0..16u32 {
-        let bits = glyph_rows[row as usize];
-        for col in 0..8u32 {
-            let bit = (bits >> (7 - col)) & 1;
-            let color = if bit != 0 { fg } else { bg };
-            engine.put_pixel(px + col, py + row, color);
-        }
-    }
-}
-
-// ============================================================================
 // Cursor rendering
 // ============================================================================
 
-/// Erase the text cursor (a small underline) at character cell (cx, cy).
-fn erase_cursor_at(engine: &mut dyn gpu::DisplayEngine, cx: u32, cy: u32, bg: gpu::Color) {
-    let px = cx * 8;
-    let py = cy * 16;
-    for dy in 0..2u32 {
-        for dx in 0..8u32 {
-            engine.put_pixel(px + dx, py + 14 + dy, bg);
-        }
-    }
-}
-
-/// Draw the text cursor (a small underline) at character cell (cx, cy).
-fn draw_cursor_at(engine: &mut dyn gpu::DisplayEngine, cx: u32, cy: u32, fg: gpu::Color) {
-    let px = cx * 8;
-    let py = cy * 16;
-    for dy in 0..2u32 {
-        for dx in 0..8u32 {
-            engine.put_pixel(px + dx, py + 14 + dy, fg);
+/// Draw the text cursor (a small underline) at pixel position (cx, cy).
+fn draw_cursor(
+    engine: &mut dyn gpu::DisplayEngine,
+    cx: i32,
+    cy: i32,
+    color: Color,
+) {
+    let cell_w = font_px() as u32;
+    let underline_h = (cell_w / 8).max(2);
+    let py = (cy + cell_w as i32 - underline_h as i32) as u32;
+    for dy in 0..underline_h {
+        for dx in 0..cell_w {
+            let px = (cx as u32).saturating_add(dx);
+            if px < engine.info().width {
+                engine.put_pixel(px, py + dy, color);
+            }
         }
     }
 }

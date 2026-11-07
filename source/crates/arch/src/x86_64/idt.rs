@@ -246,6 +246,52 @@ pub unsafe fn idt_init() {
         out("r10") _,
         options(nostack, preserves_flags),
     );
+
+    // Initialise the legacy 8259 PIC so hardware IRQs (keyboard, timer, …)
+    // are actually delivered to the CPU.  IRQ 0..7 map to IDT vectors 32..39,
+    // IRQ 8..15 map to 40..47.  We remap them away from the exception range
+    // (0..31) and unmask IRQ0 (timer) and IRQ1 (keyboard).
+    pic_init();
+
+    // Enable maskable interrupts so the installed handlers can run.
+    crate::x86_64::sti();
+}
+
+/// Initialise the two 8259 PIC chips (master + slave).
+///
+/// Programs ICW1..ICW4 so IRQs map to IDT vectors 32..47, then masks all
+/// IRQs except IRQ0 (timer) and IRQ1 (keyboard).
+fn pic_init() {
+    // ICW1: init, edge-triggered, ICW4 needed.
+    crate::x86_64::outb(0x20, 0x11);
+    crate::x86_64::io_delay();
+    crate::x86_64::outb(0xA0, 0x11);
+    crate::x86_64::io_delay();
+
+    // ICW2: vector offset — master 32, slave 40.
+    crate::x86_64::outb(0x21, 0x20);
+    crate::x86_64::io_delay();
+    crate::x86_64::outb(0xA1, 0x28);
+    crate::x86_64::io_delay();
+
+    // ICW3: master slave on IRQ2; slave cascade identity 2.
+    crate::x86_64::outb(0x21, 0x04);
+    crate::x86_64::io_delay();
+    crate::x86_64::outb(0xA1, 0x02);
+    crate::x86_64::io_delay();
+
+    // ICW4: 8086/88 mode.
+    crate::x86_64::outb(0x21, 0x01);
+    crate::x86_64::io_delay();
+    crate::x86_64::outb(0xA1, 0x01);
+    crate::x86_64::io_delay();
+
+    // OCW1: mask all, then unmask IRQ0 (timer) and IRQ1 (keyboard) on master.
+    // Master mask: ~(1<<0 | 1<<1) = 0xFC; slave: mask all = 0xFF.
+    crate::x86_64::outb(0x21, 0xFC);
+    crate::x86_64::io_delay();
+    crate::x86_64::outb(0xA1, 0xFF);
+    crate::x86_64::io_delay();
 }
 
 /// Direct COM1 hex printout helper.

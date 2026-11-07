@@ -325,6 +325,16 @@ pub trait Dev: Send + Sync {
         &()
     }
 
+    /// Downcast self to `&mut dyn Any` for runtime type inspection.
+    ///
+    /// Default implementation returns a no-op `&mut dyn Any`. Concrete device
+    /// types that want to participate in downcasting should override this
+    /// (typically by returning `self`).
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        static mut DUMMY: () = ();
+        unsafe { &mut DUMMY }
+    }
+
     // === Block I/O Operations ===
     
     /// Read a block of data (buffered I/O)
@@ -628,15 +638,77 @@ impl ConsDev {
         buf.extend_from_slice(data);
     }
 
-    /// Read a single character from input buffer
+    /// Read a single character from input buffer.
+    ///
+    /// If the buffer is empty we poll the PS/2 keyboard data port directly
+    /// so that typed characters are available even when the IRQ path has not
+    /// delivered them (e.g. QEMU `sendkey` via the monitor does not raise a
+    /// real PS/2 interrupt).
     fn get_char(&self) -> Option<u8> {
         let mut buf = self.input_buffer.lock();
         if buf.is_empty() {
-            // Fall back to serial if no keyboard input
-            crate::cons::serial_getchar()
+            drop(buf);
         } else {
-            Some(buf.remove(0))
+            return Some(buf.remove(0));
         }
+
+        // Poll PS/2 keyboard output buffer (port 0x60) when the OBF bit
+        // (bit 0 of port 0x64) is set.
+        let status: u8 = unsafe {
+            let val: u8;
+            core::arch::asm!(
+                "in al, dx",
+                out("al") val,
+                in("dx") 0x64u16,
+                options(nostack, preserves_flags),
+            );
+            val
+        };
+        if (status & 0x01) == 0 {
+            // Fall back to serial if no keyboard input
+            return crate::cons::serial_getchar();
+        }
+
+        let scan: u8 = unsafe {
+            let val: u8;
+            core::arch::asm!(
+                "in al, dx",
+                out("al") val,
+                in("dx") 0x60u16,
+                options(nostack, preserves_flags),
+            );
+            val
+        };
+
+        // Ignore break codes and the 0xE0 extended prefix.
+        if (scan & 0x80) != 0 || (scan & 0x7F) == 0xE0 {
+            return crate::cons::serial_getchar();
+        }
+        let scan = scan & 0x7F;
+
+        let ascii = match scan {
+            0x02 => Some(b'1'), 0x03 => Some(b'2'), 0x04 => Some(b'3'), 0x05 => Some(b'4'),
+            0x06 => Some(b'5'), 0x07 => Some(b'6'), 0x08 => Some(b'7'), 0x09 => Some(b'8'),
+            0x0A => Some(b'9'), 0x0B => Some(b'0'), 0x0C => Some(b'-'), 0x0D => Some(b'='),
+            0x0E => Some(0x7F),
+            0x0F => Some(b'\t'),
+            0x10 => Some(b'q'), 0x11 => Some(b'w'), 0x12 => Some(b'e'), 0x13 => Some(b'r'),
+            0x14 => Some(b't'), 0x15 => Some(b'y'), 0x16 => Some(b'u'), 0x17 => Some(b'i'),
+            0x18 => Some(b'o'), 0x19 => Some(b'p'), 0x1A => Some(b'['), 0x1B => Some(b']'),
+            0x1C => Some(b'\n'),
+            0x1E => Some(b'a'), 0x1F => Some(b's'), 0x20 => Some(b'd'), 0x21 => Some(b'f'),
+            0x22 => Some(b'g'), 0x23 => Some(b'h'), 0x24 => Some(b'j'), 0x25 => Some(b'k'),
+            0x26 => Some(b'l'), 0x27 => Some(b';'), 0x28 => Some(b'\''), 0x29 => Some(b'`'),
+            0x2B => Some(b'\\'), 0x2C => Some(b'z'), 0x2D => Some(b'x'), 0x2E => Some(b'c'),
+            0x2F => Some(b'v'), 0x30 => Some(b'b'), 0x31 => Some(b'n'), 0x32 => Some(b'm'),
+            0x33 => Some(b','), 0x34 => Some(b'.'), 0x35 => Some(b'/'),
+            0x39 => Some(b' '),
+            _ => None,
+        };
+        if let Some(c) = ascii {
+            return Some(c);
+        }
+        crate::cons::serial_getchar()
     }
 
     /// Write characters to output (screen/serial)
@@ -725,6 +797,10 @@ impl Dev for ConsDev {
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
         self
     }
 }

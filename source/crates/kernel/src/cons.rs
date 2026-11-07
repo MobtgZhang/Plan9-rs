@@ -441,18 +441,29 @@ pub fn init_console() {
     CONSOLE.store(Box::into_raw(console), Ordering::SeqCst);
 }
 
-/// Print a single character to the console
+/// Print a single character to the console.
+///
+/// Output goes to every available sink so kernel log messages remain
+/// visible after the system switches to the graphical Ring-3 terminal:
+///   * the graphical text console (when `console::init_console()` ran),
+///   * the serial port (for QEMU `-serial` capture),
+///   * the `ConsoleDev` output buffer (for `/dev/kmesg` readers).
 pub fn putchar(c: u8) {
+    // Graphical console first — this is what the Ring-3 terminal shows.
+    if crate::console::is_initialised() {
+        crate::console::putchar(c);
+    }
+    // Serial mirror for headless / debug captures.
+    serial_putchar(c);
+    // Buffer for /dev/kmesg readers.
     unsafe {
         if let Some(console) = CONSOLE.load(Ordering::SeqCst).as_ref() {
-            // For now, just add to input buffer for reads
-            // Real implementation would write to VGA/serial
             console.output.lock().push(c);
         }
     }
 }
 
-/// Print a string to the console
+/// Print a string to the console.
 pub fn puts(s: &[u8]) {
     for &c in s {
         putchar(c);

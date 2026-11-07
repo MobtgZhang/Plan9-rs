@@ -426,9 +426,17 @@ mod x86_64_asm {
         }
     }
 
-    /// I/O delay
+    /// I/O delay — a few `outb` to port 0x80 gives the chipset time to
+    /// settle between back-to-back PIC register accesses.
     #[inline(always)]
-    pub fn io_wait() {
+    pub fn io_delay() {
+        unsafe {
+            for _ in 0..4 {
+                // Port 0x80 is a classic POST/diagnostic port; writing to it
+                // is harmless and slow enough to act as a short delay.
+                asm!("out dx, al", in("dx") 0x80u16, in("al") 0u8, options(nostack, preserves_flags));
+            }
+        }
     }
 
     // ============================================================================
