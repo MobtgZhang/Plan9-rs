@@ -879,8 +879,7 @@ impl Scheduler {
                         Some(f) => f,
                         None => return None,
                     };
-                    crate::serial::put_hex_u64(child_pml4.as_u64());
-                    crate::serial::put_bytes(b"\n");
+                    crate::serial::put_bytes(b"[sched] fork: child pml4 allocated\n");
                     unsafe {
                         if crate::init_loader::copy_kernel_pml4_into(child_pml4).is_none() {
                                 return None;

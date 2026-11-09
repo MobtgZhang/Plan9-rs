@@ -1569,9 +1569,6 @@ pub fn init_allocator(base: CommonPhysAddr, size: usize) {
     serial::put_bytes(b"[vm::init_allocator] STEP3: storing ptr\n");
     FRAME_ALLOCATOR_INSTANCE.store(alloc_ptr, Ordering::SeqCst);
     serial::put_bytes(b"[vm::init_allocator] STEP4: ptr stored\n");
-
-    serial::put_hex_u64(alloc_ptr as u64);
-    serial::put_bytes(b"\n");
 }
 
 /// Get mutable reference to global frame allocator
@@ -1594,8 +1591,6 @@ pub fn frame_alloc_one() -> Option<PhysAddr> {
 pub fn alloc_frame_zeroed() -> Option<PhysAddr> {
     let paddr = alloc_frame()?;
 
-    crate::serial::put_hex_u64(paddr.as_u64());
-    crate::serial::put_bytes(b"\n");
     unsafe {
         // The boot kernel runs in the low identity mapping, so physical
         // frames inside the mapped window can be addressed directly.

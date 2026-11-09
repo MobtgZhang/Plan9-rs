@@ -83,6 +83,7 @@ pub mod debug;
 pub mod debug_gating;
 pub mod watchdog;
 pub mod acpi;
+pub mod smp;
 pub mod sema;
 pub mod qlock;
 pub mod timer;

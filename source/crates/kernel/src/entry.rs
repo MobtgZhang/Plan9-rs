@@ -59,6 +59,8 @@ pub mod tag_type {
     pub const BOOTDEV: u32           = 5;
     pub const MEMMAP: u32            = 6;
     pub const FRAMEBUFFER: u32       = 8;
+    pub const ACPI_OLD: u32          = 14;
+    pub const ACPI_NEW: u32          = 15;
 }
 
 // ============================================================================
@@ -459,6 +461,21 @@ pub fn parse_boot_info(info_addr: u64) -> Option<BootInfo> {
                 });
                 serial::put_bytes(b"[kernel] parse_boot_info: FRAMEBUFFER parsed\n");
             }
+            tag_type::ACPI_OLD | tag_type::ACPI_NEW => {
+                // Payload is a copy of the RSDP structure itself (20 bytes
+                // for RSDPv1, 36 for RSDPv2) right after the tag header.
+                // This is the only reliable RSDP source under OVMF/UEFI,
+                // where the legacy BIOS scan regions hold nothing.
+                let len = if tag_size > 8 { tag_size - 8 } else { 0 };
+                if len >= 20 {
+                    let src = unsafe { tag_ptr.byte_add(8) } as *const u8;
+                    let bytes = unsafe { core::slice::from_raw_parts(src, len) };
+                    crate::smp::store_rsdp_copy(bytes);
+                    serial::put_bytes(b"[kernel] parse_boot_info: ACPI RSDP tag len=");
+                    serial::put_hex_u32(len as u32);
+                    serial::put_bytes(b"\n");
+                }
+            }
             _ => {
                 serial::put_bytes(b"[kernel] parse_boot_info: unknown tag type=");
                 serial::put_hex_u32(tag_type as u32);
@@ -806,6 +823,11 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     crate::sched::schedinit();
 
     // Step 5 — load init and switch to user mode.
+    // Bring the other CPUs online first: they park until the scheduler is
+    // made multi-CPU, but bring-up is the hard part of SMP.
+    serial::put_bytes(b"[kstart] smp::init_aps\n");
+    crate::smp::init_aps();
+
     serial::put_bytes(b"[kstart] init_loader::load_init\n");
     let init_image = match init_loader::load_init(&boot_info) {
         Some(img) => img,

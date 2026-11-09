@@ -43,6 +43,27 @@ fn build_x86_64() {
         .compile("arch_x86_64_switch");
     println!("cargo:rerun-if-changed=src/x86_64/switch_to_user.S");
 
+    // AP startup trampoline: assembled 16-bit real-mode code, linked at
+    // the fixed low-memory page the SIPI vector points at, and shipped as
+    // a flat binary that the kernel copies into place during SMP bring-up.
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let gcc = std::process::Command::new("gcc")
+        .args(["-m16", "-c", "-o"])
+        .arg(out_dir.join("ap_trampoline.o"))
+        .arg(manifest_dir.join("src/x86_64/ap_trampoline.S"))
+        .status()
+        .expect("failed to run gcc for the AP trampoline");
+    assert!(gcc.success(), "assembling ap_trampoline.S failed");
+    let ld = std::process::Command::new("ld")
+        .args(["-m", "elf_i386", "-Ttext=0x50000", "--oformat=binary", "-e", "ap_trampoline_start"])
+        .arg(out_dir.join("ap_trampoline.o"))
+        .arg("-o")
+        .arg(out_dir.join("ap_trampoline.bin"))
+        .status()
+        .expect("failed to run ld for the AP trampoline");
+    assert!(ld.success(), "linking ap_trampoline.bin failed");
+    println!("cargo:rerun-if-changed=src/x86_64/ap_trampoline.S");
+
     println!("cargo:rerun-if-changed=build.rs");
 }
 

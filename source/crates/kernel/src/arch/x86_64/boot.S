@@ -41,6 +41,8 @@ multiboot2_info_request:
     .long   INFO_TAG_BOOTDEV
     .long   INFO_TAG_MEMORY_MAP
     .long   INFO_TAG_FRAMEBUFFER
+    .long   INFO_TAG_ACPI_OLD
+    .long   INFO_TAG_ACPI_NEW
 multiboot2_info_request_end:
 
     /* Framebuffer tag */

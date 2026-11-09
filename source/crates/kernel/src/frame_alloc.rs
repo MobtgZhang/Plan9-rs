@@ -160,6 +160,13 @@ fn reserve_range(start: u64, end: u64) {
     list.push(ReservedRange { start, end });
 }
 
+/// Reserve a physical range `[start, end)` so the frame allocator never
+/// hands it out (used by SMP bring-up for the trampoline page and the AP
+/// stacks).
+pub fn reserve_range_pub(start: u64, end: u64) {
+    reserve_range(start, end);
+}
+
 /// Mark every frame in `[start, end)` as allocated in the frame allocator.
 ///
 /// # Safety

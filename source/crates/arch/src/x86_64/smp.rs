@@ -67,3 +67,18 @@ pub fn init_smp_bsp() {
     // monotonically increasing ids in `init_smp_aps`.
     x86_64::write_tsc_aux(0);
 }
+
+// ============================================================================
+// AP startup trampoline blob
+// ============================================================================
+
+/// The 16-bit real-mode trampoline page the APs boot from. Assembled by
+/// `build.rs` into a flat binary linked at `AP_TRAMPOLINE` (0x50000).
+pub const AP_TRAMPOLINE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ap_trampoline.bin"));
+
+/// Physical address the trampoline is linked at (SIPI vector 0x50).
+pub const AP_TRAMPOLINE_ADDR: u64 = 0x50000;
+
+/// Offset of the AP mailbox inside the trampoline page (see
+/// `ap_trampoline.S` for the field layout).
+pub const AP_MAILBOX_OFF: u64 = 0x800;
