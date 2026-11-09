@@ -16,9 +16,11 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-pub struct CpioEntry {
+pub struct CpioEntry<'a> {
     pub name: String,
-    pub data: Vec<u8>,
+    /// Payload borrowed straight from the archive mapping — no per-entry
+    /// heap copy (the rootfs archive is multi-megabyte).
+    pub data: &'a [u8],
     pub mode: u32,
     pub is_dir: bool,
 }
@@ -38,7 +40,7 @@ fn read_hex(data: &[u8], start: usize, len: usize) -> Option<u32> {
     Some(value)
 }
 
-pub fn parse_newc(archive: &[u8]) -> Vec<CpioEntry> {
+pub fn parse_newc(archive: &[u8]) -> Vec<CpioEntry<'_>> {
     let mut entries = Vec::new();
     let mut off = 0usize;
 
@@ -93,12 +95,12 @@ pub fn parse_newc(archive: &[u8]) -> Vec<CpioEntry> {
             break;
         }
 
-        let mut data = archive[data_start..data_end].to_vec();
+        let mut data = &archive[data_start..data_end];
 
         // Directory entries have no data; their mode carries S_IFDIR (0o40000).
         let is_dir = (mode & 0o170000) == 0o40000;
         if is_dir {
-            data.clear();
+            data = &[];
         }
 
         let is_trailer = name == "TRAILER!!!";

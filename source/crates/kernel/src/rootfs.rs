@@ -214,7 +214,8 @@ impl RootFsDev {
             if entry.is_dir {
                 self.mkdir_path(path);
             } else {
-                self.add_file(path, entry.data);
+                // The archive is borrowed; own a single copy for the VFS.
+                self.add_file(path, entry.data.to_vec());
             }
             count += 1;
         }

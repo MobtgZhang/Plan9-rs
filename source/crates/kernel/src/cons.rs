@@ -500,12 +500,53 @@ pub fn serial_puts(s: &[u8]) {
 }
 
 /// Read a byte from serial port (non-blocking)
+///
+/// Bytes are served from the software RX buffer first (see `poll_serial_rx`),
+/// then straight from the UART.
 pub fn serial_getchar() -> Option<u8> {
+    {
+        let mut buf = SER_RX.lock();
+        if !buf.is_empty() {
+            return Some(buf.remove(0));
+        }
+    }
     unsafe {
         if let Some(serial) = SERIAL.load(Ordering::SeqCst).as_ref() {
             serial.read_byte()
         } else {
             None
+        }
+    }
+}
+
+/// Software buffer for serial receive bytes.
+///
+/// The 16550 FIFO holds only 16 bytes and nothing polls it while the
+/// graphical console is busy rendering output inside a `write` syscall, so
+/// fast typists would lose keystrokes.  Every console interaction drains
+/// the UART into this buffer first.
+static SER_RX: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// Move every byte waiting in the UART FIFO into the software RX buffer.
+///
+/// Cheap when idle (one LSR port read); call it from any code that runs for
+/// a long time without servicing input, e.g. the console render path.
+pub fn poll_serial_rx() {
+    let mut guard = SER_RX.lock();
+    loop {
+        let byte = unsafe {
+            match SERIAL.load(Ordering::SeqCst).as_ref() {
+                Some(s) => s.read_byte(),
+                None => None,
+            }
+        };
+        match byte {
+            Some(b) => {
+                if guard.len() < 4096 {
+                    guard.push(b);
+                }
+            }
+            None => break,
         }
     }
 }

@@ -857,6 +857,7 @@ fn install_rootfs(boot: &BootInfo) {
                     let bytes = unsafe {
                         core::slice::from_raw_parts(m.start as *const u8, size)
                     };
+                    let _font_loaded = crate::font::load_font_from_cpio(bytes);
                     let count = rf.import_cpio(bytes);
                     serial::put_bytes(b"[kstart] rootfs imported entries=");
                     serial::put_hex_u32(count as u32);

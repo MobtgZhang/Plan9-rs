@@ -508,6 +508,7 @@ impl Builder {
             let path = self.rootfs_dir().join(dir);
             std::fs::create_dir_all(&path)?;
         }
+        std::fs::create_dir_all(self.rootfs_dir().join("lib").join("fonts"))?;
 
         // Touch stamp file
         std::fs::write(self.stamp_file("rootfs-stamp"), "")?;
@@ -531,6 +532,15 @@ impl Builder {
         // Install kernel and init to boot
         std::fs::copy(&self.kernel_elf(), &self.kernel_boot_elf())?;
         std::fs::copy(&self.init_elf_source(), &self.init_boot_elf())?;
+
+        // Install the built-in Sarasa-Gothic terminal font.
+        let font_src = self.project_root.join("source").join("fonts")
+            .join("SarasaTermSC-Regular-subset.ttf");
+        if font_src.exists() {
+            std::fs::create_dir_all(self.rootfs_dir().join("lib").join("fonts"))?;
+            std::fs::copy(&font_src, self.rootfs_dir().join("lib").join("fonts")
+                .join("SarasaTermSC-Regular.ttf"))?;
+        }
 
         // Install the Bash and SSH ports into /bin.
         std::fs::create_dir_all(self.rootfs_dir().join("bin"))?;
@@ -577,7 +587,13 @@ impl Builder {
         let cpio = self.rootfs_cpio();
         let status = Command::new("bash")
             .arg("-c")
-            .arg(format!("find . -print | cpio -o -H newc -O '{}'", cpio.display()))
+            // The kernel image is only needed for ISO (multiboot) boots;
+            // shipping it inside the RAM rootfs would waste ~8 MiB of kernel
+            // heap, which the boot bump-allocator cannot reclaim.
+            .arg(format!(
+                "find . -print | grep -v -x -e './boot/9kernel.elf' | cpio -o -H newc -O '{}'",
+                cpio.display()
+            ))
             .current_dir(self.rootfs_dir())
             .status()
             .context("Failed to create rootfs.cpio")?;

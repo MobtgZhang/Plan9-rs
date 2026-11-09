@@ -5,12 +5,12 @@
 //! virtio-gpu) as long as the engine has been initialised by
 //! `gpu::manager::init_from_bootinfo()`.
 //!
-//! Character output now goes through the vector-font layer in
-//! `crate::font`, so the terminal can be scaled independently of the
-//! framebuffer resolution.  The default face is the built-in 8x16 bitmap
-//! font scaled to the requested pixel size; a real deployment should load
-//! a full TTF (e.g. Sarasa-Gothic) from the initramfs/ESP and install it
-//! with `crate::font::set_font`.
+//! Text is laid out on a fixed cell grid derived from the installed vector
+//! font: the cell width is the advance of a reference half-width glyph (so a
+//! monospace face such as Sarasa-Term lines up exactly), the line height
+//! comes from the font's `hhea` metrics, and glyphs are drawn with their
+//! true baseline inside the line box.  Multi-byte UTF-8 sequences written
+//! through `putchar` are decoded before rendering.
 
 use core::fmt::{self, Write};
 use alloc::boxed::Box;
@@ -30,14 +30,26 @@ static mut FG_COLOR: Color = Color::new(0xCC, 0xCC, 0xCC); // light grey
 static mut BG_COLOR: Color = Color::BLACK;
 
 /// Pixel size of the font (in framebuffer pixels).
-static mut FONT_PX: u32 = 16;
+static mut FONT_PX: u32 = 24;
 
-/// Number of text columns and rows (derived from framebuffer and font size).
+/// Width of one half-width character cell (pixels).
+static mut CELL_W: u32 = 12;
+/// Height of one text line box (pixels).
+static mut LINE_H: u32 = 30;
+/// Baseline offset from the top of the line box (pixels).
+static mut BASELINE: u32 = 24;
+
+/// Number of text columns and rows (derived from framebuffer and cell size).
 static mut COLS: usize = 0;
 static mut ROWS: usize = 0;
 
 /// Whether `init_console()` has completed successfully on a real framebuffer.
 static mut CONSOLE_INIT: bool = false;
+
+/// Incremental UTF-8 decoder state for `putchar`.
+static mut UTF8_BUF: [u8; 4] = [0; 4];
+static mut UTF8_LEN: usize = 0;
+static mut UTF8_NEED: usize = 0;
 
 // ============================================================================
 // Initialisation
@@ -46,15 +58,38 @@ static mut CONSOLE_INIT: bool = false;
 /// Initialise the on-screen text console.
 ///
 /// Clears the framebuffer to the background colour, resets the cursor to (0, 0),
-/// and computes the number of text columns and rows from the engine's
-/// framebuffer dimensions and the current font pixel size. Safe to call after
+/// and computes the text grid from the framebuffer dimensions and the
+/// installed font's metrics. Safe to call after
 /// `gpu::manager::init_from_bootinfo()`.
 pub fn init_console() {
     gpu::manager::with_mut(|engine| {
         let info = engine.info();
         let px = unsafe { FONT_PX.max(8) };
-        let cols = (info.width as u64 / px as u64) as usize;
-        let rows = (info.height as u64 / px as u64) as usize;
+
+        // Use the font face installed at boot (Sarasa-Gothic if it was
+        // loaded from the root archive), otherwise the built-in fallback.
+        let source: &'static dyn font::Font = match font::ttf() {
+            Some(f) => f as &dyn font::Font,
+            None => &BuiltinBitmapFont as &dyn font::Font,
+        };
+        let scaled = Box::leak(Box::new(ScaledFont::new(source, px)));
+        font::set_font(scaled);
+
+        // Cell width: the advance of a reference half-width glyph.  For a
+        // monospace face such as Sarasa-Term every Latin glyph shares this
+        // advance, so columns line up exactly; CJK glyphs are double width.
+        let mut cell_w = font::char_advance('M' as u32);
+        if cell_w == 0 {
+            cell_w = (px / 2).max(4);
+        }
+
+        // Line box: ascent + descent + leading straight from `hhea`.
+        let (asc, desc, gap) = font::line_metrics();
+        let line_h = (asc + desc + gap).max(px / 2);
+        let baseline = asc + gap / 2;
+
+        let cols = (info.width as u64 / cell_w as u64) as usize;
+        let rows = (info.height as u64 / line_h as u64) as usize;
 
         // The null engine has a zero-sized framebuffer.  Do not mark the
         // graphical console as usable in that case; `/dev/console` will
@@ -65,22 +100,18 @@ pub fn init_console() {
             return;
         }
 
-        // Install the default scaled font (built-in bitmap font scaled to
-        // `px` pixels).  A real deployment can replace this with a Sarasa
-        // Gothic TTF loaded at boot.
-        let font = Box::leak(Box::new(ScaledFont::new(
-            &BuiltinBitmapFont as &dyn font::Font,
-            px,
-        )));
-        font::set_font(font);
-
         unsafe {
+            CELL_W = cell_w;
+            LINE_H = line_h;
+            BASELINE = baseline;
             COLS = cols;
             ROWS = rows;
             CURSOR_X = 0;
             CURSOR_Y = 0;
             FG_COLOR = Color::new(0xCC, 0xCC, 0xCC);
             BG_COLOR = Color::BLACK;
+            UTF8_LEN = 0;
+            UTF8_NEED = 0;
         }
 
         // Clear the framebuffer to black.
@@ -99,6 +130,10 @@ pub fn init_console() {
         crate::serial::put_hex_u32(rows as u32);
         crate::serial::put_bytes(b" font_px=");
         crate::serial::put_hex_u32(px);
+        crate::serial::put_bytes(b" cell=");
+        crate::serial::put_hex_u32(cell_w);
+        crate::serial::put_bytes(b" line=");
+        crate::serial::put_hex_u32(line_h);
         crate::serial::put_bytes(b"\n");
     });
 }
@@ -118,6 +153,94 @@ pub fn font_px() -> u32 {
     unsafe { FONT_PX }
 }
 
+/// Returns the width of one half-width character cell in pixels.
+pub fn cell_w() -> u32 {
+    unsafe { CELL_W }
+}
+
+/// Returns the height of one text line in pixels.
+pub fn line_h() -> u32 {
+    unsafe { LINE_H }
+}
+
+// ============================================================================
+// UTF-8 decoding
+// ============================================================================
+
+/// Event decoded from an incoming byte stream.
+enum Event {
+    /// A printable character ready to be drawn.
+    Char(char),
+    /// A control byte (`\n`, `\r`, `\t`, backspace).
+    Ctrl(u8),
+    /// Nothing to do for this byte.
+    Skip,
+}
+
+/// Feed one byte to the UTF-8 decoder / control-byte classifier.
+fn decode_byte(c: u8) -> Event {
+    if c < 0x80 {
+        // ASCII terminates any pending multi-byte sequence (dropped if
+        // incomplete) and never continues one.
+        unsafe {
+            UTF8_LEN = 0;
+            UTF8_NEED = 0;
+        }
+        match c {
+            b'\n' | b'\r' | b'\t' | b'\x08' => Event::Ctrl(c),
+            0x20..=0x7e => Event::Char(c as char),
+            _ => Event::Skip,
+        }
+    } else if c & 0xC0 == 0x80 {
+        // Continuation byte.
+        unsafe {
+            if UTF8_LEN == 0 || UTF8_LEN >= UTF8_NEED {
+                return Event::Skip; // stray continuation
+            }
+            UTF8_BUF[UTF8_LEN] = c;
+            UTF8_LEN += 1;
+            if UTF8_LEN < UTF8_NEED {
+                return Event::Skip;
+            }
+            let bytes = [UTF8_BUF[0], UTF8_BUF[1], UTF8_BUF[2], UTF8_BUF[3]];
+            UTF8_LEN = 0;
+            UTF8_NEED = 0;
+            let slice = &bytes[..utf8_seq_len(bytes[0]).unwrap_or(0).min(4)];
+            if let Ok(s) = core::str::from_utf8(slice) {
+                if let Some(ch) = s.chars().next() {
+                    return Event::Char(ch);
+                }
+            }
+            Event::Skip
+        }
+    } else {
+        // Lead byte of a new sequence.
+        let Some(len) = utf8_seq_len(c) else { return Event::Skip; };
+        unsafe {
+            UTF8_BUF[0] = c;
+            UTF8_LEN = 1;
+            UTF8_NEED = len;
+        }
+        if len == 1 {
+            unsafe { UTF8_LEN = 0; UTF8_NEED = 0; }
+            Event::Char(c as char)
+        } else {
+            Event::Skip
+        }
+    }
+}
+
+/// Length in bytes of a UTF-8 sequence starting with `lead`, or `None` when
+/// the byte cannot start a valid sequence (over-long / out of range).
+fn utf8_seq_len(lead: u8) -> Option<usize> {
+    match lead {
+        0xC2..=0xDF => Some(2), // no over-long 2-byte forms
+        0xE0..=0xEF => Some(3),
+        0xF0..=0xF4 => Some(4),
+        _ => None,
+    }
+}
+
 // ============================================================================
 // Character output
 // ============================================================================
@@ -128,6 +251,10 @@ pub fn putchar(c: u8) {
         return;
     }
 
+    // Rendering a glyph can take a while; keep the 16-byte UART FIFO from
+    // overflowing by moving waiting bytes into the software RX buffer.
+    crate::cons::poll_serial_rx();
+
     // Defensive guard: a usable engine always has at least one cell.
     unsafe {
         if COLS == 0 || ROWS == 0 {
@@ -135,82 +262,84 @@ pub fn putchar(c: u8) {
         }
     }
 
+    let event = decode_byte(c);
+    match event {
+        Event::Skip => return,
+        _ => {}
+    }
+
     gpu::manager::with_mut(|engine| {
         let mut cx = unsafe { CURSOR_X };
         let mut cy = unsafe { CURSOR_Y };
         let (cols, rows) = unsafe { (COLS as i32, ROWS as i32) };
+        let cell_w = unsafe { CELL_W as i32 };
+        let line_h = unsafe { LINE_H as i32 };
         let fg = unsafe { FG_COLOR };
         let bg = unsafe { BG_COLOR };
         let cursor_drawn = unsafe { CURSOR_DRAWN };
 
-        match c {
-            b'\n' => {
-                if cursor_drawn {
-                    draw_cursor(engine, cx, cy, bg);
-                }
-                cx = 0;
-                cy += font_px() as i32;
-            }
-            b'\r' => {
-                cx = 0;
-            }
-            b'\t' => {
-                let tab_w = font_px() as i32 * 8;
-                cx = (cx + tab_w) & !(tab_w - 1);
-                if cx >= cols * font_px() as i32 {
+        if cursor_drawn {
+            draw_cursor(engine, cx, cy, bg);
+        }
+
+        match event {
+            Event::Char(ch) => {
+                let baseline = cy + unsafe { BASELINE } as i32;
+                let end = font::draw_char(engine, cx, baseline, ch, fg);
+                let adv = (end - cx).max(0) as u32;
+                // Round the glyph's advance to whole cells: half-width Latin
+                // is one cell, full-width CJK two, unknown glyphs two.
+                let cells = ((adv + unsafe { CELL_W } / 2) / unsafe { CELL_W }.max(1)).max(1);
+                cx += cells as i32 * cell_w;
+                if cx >= cols * cell_w {
                     cx = 0;
-                    cy += font_px() as i32;
+                    cy += line_h;
                 }
             }
-            b'\x08' => {
+            Event::Ctrl(b'\n') => {
+                cx = 0;
+                cy += line_h;
+            }
+            Event::Ctrl(b'\r') => {
+                cx = 0;
+            }
+            Event::Ctrl(b'\t') => {
+                let tab_w = cell_w * 8;
+                cx = ((cx + tab_w) / tab_w) * tab_w;
+                if cx >= cols * cell_w {
+                    cx = 0;
+                    cy += line_h;
+                }
+            }
+            Event::Ctrl(b'\x08') => {
                 // Backspace: erase the previous character cell.
-                let cell_w = font_px() as i32;
                 if cx > 0 {
                     cx -= cell_w;
                 }
-                let px = cx as u32;
-                let py = cy as u32;
                 engine.fill_rect(
-                    gpu::Rect::new(px, py, font_px(), font_px()),
+                    gpu::Rect::new(cx as u32, cy as u32, cell_w as u32, line_h as u32),
                     bg,
                 );
-                unsafe { CURSOR_X = cx; }
-                return;
             }
-            _ => {
-                if cursor_drawn {
-                    draw_cursor(engine, cx, cy, bg);
-                }
-                let px = cx as u32;
-                let py = cy as u32;
-                let ch = c as char;
-                let mut utf8 = [0u8; 4];
-                let s = ch.encode_utf8(&mut utf8);
-                font::draw_text(engine, cx, cy, s, fg);
-                cx += font_px() as i32;
-                if cx >= cols * font_px() as i32 {
-                    cx = 0;
-                    cy += font_px() as i32;
-                }
-            }
+            Event::Ctrl(_) => {}
+            Event::Skip => unreachable!(),
         }
 
         // Handle scrolling.
-        if cy >= rows * font_px() as i32 {
-            cy = (rows - 1) * font_px() as i32;
-            engine.scroll_up(font_px(), bg);
+        if cy >= rows * line_h {
+            cy = (rows - 1) * line_h;
+            engine.scroll_up(line_h as u32, bg);
         }
 
         // Draw cursor at new position.
         draw_cursor(engine, cx, cy, fg);
-        unsafe { CURSOR_DRAWN = true; }
-
-        engine.flush();
-
         unsafe {
+            CURSOR_DRAWN = true;
             CURSOR_X = cx;
             CURSOR_Y = cy;
         }
+
+        engine.flush();
     });
 }
 
@@ -246,21 +375,30 @@ pub fn putu(mut v: u64) {
 // Cursor rendering
 // ============================================================================
 
-/// Draw the text cursor (a small underline) at pixel position (cx, cy).
+/// Draw the text cursor (an underline inside the line box) at cell (cx, cy).
 fn draw_cursor(
     engine: &mut dyn gpu::DisplayEngine,
     cx: i32,
     cy: i32,
     color: Color,
 ) {
-    let cell_w = font_px() as u32;
-    let underline_h = (cell_w / 8).max(2);
-    let py = (cy + cell_w as i32 - underline_h as i32) as u32;
+    let cell_w = unsafe { CELL_W } as i32;
+    let line_h = unsafe { LINE_H } as i32;
+    let underline_h = (line_h / 10).max(2);
+    let py = cy + line_h - underline_h;
+    if py < 0 {
+        return;
+    }
+    let (w, h) = {
+        let i = engine.info();
+        (i.width, i.height)
+    };
     for dy in 0..underline_h {
         for dx in 0..cell_w {
-            let px = (cx as u32).saturating_add(dx);
-            if px < engine.info().width {
-                engine.put_pixel(px, py + dy, color);
+            let px = cx + dx;
+            let y = py + dy;
+            if px >= 0 && y >= 0 && (px as u32) < w && (y as u32) < h {
+                engine.put_pixel(px as u32, y as u32, color);
             }
         }
     }

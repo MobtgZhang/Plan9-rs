@@ -116,8 +116,30 @@ fn main() -> ! {
             println("goodbye");
             exit(0);
         } else if cmd == "echo" {
+            // Print every argument separated by single spaces.  Arguments
+            // are raw byte slices so UTF-8 input (e.g. CJK) passes through
+            // untouched.
             if nwords > 1 {
-                println(arg1);
+                let mut out_buf = [0u8; 256];
+                let mut out_len = 0usize;
+                for wi in 1..nwords {
+                    if wi > 1 && out_len < out_buf.len() {
+                        out_buf[out_len] = b' ';
+                        out_len += 1;
+                    }
+                    let mut n = 0usize;
+                    while n < 128 && words[wi][n] != 0 {
+                        n += 1;
+                    }
+                    if out_len + n >= out_buf.len() {
+                        break;
+                    }
+                    out_buf[out_len..out_len + n].copy_from_slice(&words[wi][..n]);
+                    out_len += n;
+                }
+                out_buf[out_len] = 0;
+                puts(out_buf.as_ptr());
+                print("\n");
             } else {
                 println("");
             }
