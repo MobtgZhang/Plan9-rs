@@ -478,15 +478,39 @@ impl Dev for ProcFsDev {
             return Ok(Some(Qid::new(0, 0, qidtype::DIR)));
         }
         
-        // Try to find a process with this PID in the scheduler table.
-        if let Ok(pid) = name.parse::<i32>() {
-            if Self::real_proc(pid).is_some() {
-                let path = proc_qid(pid, ProcQid::None);
-                return Ok(Some(Qid::new(path, 0, qidtype::DIR)));
+        // Directory level decides what names are legal: the root holds
+        // PID directories, a PID directory holds that process's files.
+        // NOTE: namec() discards the returned Qid, so the channel must be
+        // updated in place (the convention used by the other devices).
+        if ch.qid.path == 0 {
+            // Root: only a PID directory name is accepted.
+            if let Ok(pid) = name.parse::<i32>() {
+                if Self::real_proc(pid).is_some() {
+                    ch.qid = Qid::new(proc_qid(pid, ProcQid::None), 0, qidtype::DIR);
+                    return Ok(Some(ch.qid));
+                }
             }
+            return Err(DevError::Enoent);
         }
-        
-        Err(DevError::Enoent)
+
+        // Inside a PID directory: accept that process's file names.
+        let pid = (ch.qid.path >> 8) as i32;
+        if Self::real_proc(pid).is_none() {
+            return Err(DevError::Enoent);
+        }
+        let ftype = match name {
+            "ctl" => ProcQid::Ctl,
+            "status" => ProcQid::Status,
+            "note" => ProcQid::Note,
+            "mem" => ProcQid::Memory,
+            "regs" => ProcQid::Regs,
+            "fpregs" => ProcQid::Fpregs,
+            "fd" => ProcQid::FdDir,
+            "wait" => ProcQid::Wait,
+            _ => return Err(DevError::Enoent),
+        };
+        ch.qid = Qid::new(proc_qid(pid, ftype), 0, qidtype::FILE);
+        Ok(Some(ch.qid))
     }
     
     /// Open a proc file
@@ -533,8 +557,8 @@ impl Dev for ProcFsDev {
                 Err(DevError::Eperm)
             }
             ProcQid::Memory => {
-                // Process memory
-                Err(DevError::Eperm)
+                // Process memory segment map
+                Self::read_memory(pid, buf, offset)
             }
             ProcQid::Regs => {
                 // Registers
@@ -717,20 +741,83 @@ impl ProcFsDev {
     }
     
     /// Read process status
-    fn read_status(pid: i32, buf: &mut [u8], _offset: u64) -> Result<usize, DevError> {
+    fn read_status(pid: i32, buf: &mut [u8], offset: u64) -> Result<usize, DevError> {
         let proc = Self::real_proc(pid).ok_or(DevError::Enoent)?;
 
+        // Sum the resident bytes across the process segments.
+        let mut mem_bytes = 0usize;
+        let mut seg_count = 0usize;
+        for seg in proc.seg.iter() {
+            if let Some(s) = seg {
+                if s.segtype != crate::proc::SegType::None {
+                    mem_bytes += s.size();
+                    seg_count += 1;
+                }
+            }
+        }
+
         let status_str = alloc::format!(
-            "PID\t{}\nState\t{}\n",
+            "PID\t{}\nState\t{}\nSegments\t{}\nMemBytes\t{}\n",
             proc.pid,
-            Self::state_str(proc.state)
+            Self::state_str(proc.state),
+            seg_count,
+            mem_bytes
         );
-        
-        let status_bytes = status_str.as_bytes();
-        let copy_len = status_bytes.len().min(buf.len());
-        buf[..copy_len].copy_from_slice(&status_bytes[..copy_len]);
-        
-        Ok(copy_len)
+
+        // Stream with offset so repeated reads walk the file instead of
+        // re-printing the first window (see read_memory).
+        let bytes = status_str.as_bytes();
+        let off = offset as usize;
+        if off >= bytes.len() {
+            return Ok(0);
+        }
+        let end = (off + buf.len()).min(bytes.len());
+        buf[..end - off].copy_from_slice(&bytes[off..end]);
+        Ok(end - off)
+    }
+
+    /// Read `/proc/N/mem`: dump the process segment map.
+    fn read_memory(pid: i32, buf: &mut [u8], offset: u64) -> Result<usize, DevError> {
+        let proc = Self::real_proc(pid).ok_or(DevError::Enoent)?;
+
+        let mut text = alloc::string::String::new();
+        text.push_str("Segment\tType\tBase\tTop\tSize\n");
+        for (i, seg) in proc.seg.iter().enumerate() {
+            if let Some(s) = seg {
+                if s.segtype == crate::proc::SegType::None {
+                    continue;
+                }
+                let name = match s.segtype {
+                    crate::proc::SegType::Text => "text",
+                    crate::proc::SegType::Data => "data",
+                    crate::proc::SegType::Bss => "bss",
+                    crate::proc::SegType::Stack => "stack",
+                    crate::proc::SegType::Shared => "shared",
+                    crate::proc::SegType::Physical => "phys",
+                    crate::proc::SegType::None => continue,
+                };
+                text.push_str(&alloc::format!(
+                    "{}\t{}\t{:#x}\t{:#x}\t{}\n",
+                    i,
+                    name,
+                    s.base,
+                    s.top,
+                    s.size()
+                ));
+            }
+        }
+
+        // Stream: the caller's channel offset advances by the number of
+        // bytes returned, so serve the window [offset, offset+buf.len())
+        // of the pre-built text and report EOF with a zero-length read.
+        let bytes = text.as_bytes();
+        let off = offset as usize;
+        if off >= bytes.len() {
+            return Ok(0);
+        }
+        let end = (off + buf.len()).min(bytes.len());
+        buf[..end - off].copy_from_slice(&bytes[off..end]);
+        Ok(end - off)
     }
     
     /// Write to control file

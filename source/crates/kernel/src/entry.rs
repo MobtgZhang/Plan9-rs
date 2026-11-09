@@ -819,6 +819,19 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     if let Some(proc) = crate::proc::curproc_mut() {
         proc.mmupdb = init_image.pml4;
         proc.set_text(b"init");
+        // Publish the segment layout so /proc/1/mem and status report the
+        // real text/data/stack ranges.
+        for (i, (tag, base, top)) in init_loader::take_user_segments().iter().enumerate() {
+            let segtype = match *tag {
+                t if t == crate::proc::SegType::Text as u8 => crate::proc::SegType::Text,
+                t if t == crate::proc::SegType::Data as u8 => crate::proc::SegType::Data,
+                t if t == crate::proc::SegType::Stack as u8 => crate::proc::SegType::Stack,
+                _ => crate::proc::SegType::None,
+            };
+            if segtype != crate::proc::SegType::None {
+                proc.set_segment_info(i, segtype, *base, *top);
+            }
+        }
     }
 
     serial::put_bytes(b"[kstart] switching to user mode (entry=");
@@ -861,6 +874,17 @@ fn install_rootfs(boot: &BootInfo) {
                     let count = rf.import_cpio(bytes);
                     serial::put_bytes(b"[kstart] rootfs imported entries=");
                     serial::put_hex_u32(count as u32);
+                    serial::put_bytes(b"\n");
+                    // Boot-time heap usage report (milestone: memory mgmt).
+                    let st = crate::heap::stats();
+                    serial::put_bytes(b"[kstart] heap allocs=");
+                    serial::put_hex_u32(st.allocs as u32);
+                    serial::put_bytes(b" frees=");
+                    serial::put_hex_u32(st.frees as u32);
+                    serial::put_bytes(b" live=");
+                    serial::put_hex_u32(st.live_bytes as u32);
+                    serial::put_bytes(b" total=");
+                    serial::put_hex_u32(st.total_bytes as u32);
                     serial::put_bytes(b"\n");
                     found = true;
                     break;

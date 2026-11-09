@@ -751,6 +751,9 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
 
     const PAGE_SIZE: usize = 4096;
 
+    // Segment metadata for /proc: (SegType tag, base, top) per PT_LOAD.
+    let mut exec_segs: Vec<(u8, u64, u64)> = Vec::new();
+
     for i in 0..phnum {
         let ph_pos = phoff + i * phentsize;
         if ph_pos + 56 > data.len() {
@@ -782,6 +785,14 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
         let seg_start = p_vaddr + crate::USER_BASE;
         let seg_end = seg_start + p_memsz;
         let data_end = seg_start + p_filesz as u64;
+
+        // Record the segment layout for /proc (writable -> data, else text).
+        let seg_tag = if p_flags & 2 != 0 {
+            crate::proc::SegType::Data as u8
+        } else {
+            crate::proc::SegType::Text as u8
+        };
+        exec_segs.push((seg_tag, seg_start, seg_end));
 
         let mut cur_vaddr = seg_start & !(PAGE_SIZE as u64 - 1);
         while cur_vaddr < seg_end {
@@ -833,6 +844,30 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
 
     // Build and map the user stack for the new image.
     let sp = build_exec_stack(&args, &envp, entry, proc)?;
+
+    // Publish the new image's segment table for /proc/N/mem and status:
+    // the PT_LOAD segments plus the freshly mapped user stack.
+    const STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
+    const STACK_PAGES: u64 = 4;
+    const STACK_SIZE: u64 = STACK_PAGES * PAGE_SIZE as u64;
+    exec_segs.push((
+        crate::proc::SegType::Stack as u8,
+        STACK_TOP - STACK_SIZE + PAGE_SIZE as u64,
+        STACK_TOP,
+    ));
+    proc.seg.iter_mut().for_each(|s| *s = None);
+    for (i, (tag, base, top)) in exec_segs.iter().enumerate() {
+        let segtype = match *tag {
+            t if t == crate::proc::SegType::Text as u8 => crate::proc::SegType::Text,
+            t if t == crate::proc::SegType::Data as u8 => crate::proc::SegType::Data,
+            t if t == crate::proc::SegType::Stack as u8 => crate::proc::SegType::Stack,
+            _ => crate::proc::SegType::None,
+        };
+        if segtype != crate::proc::SegType::None {
+            proc.set_segment_info(i, segtype, *base, *top);
+        }
+    }
+
     proc.set_exec_context(entry, sp, args.len());
     Ok(0)
 }

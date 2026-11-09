@@ -24,6 +24,24 @@ use crate::plan9_common::sync::Spinlock;
 
 use crate::frame_alloc;
 
+/// Segment metadata collected while mapping the init ELF: a
+/// `crate::proc::SegType` discriminant, base and top virtual addresses.
+/// The boot path applies this to proc0 so `/proc/N/mem` and `status`
+/// report the real segment layout.
+pub type UserSegInfo = (u8, u64, u64);
+
+static USER_SEGS: Spinlock<Vec<UserSegInfo>> = Spinlock::new(Vec::new());
+
+/// Drain the collected segment metadata (called once by the boot path).
+pub fn take_user_segments() -> Vec<UserSegInfo> {
+    let mut guard = USER_SEGS.lock();
+    core::mem::take(&mut *guard)
+}
+
+fn record_user_seg(tag: u8, base: u64, top: u64) {
+    USER_SEGS.lock().push((tag, base, top));
+}
+
 /// Where the user-mode ELF gets mapped.  Plan 9-style non-PIE userspace.
 /// User programs are linked at 0x200000 (the kernel's linker base), so we
 /// relocate the whole image uniformly to 1 GiB (USER_BASE).  This keeps the
@@ -132,6 +150,7 @@ pub fn load_init(boot: &BootInfo) -> Option<InitImage> {
     crate::serial::put_bytes(b"[init_loader] stack_base=");
     crate::serial::put_hex_u64(stack_base);
     crate::serial::put_bytes(b"\n");
+    record_user_seg(crate::proc::SegType::Stack as u8, stack_base, stack_top);
     unsafe {
         for page in 0..USER_STACK_PAGES {
             let phys = match frame_alloc::frame_alloc_zeroed() {
@@ -481,6 +500,14 @@ unsafe fn map_elf_segments(pml4: PhysAddr, module: &crate::entry::RawModuleInfo)
         let seg_start_vaddr = ph.p_vaddr + USER_LOAD_BASE;
         let seg_end_vaddr   = ph.p_vaddr + USER_LOAD_BASE + ph.p_memsz;
         let data_end_vaddr  = seg_start_vaddr + ph.p_filesz;
+
+        // Record the segment layout for /proc (writable -> data, else text).
+        let seg_tag = if ph.p_flags & 0x2 != 0 {
+            crate::proc::SegType::Data as u8
+        } else {
+            crate::proc::SegType::Text as u8
+        };
+        record_user_seg(seg_tag, seg_start_vaddr, seg_end_vaddr);
 
         let mut cur_vaddr = seg_start_vaddr & !(PAGESIZE as u64 - 1);
 

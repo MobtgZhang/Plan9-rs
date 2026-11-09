@@ -860,6 +860,15 @@ impl Scheduler {
             // Fork process groups based on flags
             proc.fork_groups(Some(p), flags);
 
+            // Inherit the parent's segment table (metadata only: the child
+            // gets its own page-table copy or shares the parent's, depending
+            // on FLAGFMEM below, but /proc should report the same layout).
+            for (i, seg) in p.seg.iter().enumerate() {
+                if let Some(s) = seg {
+                    proc.set_segment_info(i, s.segtype, s.base, s.top);
+                }
+            }
+
             // Handle memory based on flags.  For ordinary fork we make a
             // separate PML4 with copied kernel mappings and a deep copy of
             // the parent's user pages, so exec/write in the child cannot

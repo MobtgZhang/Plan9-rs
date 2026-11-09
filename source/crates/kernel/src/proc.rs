@@ -1932,6 +1932,18 @@ impl Proc {
     /// Setup segments for exec
     ///
     /// Replaces the process's memory segments with new ones for the exec'd program.
+    /// Register a segment's metadata without performing any mapping.
+    ///
+    /// Used by the boot path and `fork` to populate the `/proc` segment
+    /// table for address spaces that were built directly through the
+    /// page-table helpers (init) or inherited page by page (fork).
+    pub fn set_segment_info(&mut self, idx: usize, segtype: SegType, base: u64, top: u64) {
+        if idx < NSEG && top > base {
+            let size = (top - base) as usize;
+            self.seg[idx] = Some(ProcSegment::new(segtype, base, size));
+        }
+    }
+
     pub fn setup_segments(&mut self, entry: u64, text_size: usize, data_size: usize, stack_top: u64) {
         // Free old segments first
         self.free_segments();
