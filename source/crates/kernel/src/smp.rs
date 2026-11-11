@@ -13,7 +13,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::frame_alloc;
-use crate::plan9_arch::x86_64::paging::{phys_to_virt, PAGESIZE};
+use crate::plan9_arch::hal::paging::{phys_to_virt, PAGESIZE};
 use plan9_common::types::PhysAddr;
 
 /// Physical page the trampoline binary is linked at (SIPI vector 0x50).
@@ -48,6 +48,7 @@ static mut RSDP_COPY_LEN: usize = 0;
 
 /// Record the RSDP bytes handed over by the bootloader.  Called from
 /// `parse_boot_info` when it sees the Multiboot2 ACPI tags.
+#[cfg(target_arch = "x86_64")]
 pub fn store_rsdp_copy(bytes: &[u8]) {
     let n = bytes.len().min(36);
     unsafe {
@@ -59,6 +60,7 @@ pub fn store_rsdp_copy(bytes: &[u8]) {
 /// Validate the stored RSDP copy and return its address.  The copy lives in
 /// the kernel image, which is identity-mapped, so the address can be used
 /// directly as an RSDP pointer (the bytes are identical to the original).
+#[cfg(target_arch = "x86_64")]
 fn rsdp_from_copy() -> Option<u64> {
     unsafe {
         if RSDP_COPY_LEN < 20 {
@@ -91,6 +93,7 @@ fn rsdp_from_copy() -> Option<u64> {
 /// the standard BIOS scan is the fallback for non-UEFI boots: the EBDA
 /// region pointed to by BDA word 0x40E, the 0x60000..0xA0000 conventional
 /// memory top, then the 0xE0000..0x100000 BIOS ROM shadow area.
+#[cfg(target_arch = "x86_64")]
 fn find_rsdp() -> Option<u64> {
     if let Some(a) = rsdp_from_copy() {
         return Some(a);
@@ -114,6 +117,7 @@ fn find_rsdp() -> Option<u64> {
 }
 
 /// Look for "RSD PTR " followed by a valid ACPI 1.0 checksum.
+#[cfg(target_arch = "x86_64")]
 fn scan_rsdp_range(start: u64, end: u64) -> Option<u64> {
     let mut addr = start;
     while addr + 8 <= end {
@@ -133,15 +137,17 @@ fn scan_rsdp_range(start: u64, end: u64) -> Option<u64> {
 
 /// Extract the RSDT/XSDT address from the RSDP at `rsdp`.  Returns the
 /// table address plus whether it is an XSDT (64-bit entry format).
+#[cfg(target_arch = "x86_64")]
 unsafe fn rsdt_address(rsdp: u64) -> Option<(u64, bool)> {
-    let revision = *(rsdp as *const u8).add(15);
+    let revision = core::ptr::read_unaligned((rsdp as *const u8).add(15));
     if revision >= 2 {
-        let xsdt = *(rsdp as *const u64).add(3); // offset 24
+        let xsdt = core::ptr::read_unaligned((rsdp as *const u64).add(3)); // offset 24
         if xsdt != 0 {
             return Some((xsdt, true));
         }
     }
-    let rsdt = *(rsdp as *const u32).add(10) as u64; // offset 16 (0x0C)
+    // RSDT pointer is at offset 16 (four u32 slots past the signature).
+    let rsdt = core::ptr::read_unaligned((rsdp as *const u32).add(4)) as u64;
     if rsdt != 0 {
         return Some((rsdt, false));
     }
@@ -150,21 +156,25 @@ unsafe fn rsdt_address(rsdp: u64) -> Option<(u64, bool)> {
 
 /// Walk the RSDT/XSDT (a table of pointers to other SDTs), find the MADT
 /// ("APIC" table) and return the APIC IDs of every enabled CPU.
+#[cfg(target_arch = "x86_64")]
 fn madt_apic_ids(rsdt: u64, xsdt: bool) -> Option<alloc::vec::Vec<u8>> {
     unsafe {
-        let table_len = *(rsdt as *const u32).add(1) as usize; // offset 4 = length
+        // ACPI SDT header: 32-bit length field at offset 4. Firmware tables
+        // are not guaranteed to be aligned for the entry width, so every
+        // multi-byte access uses `read_unaligned`.
+        let table_len = core::ptr::read_unaligned((rsdt as *const u32).add(1)) as usize;
         // 36-byte SDT header, then the pointer entries (u32 for RSDT,
         // u64 for XSDT).
         let stride = if xsdt { 8usize } else { 4usize };
         let mut off = 36usize;
         while off + stride <= table_len {
             let ptr = if xsdt {
-                *((rsdt + off as u64) as *const u64)
+                core::ptr::read_unaligned((rsdt + off as u64) as *const u64)
             } else {
-                *((rsdt + off as u64) as *const u32) as u64
+                core::ptr::read_unaligned((rsdt + off as u64) as *const u32) as u64
             };
             if ptr != 0 {
-                let sig = *(ptr as *const [u8; 4]);
+                let sig = core::ptr::read_unaligned(ptr as *const [u8; 4]);
                 if sig == *b"APIC" {
                     return parse_madt(ptr);
                 }
@@ -179,9 +189,10 @@ fn madt_apic_ids(rsdt: u64, xsdt: bool) -> Option<alloc::vec::Vec<u8>> {
 ///
 /// Entry layout for type 0 (Processor Local APIC, 8 bytes):
 /// [0]=type [1]=len [2]=ACPI UID [3]=APIC ID [4..8]=flags (bit 0 = enabled).
+#[cfg(target_arch = "x86_64")]
 fn parse_madt(madt: u64) -> Option<alloc::vec::Vec<u8>> {
     unsafe {
-        let table_len = *(madt as *const u32).add(1) as usize; // offset 4 = length
+        let table_len = core::ptr::read_unaligned((madt as *const u32).add(1)) as usize;
         if table_len <= 44 {
             return None;
         }
@@ -191,14 +202,14 @@ fn parse_madt(madt: u64) -> Option<alloc::vec::Vec<u8>> {
         let mut off = 44usize;
         while off + 2 <= table_len {
             let entry = madt + off as u64;
-            let etype = *(entry as *const u8);
-            let elen = *((entry + 1) as *const u8) as usize;
+            let etype = core::ptr::read_unaligned(entry as *const u8);
+            let elen = core::ptr::read_unaligned((entry + 1) as *const u8) as usize;
             if elen < 2 || off + elen > table_len {
                 break;
             }
             if etype == 0 && elen >= 8 {
-                let apic_id = *((entry + 3) as *const u8);
-                let flags = *((entry + 4) as *const u32);
+                let apic_id = core::ptr::read_unaligned((entry + 3) as *const u8);
+                let flags = core::ptr::read_unaligned((entry + 4) as *const u32);
                 if flags & 1 != 0 {
                     ids.push(apic_id);
                 }
@@ -219,6 +230,7 @@ fn parse_madt(madt: u64) -> Option<alloc::vec::Vec<u8>> {
 
 /// Bring up the application processors.  Must run once, from the BSP,
 /// after the frame allocator, heap and scheduler are initialised.
+#[cfg(target_arch = "x86_64")]
 pub fn init_aps() {
     let cpus = unsafe {
         let rsdp = match find_rsdp() {
@@ -260,9 +272,9 @@ pub fn init_aps() {
     let tramp = AP_TRAMPOLINE as *mut u8;
     unsafe {
         core::ptr::copy_nonoverlapping(
-            crate::plan9_arch::x86_64::smp::AP_TRAMPOLINE.as_ptr(),
+            crate::plan9_arch::hal::smp::AP_TRAMPOLINE.as_ptr(),
             tramp,
-            crate::plan9_arch::x86_64::smp::AP_TRAMPOLINE.len(),
+            crate::plan9_arch::hal::smp::AP_TRAMPOLINE.len(),
         );
     }
 
@@ -291,6 +303,7 @@ pub fn init_aps() {
 
 /// Read the BSP's APIC id from the LAPIC ID register (0xFEE00020).  The
 /// MMIO window sits in the boot identity map, so a plain pointer read works.
+#[cfg(target_arch = "x86_64")]
 fn bsp_lapic_id() -> u8 {
     let id_reg = unsafe { *(0xFEE00020usize as *const u32) };
     (id_reg >> 24) as u8
@@ -318,6 +331,7 @@ static mut AP_GDT: ApGdt = ApGdt {
 };
 
 /// Start one AP by APIC id.  Returns whether it reported online.
+#[cfg(target_arch = "x86_64")]
 fn start_ap(apic_id: u8) -> bool {
     // AP page tables: kernel-half mirror + the 0..1 GiB identity map.
     let ap_pml4 = match frame_alloc::frame_alloc_zeroed() {
@@ -401,6 +415,7 @@ fn start_ap(apic_id: u8) -> bool {
 /// The LAPIC MMIO window must be mapped (it is: the boot identity map
 /// covers 0x80000000..0xC0000000).
 #[inline]
+#[cfg(target_arch = "x86_64")]
 unsafe fn icr_write(dest_apic_id: u8, command: u32) {
     // LAPIC MMIO base 0xFEE00000: ICR low at +0x300, ICR2 (destination) at
     // +0x310.  Beware the hex digit count: 0xFEE00300 (32-bit) is correct;
@@ -422,6 +437,7 @@ unsafe fn icr_write(dest_apic_id: u8, command: u32) {
 }
 
 /// Bounded busy-wait between IPI phases.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn delay() {
     for _ in 0..200_000 {
@@ -431,19 +447,20 @@ fn delay() {
 
 /// AP entry point, called in long mode with the CPU id in the first
 /// argument register.  Never returns.
+#[cfg(target_arch = "x86_64")]
 pub extern "C" fn ap_main(cpu_id: u32) -> ! {
     unsafe {
         // Per-CPU id for current_cpu_id() (TSC_AUX based).
-        crate::plan9_arch::x86_64::write_tsc_aux(cpu_id);
+        crate::plan9_arch::hal::write_tsc_aux(cpu_id);
 
         // Load the kernel GDT and reload segment registers (the
         // trampoline's CS refers to the minimal AP GDT).
-        crate::plan9_arch::x86_64::gdt::gdt_init();
-        crate::plan9_arch::x86_64::gdt::reload_segments();
+        crate::plan9_arch::hal::gdt::gdt_init();
+        crate::plan9_arch::hal::gdt::reload_segments();
 
         // Shared IDT: every CPU handles the same vectors.  The arch crate
         // owns the IDT (the kernel's trap::init_idt is unreferenced).
-        unsafe { crate::plan9_arch::x86_64::idt::idt_init() };
+        unsafe { crate::plan9_arch::hal::idt::idt_init() };
     }
 
     crate::serial::put_bytes(b"[smp] cpu ");

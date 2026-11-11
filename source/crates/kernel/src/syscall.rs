@@ -586,7 +586,7 @@ fn sys_internalwait(frame: &SyscallFrame) -> Result<usize> {
     crate::proc::set_curproc(&mut *child);
 
     unsafe {
-        plan9_arch::x86_64::switch_to_user::kernel_resume_user(
+        plan9_arch::hal::switch_to_user::kernel_resume_user(
             frame_ptr,
             child_pml4,
         );
@@ -741,7 +741,7 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
     if pml4.as_u64() == 0 {
         return Err(Error::Eperm);
     }
-    let cr3 = crate::plan9_arch::x86_64::mmu::cr3_read();
+    let cr3 = crate::plan9_arch::hal::mmu::cr3_read();
     let _ = cr3;
 
     // Relocate absolute .got pointers into the user image.
@@ -1350,7 +1350,7 @@ fn sys_internalexits(frame: &SyscallFrame) -> Result<usize> {
                     if frame_ptr != 0 && pml4 != 0 {
                         // Resume the waiting parent as the current process.
                         crate::proc::set_curproc(p);
-                        plan9_arch::x86_64::switch_to_user::kernel_resume_user(
+                        plan9_arch::hal::switch_to_user::kernel_resume_user(
                             frame_ptr,
                             pml4,
                         );
@@ -3646,7 +3646,7 @@ fn load_segment(
     let end_page = page_align_up(end_vaddr as u64) as u64;
 
     // Determine page table flags based on segment flags
-    let mut pt_flags = crate::plan9_arch::x86_64::paging::PteFlags::new(0);
+    let mut pt_flags = crate::plan9_arch::hal::paging::PteFlags::new(0);
     pt_flags = pt_flags.with_user(); // User space pages
     pt_flags = pt_flags.with_present();
 

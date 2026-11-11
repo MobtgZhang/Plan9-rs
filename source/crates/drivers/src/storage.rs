@@ -250,12 +250,12 @@ impl AtaChannel {
 
     /// Read ATA status register
     pub fn status(&self) -> u8 {
-        plan9_arch::x86_64::inb(self.base + 7)
+        plan9_arch::hal::inb(self.base + 7)
     }
 
     /// Read ATA status with alternate register
     pub fn alt_status(&self) -> u8 {
-        plan9_arch::x86_64::inb(self.ctrl)
+        plan9_arch::hal::inb(self.ctrl)
     }
 
     /// Wait for ATA device to be ready
@@ -285,8 +285,8 @@ impl AtaChannel {
     /// Select device (master/slave)
     pub fn select(&mut self, slave: bool) {
         let devsel: u8 = if slave { 0xB0 } else { 0xA0 };
-        plan9_arch::x86_64::outb(ata_reg::ATA_HDDEVSEL, devsel);
-        plan9_arch::x86_64::wait();
+        plan9_arch::hal::outb(ata_reg::ATA_HDDEVSEL, devsel);
+        plan9_arch::hal::wait();
     }
 
     /// Identify device
@@ -294,11 +294,11 @@ impl AtaChannel {
         self.select(slave);
 
         // Send IDENTIFY command
-        plan9_arch::x86_64::outb(ata_reg::ATA_SECCOUNT0, 0);
-        plan9_arch::x86_64::outb(ata_reg::ATA_LBA0, 0);
-        plan9_arch::x86_64::outb(ata_reg::ATA_LBA1, 0);
-        plan9_arch::x86_64::outb(ata_reg::ATA_LBA2, 0);
-        plan9_arch::x86_64::outb(ata_reg::ATA_COMMAND, ata_reg::ATA_CMD_IDENTIFY);
+        plan9_arch::hal::outb(ata_reg::ATA_SECCOUNT0, 0);
+        plan9_arch::hal::outb(ata_reg::ATA_LBA0, 0);
+        plan9_arch::hal::outb(ata_reg::ATA_LBA1, 0);
+        plan9_arch::hal::outb(ata_reg::ATA_LBA2, 0);
+        plan9_arch::hal::outb(ata_reg::ATA_COMMAND, ata_reg::ATA_CMD_IDENTIFY);
 
         // Check if device exists
         let status = self.status();
@@ -357,7 +357,7 @@ impl AtaChannel {
         let ptr = buf.as_mut_ptr();
         for i in 0..count {
             unsafe {
-                core::ptr::write(ptr.add(i), plan9_arch::x86_64::inw(self.base));
+                core::ptr::write(ptr.add(i), plan9_arch::hal::inw(self.base));
             }
         }
         buf
@@ -384,16 +384,16 @@ impl AtaChannel {
         self.select(slave);
 
         // Set LBA mode
-        plan9_arch::x86_64::outb(ata_reg::ATA_SECCOUNT0, count);
-        plan9_arch::x86_64::outb(ata_reg::ATA_LBA0, lba as u8);
-        plan9_arch::x86_64::outb(ata_reg::ATA_LBA1, (lba >> 8) as u8);
-        plan9_arch::x86_64::outb(ata_reg::ATA_LBA2, (lba >> 16) as u8);
+        plan9_arch::hal::outb(ata_reg::ATA_SECCOUNT0, count);
+        plan9_arch::hal::outb(ata_reg::ATA_LBA0, lba as u8);
+        plan9_arch::hal::outb(ata_reg::ATA_LBA1, (lba >> 8) as u8);
+        plan9_arch::hal::outb(ata_reg::ATA_LBA2, (lba >> 16) as u8);
         // Set LBA48 bit and device select
         let device_reg = 0x40 | if slave { 0x10 } else { 0x00 } | ((lba >> 24) & 0x0F) as u8;
-        plan9_arch::x86_64::outb(ata_reg::ATA_HDDEVSEL, device_reg);
+        plan9_arch::hal::outb(ata_reg::ATA_HDDEVSEL, device_reg);
 
         // Send read command
-        plan9_arch::x86_64::outb(ata_reg::ATA_COMMAND, ata_reg::ATA_CMD_READ_EXT);
+        plan9_arch::hal::outb(ata_reg::ATA_COMMAND, ata_reg::ATA_CMD_READ_EXT);
 
         // Read data
         let mut total = 0;
@@ -403,7 +403,7 @@ impl AtaChannel {
 
             // Read 256 words (512 bytes)
             for _i in 0..256 {
-                let word = plan9_arch::x86_64::inw(self.base);
+                let word = plan9_arch::hal::inw(self.base);
                 if total + 2 <= buffer.len() {
                     buffer[total] = (word & 0xFF) as u8;
                     buffer[total + 1] = ((word >> 8) & 0xFF) as u8;
@@ -436,15 +436,15 @@ impl AtaChannel {
         self.select(slave);
 
         // Set LBA mode
-        plan9_arch::x86_64::outb(ata_reg::ATA_SECCOUNT0, count);
-        plan9_arch::x86_64::outb(ata_reg::ATA_LBA0, lba as u8);
-        plan9_arch::x86_64::outb(ata_reg::ATA_LBA1, (lba >> 8) as u8);
-        plan9_arch::x86_64::outb(ata_reg::ATA_LBA2, (lba >> 16) as u8);
+        plan9_arch::hal::outb(ata_reg::ATA_SECCOUNT0, count);
+        plan9_arch::hal::outb(ata_reg::ATA_LBA0, lba as u8);
+        plan9_arch::hal::outb(ata_reg::ATA_LBA1, (lba >> 8) as u8);
+        plan9_arch::hal::outb(ata_reg::ATA_LBA2, (lba >> 16) as u8);
         let device_reg = 0x40 | if slave { 0x10 } else { 0x00 } | ((lba >> 24) & 0x0F) as u8;
-        plan9_arch::x86_64::outb(ata_reg::ATA_HDDEVSEL, device_reg);
+        plan9_arch::hal::outb(ata_reg::ATA_HDDEVSEL, device_reg);
 
         // Send write command
-        plan9_arch::x86_64::outb(ata_reg::ATA_COMMAND, ata_reg::ATA_CMD_WRITE_EXT);
+        plan9_arch::hal::outb(ata_reg::ATA_COMMAND, ata_reg::ATA_CMD_WRITE_EXT);
 
         // Write data
         let mut total = 0;
@@ -455,13 +455,13 @@ impl AtaChannel {
             // Write 256 words (512 bytes)
             for _i in 0..256 {
                 let word = (buffer[total + 1] as u16) << 8 | buffer[total] as u16;
-                plan9_arch::x86_64::outw(self.base, word);
+                plan9_arch::hal::outw(self.base, word);
                 total += 2;
             }
         }
 
         // Send flush command
-        plan9_arch::x86_64::outb(ata_reg::ATA_COMMAND, ata_reg::ATA_CMD_FLUSH_EXT);
+        plan9_arch::hal::outb(ata_reg::ATA_COMMAND, ata_reg::ATA_CMD_FLUSH_EXT);
         self.poll_not_busy(5000)?;
 
         Ok(total)
@@ -631,7 +631,7 @@ impl BlockDevice for AtaDevice {
         channel.ensure_selected(self.slave);
         
         // Send flush command
-        plan9_arch::x86_64::outb(ata_reg::ATA_COMMAND, ata_reg::ATA_CMD_FLUSH);
+        plan9_arch::hal::outb(ata_reg::ATA_COMMAND, ata_reg::ATA_CMD_FLUSH);
         channel.poll_not_busy(5000)?;
         
         Ok(())

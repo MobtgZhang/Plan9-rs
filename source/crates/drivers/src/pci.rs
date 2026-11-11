@@ -24,9 +24,12 @@ pub const PCI_CONFIG_DATA: u16 = 0xCFC;
 pub struct PciConfigAddr(u32);
 
 impl PciConfigAddr {
-    /// Create address for bus, device, function, and register
+    /// Create address for bus, device, function, and register.
+    ///
+    /// `reg` is a byte offset into config space (0..255). The address
+    /// register only carries bits [7:0]; byte selection (`reg & 3`) is done
+    /// by the caller when extracting a word/byte from the 32-bit data.
     pub fn new(bus: u8, dev: u8, func: u8, reg: u8) -> Self {
-        debug_assert!(reg % 4 == 0 && reg < 64);
         Self(
             (1 << 31) |           // Enable bit
             ((bus as u32) << 16) |
@@ -115,16 +118,16 @@ pub struct PciBarIo {
 /// Read PCI configuration dword
 pub fn pci_config_read(addr: PciConfigAddr) -> u32 {
     // Write address to config address port
-    crate::plan9_arch::x86_64::outl(PCI_CONFIG_ADDR, addr.0);
+    crate::plan9_arch::hal::outl(PCI_CONFIG_ADDR, addr.0);
 
     // Read data from config data port
-    crate::plan9_arch::x86_64::inl(PCI_CONFIG_DATA)
+    crate::plan9_arch::hal::inl(PCI_CONFIG_DATA)
 }
 
 /// Write PCI configuration dword
 pub fn pci_config_write(addr: PciConfigAddr, val: u32) {
-    crate::plan9_arch::x86_64::outl(PCI_CONFIG_ADDR, addr.0);
-    crate::plan9_arch::x86_64::outl(PCI_CONFIG_DATA, val);
+    crate::plan9_arch::hal::outl(PCI_CONFIG_ADDR, addr.0);
+    crate::plan9_arch::hal::outl(PCI_CONFIG_DATA, val);
 }
 
 /// Read PCI vendor/device ID
@@ -281,10 +284,7 @@ impl PciDeviceIter {
     /// ISA bridge on device 31, function 0, while SATA is function 2), so we
     /// iterate all eight functions explicitly.
     fn next_internal(&mut self) -> Option<PciDevice> {
-        if self.done {
-            return None;
-        }
-        loop {
+        while !self.done {
             let vendor = pci_vendor_id(self.current_bus, self.current_dev, self.current_func);
 
             if vendor != 0xFFFFFFFF && vendor != 0 {
@@ -310,6 +310,7 @@ impl PciDeviceIter {
 
             self.advance();
         }
+        None
     }
 
     fn advance(&mut self) {

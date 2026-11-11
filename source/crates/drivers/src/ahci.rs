@@ -13,11 +13,11 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::storage::{StorageBackend, SdError, SdResult};
 use plan9_common::types::PhysAddr;
-use plan9_arch::x86_64::paging::phys_to_virt;
+use plan9_arch::hal::paging::phys_to_virt;
 
 // Temporary diagnostic byte to the serial port.
 fn dbg(c: u8) {
-    plan9_arch::x86_64::outb(0x3F8, c);
+    plan9_arch::hal::outb(0x3F8, c);
 }
 
 // ============================================================================

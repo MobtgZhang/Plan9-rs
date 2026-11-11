@@ -15,7 +15,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use crate::plan9_arch::x86_64::paging::PAGESIZE;
+use crate::plan9_arch::hal::paging::PAGESIZE;
 use plan9_common::types::{PhysAddr, VirtAddr};
 use plan9_common::sync::Spinlock;
 
@@ -229,5 +229,5 @@ pub fn frame_alloc_zeroed() -> Option<PhysAddr> {
 /// Convert a physical address to a kernel-virtual address via the higher-half
 /// direct mapping.
 pub fn phys_to_virt(paddr: PhysAddr) -> VirtAddr {
-    crate::plan9_arch::x86_64::paging::phys_to_virt(paddr)
+    crate::plan9_arch::hal::paging::phys_to_virt(paddr)
 }

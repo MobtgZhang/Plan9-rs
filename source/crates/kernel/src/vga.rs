@@ -66,29 +66,13 @@ pub mod vga_registers {
 /// Read a byte from an I/O port
 #[inline(always)]
 fn inb(port: u16) -> u8 {
-    let value: u8;
-    unsafe {
-        core::arch::asm!(
-            "in al, dx",
-            out("al") value,
-            in("dx") port,
-            options(nostack, preserves_flags)
-        );
-    }
-    value
+    crate::plan9_arch::hal::io::inb(port)
 }
 
 /// Write a byte to an I/O port
 #[inline(always)]
 fn outb(port: u16, value: u8) {
-    unsafe {
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") port,
-            in("al") value,
-            options(nostack, preserves_flags)
-        );
-    }
+    crate::plan9_arch::hal::io::outb(port, value)
 }
 
 /// Read a byte from CRT controller register
@@ -668,7 +652,7 @@ impl DisplayHw for ArmVgaHw {
         // Write to the MMIO framebuffer using a volatile pointer.
         // For a real PL111 driver the framebuffer starts at
         // AARCH64_VGA_FRAMEBUFFER with 2 bytes per character cell.
-        let ptr = (AARCH64_VGA_FRAMEBUFFER as *mut u64).add(idx);
+        let ptr = (AARCH64_VGA_FRAMEBUFFER as *mut u16).add(idx);
         core::ptr::write_volatile(ptr, cell);
     }
 }
@@ -696,7 +680,7 @@ impl DisplayHw for RiscvVgaHw {
     unsafe fn put_cell(idx: usize, cell: u16) {
         // Write to the UART TX register (THR, offset 0) for each cell.
         // In a full driver this would render into a framebuffer first.
-        let ptr = (RISCV_UART_BASE as *mut u64).add(idx);
+        let ptr = (RISCV_UART_BASE as *mut u16).add(idx);
         core::ptr::write_volatile(ptr, cell);
     }
 }
@@ -721,7 +705,7 @@ impl DisplayHw for LoongArchVgaHw {
     }
 
     unsafe fn put_cell(idx: usize, cell: u16) {
-        let ptr = (LOONGARCH_FRAMEBUFFER_BASE as *mut u64).add(idx);
+        let ptr = (LOONGARCH_FRAMEBUFFER_BASE as *mut u16).add(idx);
         core::ptr::write_volatile(ptr, cell);
     }
 }
@@ -799,13 +783,13 @@ unsafe fn vga_hw_init_impl() {
     X86VgaHw::hw_init();
 
     #[cfg(target_arch = "aarch64")]
-    ArmVgaHw.hw_init();
+    ArmVgaHw::hw_init();
 
     #[cfg(target_arch = "riscv64")]
-    RiscvVgaHw.hw_init();
+    RiscvVgaHw::hw_init();
 
     #[cfg(target_arch = "loongarch64")]
-    LoongArchVgaHw.hw_init();
+    LoongArchVgaHw::hw_init();
 
     #[cfg(not(any(
         all(target_arch = "x86_64", not(test)),
@@ -814,7 +798,7 @@ unsafe fn vga_hw_init_impl() {
         target_arch = "riscv64",
         target_arch = "loongarch64",
     )))]
-    StubHw.hw_init();
+    StubHw::hw_init();
 }
 
 /// Access the global VGA state, if it has been initialized.
@@ -1026,11 +1010,6 @@ pub fn vga_set_cursor(visible: bool, start_scanline: u8, end_scanline: u8) {
             );
         }
     }
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
-pub fn vga_set_cursor(_visible: bool, _start_scanline: u8, _end_scanline: u8) {
-    // Not supported on non-x86 architectures
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]

@@ -516,7 +516,7 @@ pub fn tlb_flush_range(_start: u64, _count: u64) {
     #[cfg(target_arch = "x86_64")]
     {
         // Use the architecture module
-        crate::plan9_arch::x86_64::mmu::flush_tlb();
+        crate::plan9_arch::hal::mmu::flush_tlb();
     }
 }
 

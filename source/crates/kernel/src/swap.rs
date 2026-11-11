@@ -1156,7 +1156,7 @@ fn swap_device_lock() -> &'static Spinlock<SwapDevice> {
 /// * `Ok(())` if successful
 /// * `Err(())` if I/O error
 pub fn read_page_from_swap(phys_addr: u64, swap_offset: usize) -> Result<(), ()> {
-    use crate::plan9_arch::x86_64::paging::phys_to_virt;
+    use crate::plan9_arch::hal::paging::phys_to_virt;
     use crate::plan9_common::types::PhysAddr;
 
     let virt = phys_to_virt(PhysAddr::new(phys_addr));
@@ -1173,7 +1173,7 @@ pub fn read_page_from_swap(phys_addr: u64, swap_offset: usize) -> Result<(), ()>
 /// * `Ok(())` if successful
 /// * `Err(())` if I/O error
 pub fn write_page_to_swap(phys_addr: u64, swap_offset: usize) -> Result<(), ()> {
-    use crate::plan9_arch::x86_64::paging::phys_to_virt;
+    use crate::plan9_arch::hal::paging::phys_to_virt;
     use crate::plan9_common::types::PhysAddr;
 
     let virt = phys_to_virt(PhysAddr::new(phys_addr));

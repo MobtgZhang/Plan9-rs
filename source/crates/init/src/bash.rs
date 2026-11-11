@@ -784,7 +784,7 @@ fn apply_redirs(line: &[u8], st: &Stage) {
         let mode = if st.append { O_RDONLY } else { OWRITE };
         let fd = if st.append {
             // Append: open (or create) then seek to end.
-            let fd = create3(f.as_ptr(), O_RDONLY, 0o644);
+            let mut fd = create3(f.as_ptr(), O_RDONLY, 0o644);
             if fd < 0 {
                 fd = open(f.as_ptr(), O_RDONLY);
             }

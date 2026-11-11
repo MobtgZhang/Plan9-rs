@@ -371,6 +371,11 @@ impl SerialDev {
     pub fn read_byte(&self) -> Option<u8> {
         None
     }
+
+    /// Current line-status register (stub for non-x86_64).
+    pub fn lsr(&self) -> u8 {
+        0
+    }
     
     /// Write a byte to the serial port (stub for non-x86_64)
     pub fn write_byte(&self, _byte: u8) {

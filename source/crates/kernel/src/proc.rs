@@ -2175,10 +2175,10 @@ impl Proc {
     /// # Safety
     /// Should only be called during process creation
     pub fn setup_page_table(&mut self) -> bool {
-        use crate::plan9_arch::x86_64::mmu::cr3_read;
+        use crate::plan9_arch::hal::mmu::cr3_read;
 //         use crate::plan9_common::types::PhysAddr;
         use crate::vm::frame_allocator;
-        use crate::plan9_arch::x86_64::paging::PHYS_MEMORY_VIRT;
+        use crate::plan9_arch::hal::paging::PHYS_MEMORY_VIRT;
 
         // Allocate a new PML4 page
         let pml4_frame = match frame_allocator().alloc_frame() {
@@ -3051,10 +3051,10 @@ pub fn cow_page_fault(va: u64, seg: &mut ProcSegment, writable: bool) -> bool {
         return false; // Not our page
     }
 
-    let flags = PteFlags::from_pte(pte);
+    let arch_flags = crate::plan9_arch::hal::paging::PteFlags::new(pte);
 
     // Check if it's a COW page and we need to write
-    if flags.cow && writable && flags.present {
+    if arch_flags.is_cow() && writable && arch_flags.is_present() {
         // Get the physical address of the current page
         let _phys_addr = PhysAddr::new(pte & 0x000_FFFF_FFFF_F000);
 
@@ -3065,13 +3065,14 @@ pub fn cow_page_fault(va: u64, seg: &mut ProcSegment, writable: bool) -> bool {
             // For now, we'll set up the new PTE
 
             // Create new PTE with writable flag (remove COW flag)
-            let new_pte = new_phys.as_u64() | 0x01 | 0x02 | 0x04; // Present, Writable, User
+            let new_pte = new_phys.as_u64()
+                | crate::plan9_arch::hal::paging::PteFlags::USER_RW.bits();
 
             // Update the segment's page table
             seg.set_pte(page_idx, new_pte);
 
             // Invalidate TLB for this page
-            crate::plan9_arch::x86_64::mmu::invlpg(VirtAddr::new(va));
+            crate::plan9_arch::hal::mmu::invlpg(VirtAddr::new(va));
 
             return true;
         }

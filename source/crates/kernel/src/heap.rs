@@ -23,7 +23,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::plan9_arch::x86_64::paging::PAGESIZE;
+use crate::plan9_arch::hal::paging::PAGESIZE;
 use plan9_common::types::VirtAddr;
 
 /// Head of the free list (absolute virtual address, 0 = empty).
@@ -99,8 +99,17 @@ pub unsafe fn heap_init(start: VirtAddr, end: VirtAddr) {
 /// the frame allocator itself is being initialised.
 pub const STATIC_HEAP_SIZE: usize = 0x10000;
 
+/// Page-aligned wrapper so the bootstrap slab starts on a 4 KiB boundary.
+/// `repr(align)` cannot be applied to a static directly.
+#[repr(C, align(4096))]
+pub struct StaticHeap {
+    pub bytes: [u8; STATIC_HEAP_SIZE],
+}
+
 #[no_mangle]
-pub static mut STATIC_HEAP: [u8; STATIC_HEAP_SIZE] = [0; STATIC_HEAP_SIZE];
+pub static mut STATIC_HEAP: StaticHeap = StaticHeap {
+    bytes: [0; STATIC_HEAP_SIZE],
+};
 
 /// Virtual/physical region reserved for the main boot heap. It lies above
 /// the kernel image, inside the identity-mapped boot window, and is marked
@@ -162,7 +171,7 @@ unsafe impl GlobalAlloc for KernelHeap {
             let hdr = payload - HDR;
             let front = hdr - cur; // 0 or >= HDR (see note below)
             let alloc_span = HDR + size;
-            let rem_tail = (cur + bsize) - (hdr + alloc_span);
+            let alloc_end = hdr + alloc_span;
 
             // `front` is a multiple of HDR: `cur` is HDR-aligned, and for
             // `align` a power of two >= 8, align_up(cur + HDR, align) - HDR
@@ -172,11 +181,13 @@ unsafe impl GlobalAlloc for KernelHeap {
             let fits = if front == 0 {
                 alloc_span <= bsize
             } else if front >= HDR {
-                hdr + alloc_span <= cur + bsize
+                alloc_end <= cur + bsize
             } else {
                 false // impossible per the alignment invariant, be safe
             };
             if fits {
+                // Safe now: the allocation lies within this free block.
+                let rem_tail = (cur + bsize) - alloc_end;
                 let alloc_size;
                 let list_next; // what replaces `cur` in the free list
 

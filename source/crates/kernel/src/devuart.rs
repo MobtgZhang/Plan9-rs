@@ -513,9 +513,9 @@ fn parse_eia_name(name: &str) -> Option<usize> {
 
 /// I/O port operations (architecture-specific)
 fn inb(port: u16) -> u8 {
-    plan9_arch::x86_64::inb(port)
+    plan9_arch::hal::inb(port)
 }
 
 fn outb(port: u16, value: u8) {
-    plan9_arch::x86_64::outb(port, value);
+    plan9_arch::hal::outb(port, value);
 }

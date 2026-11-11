@@ -15,29 +15,20 @@ const COM1: u16 = 0x3F8;
 /// `true` once `init()` has configured the port.
 static READY: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn outb(port: u16, val: u8) {
-    core::arch::asm!(
-        "out dx, al",
-        in("dx") port,
-        in("al") val,
-        options(nostack, preserves_flags),
-    );
+    crate::plan9_arch::hal::io::outb(port, val)
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn inb(port: u16) -> u8 {
-    let val: u8;
-    core::arch::asm!(
-        "in al, dx",
-        in("dx") port,
-        out("al") val,
-        options(nostack, preserves_flags),
-    );
-    val
+    crate::plan9_arch::hal::io::inb(port)
 }
 
 /// Wait until the transmit buffer is empty by polling LSR bit 5.
+#[cfg(target_arch = "x86_64")]
 unsafe fn wait_tx_ready() {
     for _ in 0..0x10000 {
         if inb(COM1 + 5) & 0x20 != 0 { return; }
@@ -45,16 +36,12 @@ unsafe fn wait_tx_ready() {
 }
 
 /// Initialise COM1 at 115200 8N1, no flow control.
+#[cfg(target_arch = "x86_64")]
 pub fn init() {
     unsafe {
         // Simple outb directly to test serial is working
         // This writes 'A' to COM1 data port
-        core::arch::asm!(
-            "mov dx, 0x3F8",
-            "mov al, 0x41",
-            "out dx, al",
-            options(nostack, preserves_flags),
-        );
+        crate::plan9_arch::hal::io::outb(0x3F8, b'A');
     }
     unsafe {
         // Disable all interrupts.
@@ -74,7 +61,21 @@ pub fn init() {
     READY.store(true, Ordering::SeqCst);
 }
 
+/// Non-x86_64: route through the architecture console (PL011, 16550 MMIO…).
+#[cfg(not(target_arch = "x86_64"))]
+pub fn init() {
+    crate::plan9_arch::hal::console::init();
+    READY.store(true, Ordering::SeqCst);
+}
+
+/// Non-x86_64 console byte output.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn putc(c: u8) {
+    crate::plan9_arch::hal::console::putc(c);
+}
+
 /// Write a single byte to COM1.
+#[cfg(target_arch = "x86_64")]
 pub fn putc(c: u8) {
     unsafe {
         wait_tx_ready();
@@ -160,6 +161,7 @@ unsafe fn idt_output(buf: &[u8]) {
 
 /// Install the IDT serial-output sink. Call this after `init()` and after
 /// the IDT is loaded.
+#[cfg(target_arch = "x86_64")]
 pub fn register_idt_output() {
-    crate::plan9_arch::x86_64::idt::set_serial_output(idt_output);
+    crate::plan9_arch::hal::idt::set_serial_output(idt_output);
 }

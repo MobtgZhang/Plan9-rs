@@ -131,6 +131,14 @@ impl Builder {
         }
     }
 
+
+    /// User-space init, bash and ssh are x86_64 programs that use the
+    /// `int 0x80` syscall gate.  Other architectures currently only bring
+    /// up the kernel.
+    fn is_x86_64(&self) -> bool {
+        self.arch == "x86_64"
+    }
+
     fn grub_platform(&self) -> &str {
         match self.arch.as_str() {
             "x86_64" => "x86_64-efi",
@@ -311,6 +319,10 @@ impl Builder {
     }
 
     fn build_init(&self) -> Result<()> {
+        if !self.is_x86_64() {
+            println!("[BUILD] Skipping plan9-init (x86_64-only user space)");
+            return Ok(());
+        }
         println!("[BUILD] Compiling plan9-init...");
         self.ensure_dirs()?;
         
@@ -351,8 +363,11 @@ impl Builder {
         println!("[BUILD] Compiling plan9-kernel...");
         self.ensure_dirs()?;
         
-        // Kernel build depends on init, so build it first
-        self.build_init()?;
+        // The x86_64 boot image carries init; other architectures only
+        // build the kernel at this stage.
+        if self.is_x86_64() {
+            self.build_init()?;
+        }
         
         // Build kernel with the bare-metal target and release profile.
         let mut cmd = std::process::Command::new("cargo");
@@ -431,6 +446,12 @@ impl Builder {
     }
 
     fn build_esp(&self) -> Result<()> {
+        if !self.is_x86_64() {
+            anyhow::bail!(
+                "ESP/GRUB boot images are only supported on x86_64; use `--kernel` for {}",
+                self.arch
+            );
+        }
         println!("[BUILD] Building EFI System Partition...");
         self.ensure_dirs()?;
 
@@ -527,11 +548,13 @@ impl Builder {
         // Always rebuild the kernel and user programs so a source change is
         // reflected in the boot image and the root archive.
         self.build_kernel()?;
-        self.build_init()?;
 
-        // Install kernel and init to boot
+        // Install kernel to boot; init is only present for x86_64.
         std::fs::copy(&self.kernel_elf(), &self.kernel_boot_elf())?;
-        std::fs::copy(&self.init_elf_source(), &self.init_boot_elf())?;
+        if self.is_x86_64() {
+            self.build_init()?;
+            std::fs::copy(&self.init_elf_source(), &self.init_boot_elf())?;
+        }
 
         // Install the built-in Sarasa-Gothic terminal font.
         let font_src = self.project_root.join("source").join("fonts")
@@ -542,12 +565,14 @@ impl Builder {
                 .join("SarasaTermSC-Regular.ttf"))?;
         }
 
-        // Install the Bash and SSH ports into /bin.
-        std::fs::create_dir_all(self.rootfs_dir().join("bin"))?;
-        std::fs::copy(&self.bash_elf_source(), self.rootfs_dir().join("bin").join("bash"))?;
-        std::fs::copy(&self.ssh_elf_source(), self.rootfs_dir().join("bin").join("ssh"))?;
-        std::fs::create_dir_all(self.rootfs_dir().join("rc").join("bin"))?;
-        std::fs::copy(&self.bash_elf_source(), self.rootfs_dir().join("rc").join("bin").join("rc"))?;
+        // Install the Bash and SSH ports into /bin (x86_64-only).
+        if self.is_x86_64() {
+            std::fs::create_dir_all(self.rootfs_dir().join("bin"))?;
+            std::fs::copy(&self.bash_elf_source(), self.rootfs_dir().join("bin").join("bash"))?;
+            std::fs::copy(&self.ssh_elf_source(), self.rootfs_dir().join("bin").join("ssh"))?;
+            std::fs::create_dir_all(self.rootfs_dir().join("rc").join("bin"))?;
+            std::fs::copy(&self.bash_elf_source(), self.rootfs_dir().join("rc").join("bin").join("rc"))?;
+        }
         
         // Make them executable
         #[cfg(unix)]
@@ -557,18 +582,22 @@ impl Builder {
             perms.set_mode(0o755);
             std::fs::set_permissions(&self.kernel_boot_elf(), perms)?;
             
-            let mut perms = std::fs::metadata(&self.init_boot_elf())?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&self.init_boot_elf(), perms)?;
-
-            for p in [
-                self.rootfs_dir().join("bin").join("bash"),
-                self.rootfs_dir().join("bin").join("ssh"),
-                self.rootfs_dir().join("rc").join("bin").join("rc"),
-            ] {
-                let mut perms = std::fs::metadata(&p)?.permissions();
+            if self.is_x86_64() {
+                let mut perms = std::fs::metadata(&self.init_boot_elf())?.permissions();
                 perms.set_mode(0o755);
-                std::fs::set_permissions(&p, perms)?;
+                std::fs::set_permissions(&self.init_boot_elf(), perms)?;
+            }
+
+            if self.is_x86_64() {
+                for p in [
+                    self.rootfs_dir().join("bin").join("bash"),
+                    self.rootfs_dir().join("bin").join("ssh"),
+                    self.rootfs_dir().join("rc").join("bin").join("rc"),
+                ] {
+                    let mut perms = std::fs::metadata(&p)?.permissions();
+                    perms.set_mode(0o755);
+                    std::fs::set_permissions(&p, perms)?;
+                }
             }
         }
 
@@ -607,15 +636,17 @@ impl Builder {
     }
 
     fn build_iso(&self) -> Result<()> {
+        if !self.is_x86_64() {
+            anyhow::bail!(
+                "ISO creation is only supported on x86_64; boot {} directly with QEMU -kernel",
+                self.arch
+            );
+        }
         println!("[BUILD] Building ISO image...");
         
-        // Ensure ESP and rootfs are built
-        if !self.grub_efi().exists() {
-            self.build_esp()?;
-        }
-        if !self.rootfs_dir().join("boot").join("9kernel.elf").exists() {
-            self.build_rootfs()?;
-        }
+        // Always rebuild the ESP/rootfs so a freshly built kernel and init
+        // are reflected in the ISO.
+        self.build_esp()?;
         
         // Generate ISO-specific grub.cfg
         self.generate_grub_cfg(&self.grub_cfg_iso(), true)?;
@@ -644,7 +675,7 @@ impl Builder {
         )?;
         std::fs::copy(
             &self.grub_efi(),
-            tmp_dir.path().join("EFI").join("BOOT").join("BOOTX64.EFI"),
+            tmp_dir.path().join("EFI").join("BOOT").join(self.boot_efi_name()),
         )?;
 
         // Build ISO with grub-mkrescue

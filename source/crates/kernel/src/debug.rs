@@ -34,10 +34,10 @@ pub fn dump_gp_regs(frame: &ExceptionFrame) {
 
 /// Dump segment registers and control registers
 pub fn dump_control_regs() {
-    let cr0 = crate::plan9_arch::x86_64::cr0_read();
-    let cr2 = crate::plan9_arch::x86_64::cr2_read();
-    let cr3 = crate::plan9_arch::x86_64::cr3_read();
-    let cr4 = crate::plan9_arch::x86_64::cr4_read();
+    let cr0 = crate::plan9_arch::hal::cr0_read();
+    let cr2 = crate::plan9_arch::hal::cr2_read();
+    let cr3 = crate::plan9_arch::hal::cr3_read();
+    let cr4 = crate::plan9_arch::hal::cr4_read();
 
     debug_puts("Control Registers:\n");
     debug_printf!("  CR0: {:016x}\n", cr0);
@@ -292,7 +292,7 @@ pub fn dump_proc_stack(proc: &Proc) {
 /// Kernel panic handler
 pub fn kernel_panic(msg: &[u8]) {
     // Disable interrupts
-    crate::plan9_arch::x86_64::cli();
+    crate::plan9_arch::hal::cli();
 
     debug_puts("\n!!! KERNEL PANIC !!!\n");
     debug_puts("Message: ");
@@ -417,7 +417,7 @@ macro_rules! debug {
 /// Halt the system
 pub fn halt() -> ! {
     loop {
-        crate::plan9_arch::x86_64::hlt();
+        crate::plan9_arch::hal::hlt();
     }
 }
 

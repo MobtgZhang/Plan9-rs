@@ -84,6 +84,13 @@ impl PteFlags {
     pub const GLOBAL: Self = Self(1 << 8);
     pub const NX: Self = Self(1 << 63);         // No-execute
 
+    /// Software copy-on-write marker (x86 PTE bit 9 is OS-available).
+    pub const COW: Self = Self(1 << 9);
+
+    /// Pseudo-flag for API parity: on x86 a page is read-only exactly when
+    /// WRITABLE is clear, so READONLY has no hardware bit.
+    pub const READONLY: Self = Self(0);
+
     /// Alias for `Self::PS`, preserved for backwards compatibility with code
     /// that referred to the bit as PAT. Prefer `Self::PS` for new code; the
     /// two constants are intentionally identical because the underlying
@@ -91,7 +98,8 @@ impl PteFlags {
     pub const PAT: Self = Self::PS;
 
     pub const fn new(bits: u64) -> Self { Self(bits) }
-    pub fn bits(self) -> u64 { self.0 }
+    pub const fn bits(self) -> u64 { self.0 }
+    pub fn from_pte(pte: u64) -> Self { Self(pte) }
 
     pub fn with_present(self) -> Self { Self(self.0 | Self::PRESENT.0) }
     pub fn with_writable(self) -> Self { Self(self.0 | Self::WRITABLE.0) }
@@ -107,6 +115,7 @@ impl PteFlags {
     pub fn is_no_exec(self) -> bool { (self.0 & Self::NX.0) != 0 }
     pub fn is_accessed(self) -> bool { (self.0 & Self::ACCESSED.0) != 0 }
     pub fn is_dirty(self) -> bool { (self.0 & Self::DIRTY.0) != 0 }
+    pub fn is_cow(self) -> bool { (self.0 & Self::COW.0) != 0 }
 
     /// Check if the PS bit is set.
     ///

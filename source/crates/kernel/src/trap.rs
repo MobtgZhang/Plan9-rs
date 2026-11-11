@@ -129,6 +129,7 @@ pub mod irq {
 }
 
 /// Total number of vectors (exceptions + interrupts)
+#[cfg(target_arch = "x86_64")]
 pub const NUM_VECTORS: usize = 256;
 
 // ============================================================================
@@ -138,6 +139,7 @@ pub const NUM_VECTORS: usize = 256;
 /// IDT entry structure (8 bytes)
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
+#[cfg(target_arch = "x86_64")]
 struct IdtEntry {
     /// Offset low 16 bits
     offset_low: u16,
@@ -155,6 +157,7 @@ struct IdtEntry {
     reserved: u32,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl IdtEntry {
     /// Create a new IDT entry
     const fn new(offset: u64, selector: u16, ist: u8, attr: u8) -> Self {
@@ -186,6 +189,7 @@ pub mod attr {
 
 /// IDT register (loaded with lidt)
 #[repr(C, packed)]
+#[cfg(target_arch = "x86_64")]
 struct IdtReg {
     /// IDT limit
     limit: u16,
@@ -198,6 +202,7 @@ struct IdtReg {
 // ============================================================================
 
 /// Global IDT storage
+#[cfg(target_arch = "x86_64")]
 static mut IDT: [IdtEntry; NUM_VECTORS] = [IdtEntry::new(0, 0, 0, 0); NUM_VECTORS];
 
 // ============================================================================
@@ -213,11 +218,11 @@ fn panic_handler(frame: &ExceptionFrame) {
     let _exc = frame.error_code;
     
     // Disable interrupts
-    crate::plan9_arch::x86_64::cli();
+    crate::plan9_arch::hal::cli();
     
     // Halt
     loop {
-        crate::plan9_arch::x86_64::hlt();
+        crate::plan9_arch::hal::hlt();
     }
 }
 
@@ -349,16 +354,7 @@ fn keyboard_interrupt() {
     crate::serial::put_bytes(b"[kbd] irq\n");
 
     // Read scancode from PS/2 keyboard data port.
-    let scan: u8 = unsafe {
-        let val: u8;
-        core::arch::asm!(
-            "in al, dx",
-            out("al") val,
-            in("dx") 0x60u16,
-            options(nostack, preserves_flags),
-        );
-        val
-    };
+    let scan: u8 = crate::plan9_arch::hal::io::inb(0x60);
 
     crate::serial::put_bytes(b"[kbd] scan=");
     crate::serial::put_hex_u32(scan as u32);
@@ -413,14 +409,7 @@ fn keyboard_interrupt() {
 
 /// Send End-Of-Interrupt to the master PIC for the given IRQ line.
 fn pic_eoi(_irq: u8) {
-    unsafe {
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") 0x20u16,
-            in("al") 0x20u8,
-            options(nostack, preserves_flags),
-        );
-    }
+    crate::plan9_arch::hal::io::outb(0x20, 0x20);
 }
 
 /// Spurious interrupt handler
@@ -524,7 +513,7 @@ fn syscall_handler(
                         .map(|fr| fr as *const SavedUserFrame as u64)
                         .unwrap_or(0);
                     let pml4 = p.mmupdb.as_u64();
-                    plan9_arch::x86_64::switch_to_user::kernel_resume_user(
+                    plan9_arch::hal::switch_to_user::kernel_resume_user(
                         frame_ptr,
                         pml4,
                     );
@@ -555,6 +544,7 @@ pub fn should_use_exec_context() -> bool {
 // ============================================================================
 
 /// Initialize the IDT
+#[cfg(target_arch = "x86_64")]
 pub fn init_idt() {
     let code_sel = 0x08; // Kernel code segment selector
     
@@ -598,6 +588,7 @@ pub fn init_idt() {
 
 /// Load IDT via lidt instruction
 #[inline(always)]
+#[cfg(target_arch = "x86_64")]
 unsafe fn load_idt(idtr: &IdtReg) {
     core::arch::asm!(
         "lidt [{0}]",
@@ -619,6 +610,7 @@ unsafe fn load_idt(idtr: &IdtReg) {
 /// - RAX contains the syscall number
 ///
 /// We save user context and call the handler.
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn syscall_entry_stub() {
     unsafe {
         core::arch::asm!(
@@ -725,6 +717,7 @@ unsafe extern "C" fn syscall_entry_stub() {
 /// # Safety
 /// Must only be called when ready to return to user mode with valid state
 #[inline]
+#[cfg(target_arch = "x86_64")]
 pub fn return_to_user(rip: u64, rsp: u64, rflags: u64) -> ! {
     unsafe {
         core::arch::asm!(
@@ -743,6 +736,7 @@ pub fn return_to_user(rip: u64, rsp: u64, rflags: u64) -> ! {
 /// Alternative user return using iretq (for compatibility)
 /// # Safety
 /// Must only be called when in valid user context with proper stack
+#[cfg(target_arch = "x86_64")]
 pub fn return_to_user_iret(rip: u64, cs: u64, rsp: u64, ss: u64, rflags: u64) -> ! {
     unsafe {
         core::arch::asm!(
@@ -764,6 +758,7 @@ pub fn return_to_user_iret(rip: u64, cs: u64, rsp: u64, ss: u64, rflags: u64) ->
 }
 
 /// Generic interrupt/exception entry stub
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn exception_entry_stub() {
     unsafe {
         core::arch::asm!(
@@ -816,6 +811,7 @@ unsafe extern "C" fn exception_entry_stub() {
 // ============================================================================
 
 /// Initialize trap handling
+#[cfg(target_arch = "x86_64")]
 pub fn init() {
     init_idt();
 }
@@ -849,18 +845,13 @@ pub extern "C" fn kernel_interrupt_from_user(vector: u64) {
     // The boot timer is normally IRQ0 / vector 32.  Acknowledge the
     // legacy 8259 PIC so a pending timer interrupt is not held forever.
     if vector == irq::TIMER as u64 {
-        unsafe {
-            core::arch::asm!(
-                "mov dx, 0x20",
-                "mov al, 0x20",
-                "out dx, al",
-                options(nostack, preserves_flags),
-            );
-        }
+        // Acknowledge the legacy 8259 PIC (master EOI, port 0x20).
+        crate::plan9_arch::hal::io::outb(0x20, 0x20);
     }
 }
 
 /// Trigger a software interrupt (syscall)
+#[cfg(target_arch = "x86_64")]
 pub fn syscall(num: u64, arg0: u64, arg1: u64, arg2: u64,
                arg3: u64, arg4: u64, arg5: u64) -> u64 {
     let ret: u64;
@@ -889,6 +880,7 @@ pub fn syscall(num: u64, arg0: u64, arg1: u64, arg2: u64,
 }
 
 /// Set up interrupt descriptor table with handler functions
+#[cfg(target_arch = "x86_64")]
 pub fn setup_idt_handlers() {
     init_idt();
 }

@@ -470,6 +470,7 @@ pub fn parse_boot_info(info_addr: u64) -> Option<BootInfo> {
                 if len >= 20 {
                     let src = unsafe { tag_ptr.byte_add(8) } as *const u8;
                     let bytes = unsafe { core::slice::from_raw_parts(src, len) };
+                    #[cfg(target_arch = "x86_64")]
                     crate::smp::store_rsdp_copy(bytes);
                     serial::put_bytes(b"[kernel] parse_boot_info: ACPI RSDP tag len=");
                     serial::put_hex_u32(len as u32);
@@ -523,6 +524,7 @@ unsafe fn read_cstring_to(ptr: *const u8, max_len: usize) -> Option<BootString> 
 extern "C" {
     static _kernel_start: u8;
     static _kernel_end:   u8;
+    #[cfg(target_arch = "x86_64")]
     static _scratch_start: u8;
 }
 
@@ -545,27 +547,43 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
      * RAX and RBX values that GRUB handed us, untouched by the BSS
      * zeroing operation). We use the _scratch_start symbol so this
      * works regardless of where GRUB loads the kernel. */
-    let scratch: *const u64 = unsafe { &_scratch_start as *const u8 as *const u64 };
-    let m: u64;
-    let i: u64;
-    unsafe {
-        core::arch::asm!(
-            "mov {m}, [{p}]",
-            "mov {i}, [{p} + 8]",
-            p = in(reg) scratch,
-            m = out(reg) m,
-            i = out(reg) i,
-            options(nostack, preserves_flags),
-        );
+    #[cfg(target_arch = "x86_64")]
+    {
+        let scratch: *const u64 = unsafe { &_scratch_start as *const u8 as *const u64 };
+        let m: u64 = unsafe { core::ptr::read_volatile(scratch) };
+        let i: u64 = unsafe { core::ptr::read_volatile(scratch.add(1)) };
+        serial::put_bytes(b"[kernel] scratch_magic=");
+        serial::put_hex_u64(m);
+        serial::put_bytes(b" scratch_info=");
+        serial::put_hex_u64(i);
+        serial::put_bytes(b"\n");
     }
-    serial::put_bytes(b"[kernel] scratch_magic=");
-    serial::put_hex_u64(m);
-    serial::put_bytes(b" scratch_info=");
-    serial::put_hex_u64(i);
-    serial::put_bytes(b"\n");
 
     serial::init();
     serial::put_bytes(b"[kernel] after_init\n");
+
+    // Non-x86_64 bring-up: the architecture console is live, so run the
+    // architecture early init + paging bring-up and then park with a
+    // banner. The x86 Multiboot2 machinery below does not apply.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // The architecture trait registry stores Box<dyn Arch>; bootstrap
+        // the static heap before early_init() so that allocation succeeds.
+        serial::put_bytes(b"[kernel] non-x86_64: bootstrap heap\n");
+        let static_heap = core::ptr::addr_of_mut!(crate::heap::STATIC_HEAP) as u64;
+        unsafe {
+            heap::heap_init(
+                plan9_common::types::VirtAddr::new(static_heap),
+                plan9_common::types::VirtAddr::new(static_heap + crate::heap::STATIC_HEAP_SIZE as u64),
+            );
+        }
+        serial::put_bytes(b"[kernel] non-x86_64: calling early_init\n");
+        plan9_arch::early_init();
+        serial::put_bytes(b"[kernel] non-x86_64: calling paging_init\n");
+        plan9_arch::paging_init();
+        serial::put_bytes(b"[kernel] non-x86_64: early_init + paging_init done\n");
+        hlt_loop();
+    }
 
     // 1. Architecture-level early init: GDT, paging, IDT. GRUB handed
     //    us a working 64-bit long-mode environment, but with a NULL
@@ -573,41 +591,8 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     //    fault reporters) before we touch any new virtual addresses
     //    installed via `vm::map_phys_range`.
     serial::put_bytes(b"[kernel] calling plan9_arch::early_init...\n");
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3F8\n\tmov al, 'X'\n\tout dx, al\n\tmov al, '0'\n\tout dx, al\n\tmov al, 10\n\tout dx, al",
-            options(nostack, preserves_flags),
-        );
-    }
     plan9_arch::early_init();
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3F8\n\tmov al, 'X'\n\tout dx, al\n\tmov al, '1'\n\tout dx, al\n\tmov al, 10\n\tout dx, al",
-            options(nostack, preserves_flags),
-        );
-    }
-    // Verify we got past early_init by writing directly via inline asm.
-    // If serial::put_bytes() below crashes, we know the issue is in
-    // the function-call mechanism (bad return address, stack corruption).
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3F8",
-            "mov al, 'A'",
-            "out dx, al",
-            "mov al, '1'",
-            "out dx, al",
-            "mov al, 10",
-            "out dx, al",
-            options(nostack, preserves_flags),
-        );
-    }
     serial::put_bytes(b"[kernel] arch early_init done\n");
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3F8\n\tmov al, 'X'\n\tout dx, al\n\tmov al, '2'\n\tout dx, al\n\tmov al, 10\n\tout dx, al",
-            options(nostack, preserves_flags),
-        );
-    }
 
     // 2. Validate the Multiboot2 magic. GRUB builds in the wild have been
     //    observed to hand us 0x36D7620A as well as the documented
@@ -813,8 +798,11 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     serial::put_bytes(b"[kstart] acpi::init_acpi\n");
     // Find RSDP in the Multiboot2 boot info (tag type 15) or fall
     // back to the well-known ACPI 1.0 scan address.
-    let rsdp = boot_info.bootloader_name.as_ref().map(|_| 0u64).unwrap_or(0);
-    crate::acpi::init_acpi(rsdp);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let rsdp = boot_info.bootloader_name.as_ref().map(|_| 0u64).unwrap_or(0);
+        crate::acpi::init_acpi(rsdp);
+    }
     serial::put_bytes(b"[kstart] timer::init_timer\n");
     crate::timer::init_timer();
 
@@ -822,11 +810,23 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     serial::put_bytes(b"[kstart] sched::schedinit\n");
     crate::sched::schedinit();
 
+    // Now that the scheduler and device registry exist, boot-time IRQ
+    // handlers (timer, keyboard) are safe. The IDT was installed earlier
+    // with every PIC IRQ masked, so deferred interrupts are delivered here.
+    #[cfg(target_arch = "x86_64")]
+    {
+        serial::put_bytes(b"[kstart] enabling interrupts\n");
+        plan9_arch::hal::idt::start_interrupts();
+    }
+
     // Step 5 — load init and switch to user mode.
     // Bring the other CPUs online first: they park until the scheduler is
     // made multi-CPU, but bring-up is the hard part of SMP.
-    serial::put_bytes(b"[kstart] smp::init_aps\n");
-    crate::smp::init_aps();
+    #[cfg(target_arch = "x86_64")]
+    {
+        serial::put_bytes(b"[kstart] smp::init_aps\n");
+        crate::smp::init_aps();
+    }
 
     serial::put_bytes(b"[kstart] init_loader::load_init\n");
     let init_image = match init_loader::load_init(&boot_info) {
@@ -1022,7 +1022,7 @@ fn init_registered_devices() {
 /// Push a synthetic IRET frame onto a fresh kernel page and invoke
 /// the `switch_to_user` trampoline. Never returns.
 fn switch_to_user(image: crate::init_loader::InitImage) -> ! {
-    use plan9_arch::x86_64::switch_to_user;
+    use plan9_arch::hal::switch_to_user;
 
     // Allocate one fresh physical page from the frame allocator for
     // the IRET frame. The kernel-side caller frame doesn't need to
@@ -1052,13 +1052,14 @@ fn switch_to_user(image: crate::init_loader::InitImage) -> ! {
     unsafe {
         switch_to_user::switch_to_user_trampoline(pml4_phys, frame_page);
     }
+    unreachable!("switch_to_user trampoline returned")
 }
 
 fn round_up(v: u64, align: u64) -> u64 { (v + align - 1) & !(align - 1) }
 
 fn hlt_loop() -> ! {
     loop {
-        unsafe { asm!("hlt", options(nostack, preserves_flags)) }
+        plan9_arch::hal::hlt();
     }
 }
 

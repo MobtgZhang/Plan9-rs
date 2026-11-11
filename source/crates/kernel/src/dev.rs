@@ -654,31 +654,13 @@ impl ConsDev {
 
         // Poll PS/2 keyboard output buffer (port 0x60) when the OBF bit
         // (bit 0 of port 0x64) is set.
-        let status: u8 = unsafe {
-            let val: u8;
-            core::arch::asm!(
-                "in al, dx",
-                out("al") val,
-                in("dx") 0x64u16,
-                options(nostack, preserves_flags),
-            );
-            val
-        };
+        let status: u8 = crate::plan9_arch::hal::io::inb(0x64);
         if (status & 0x01) == 0 {
             // Fall back to serial if no keyboard input
             return crate::cons::serial_getchar();
         }
 
-        let scan: u8 = unsafe {
-            let val: u8;
-            core::arch::asm!(
-                "in al, dx",
-                out("al") val,
-                in("dx") 0x60u16,
-                options(nostack, preserves_flags),
-            );
-            val
-        };
+        let scan: u8 = crate::plan9_arch::hal::io::inb(0x60);
 
         // Ignore break codes and the 0xE0 extended prefix.
         if (scan & 0x80) != 0 || (scan & 0x7F) == 0xE0 {

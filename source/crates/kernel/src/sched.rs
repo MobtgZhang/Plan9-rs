@@ -12,8 +12,8 @@ use crate::proc::{
 };
 use crate::proc::rfork;
 use crate::plan9_common::sync::{Spinlock, Mutex};
-use crate::plan9_arch::x86_64::context::Context;
-use crate::plan9_arch::x86_64::mmu::{ switch_page_table };
+use crate::plan9_arch::hal::context::Context;
+use crate::plan9_arch::hal::mmu::{ switch_page_table };
 // ============================================================================
 // Scheduler Constants
 // ============================================================================
@@ -632,7 +632,7 @@ impl Scheduler {
                 // SAFETY: Save the current execution context into the process's sched field
                 unsafe {
                     let mut ctx = Context::default();
-                    crate::plan9_arch::x86_64::context::save_context(&mut ctx);
+                    crate::plan9_arch::hal::context::save_context(&mut ctx);
                     prev_proc.sched = crate::proc::Label {
                         sp: ctx.rsp,
                         pc: ctx.ret,
@@ -663,7 +663,7 @@ impl Scheduler {
         if next.sched.is_set() {
             // Convert proc Label to Context and switch
             unsafe {
-                use crate::plan9_arch::x86_64::context::Label as ArchLabel;
+                use crate::plan9_arch::hal::context::Label as ArchLabel;
                 use crate::proc::Label as ProcLabel;
                 let proc_label: &ProcLabel = &next.sched;
                 let arch_label = ArchLabel {
@@ -677,21 +677,10 @@ impl Scheduler {
                     r15: proc_label.r15,
                 };
                 let ctx = Context::from_label(&arch_label);
-                core::arch::asm!(
-                    // Restore callee-saved registers
-                    "mov rbx, [rdi + 0]",
-                    "mov rbp, [rdi + 8]",
-                    "mov r12, [rdi + 16]",
-                    "mov r13, [rdi + 24]",
-                    "mov r14, [rdi + 32]",
-                    "mov r15, [rdi + 40]",
-                    // Restore stack pointer
-                    "mov rsp, [rdi + 48]",
-                    // Jump to saved PC
-                    "jmp qword ptr [rdi + 56]",
-                    in("rdi") &ctx as *const Context as u64,
-                    options(noreturn),
-                );
+                // Restore the saved context: jump to the saved PC with the
+                // saved callee-saved registers and stack pointer (the arch
+                // crate's `goto_context` longjmp).
+                crate::plan9_arch::hal::context::goto_context(&ctx);
             }
         } else if let Some(frame) = next.user_frame.as_ref() {
             // First run (or a non-blocked user process): resume its ring-3
@@ -700,7 +689,7 @@ impl Scheduler {
             if pml4 != 0 {
                 let frame_ptr = frame as *const crate::proc::SavedUserFrame as u64;
                 unsafe {
-                    crate::plan9_arch::x86_64::switch_to_user::kernel_resume_user(
+                    crate::plan9_arch::hal::switch_to_user::kernel_resume_user(
                         frame_ptr,
                         pml4,
                     );
@@ -714,8 +703,8 @@ impl Scheduler {
     /// Run the idle loop
     fn run_idle(&mut self) {
         // Enable interrupts and halt
-        crate::plan9_arch::x86_64::sti();
-        crate::plan9_arch::x86_64::hlt();
+        crate::plan9_arch::hal::sti();
+        crate::plan9_arch::hal::hlt();
     }
 
     /// Handle process exit
@@ -925,7 +914,7 @@ impl Scheduler {
         // Allocate kernel stack for the new process
         use crate::vm::alloc_frames;
         if let Some(kstack_phys) = alloc_frames(KSTACK_SIZE / 4096) {
-            proc.kstack = crate::plan9_arch::x86_64::paging::phys_to_virt(kstack_phys).as_u64();
+            proc.kstack = crate::plan9_arch::hal::paging::phys_to_virt(kstack_phys).as_u64();
         }
 
         // Set up initial scheduler context for child.  A user fork child
@@ -934,7 +923,7 @@ impl Scheduler {
         if proc.user_frame.is_none() && child_entry != 0 {
             // Set up context for child to start at entry point
             let stack_top = proc.kstack + KSTACK_SIZE as u64;
-//             use crate::plan9_arch::x86_64::context::Context;
+//             use crate::plan9_arch::hal::context::Context;
             proc.sched = crate::proc::Label {
                 sp: stack_top - 8,  // Leave room for return address
                 pc: child_entry,

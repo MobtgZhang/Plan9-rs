@@ -285,8 +285,8 @@ impl DisplayEngine for VirtioGpuEngine {
 
 /// Scan PCI buses for the virtio-gpu device and return its BAR0.
 fn find_virtio_gpu_device() -> Option<u64> {
-    use crate::plan9_arch::x86_64::outl;
-    use crate::plan9_arch::x86_64::inl;
+    use crate::plan9_arch::hal::outl;
+    use crate::plan9_arch::hal::inl;
 
     let config_addr = 0xCF8u16;
     let config_data = 0xCFCu16;
@@ -343,8 +343,8 @@ fn find_virtio_gpu_device() -> Option<u64> {
 /// Read a 32-bit BAR from PCI config space using a closure that builds
 /// the address for the current device's bus/dev/func.
 fn read_bar_at(make_addr: &dyn Fn(u32) -> u32, offset: u32) -> u64 {
-    use crate::plan9_arch::x86_64::outl;
-    use crate::plan9_arch::x86_64::inl;
+    use crate::plan9_arch::hal::outl;
+    use crate::plan9_arch::hal::inl;
 
     let addr = make_addr(offset);
     unsafe { outl(0xCF8, addr); }

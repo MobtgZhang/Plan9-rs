@@ -5,13 +5,13 @@
 
 use alloc::vec::Vec;
 use crate::proc::{curproc, Proc, State, SegType};
-use crate::plan9_arch::x86_64::paging::{ PAGESIZE, USER_VIRT_END, PteFlags, PT_ENTRIES };
-use crate::plan9_arch::x86_64::mmu::{cr2_read, invlpg, PageFaultError};
+use crate::plan9_arch::hal::paging::{ PAGESIZE, USER_VIRT_END, PteFlags, PT_ENTRIES };
+use crate::plan9_arch::hal::mmu::{cr2_read, invlpg, PageFaultError};
 use crate::plan9_common::types::PhysAddr;
 
 const PAGE_SIZE: u64 = PAGESIZE as u64;
 const PAGE_FRAME_MASK: u64 = 0x000_FFFF_FFFF_F000;
-const COW_PTE_BIT: u64 = 1 << 9;
+const COW_PTE_BIT: u64 = PteFlags::COW.bits();
 
 // ============================================================================
 // Page Fault Handler
@@ -161,7 +161,7 @@ fn handle_page_fault(proc: &mut Proc, addr: u64, error: PageFaultError) -> Resul
             Err(FaultError::NoSegment)
         }
     } else if (pte & PteFlags::PRESENT.bits()) != 0 {
-        if error.write() && (pte & PteFlags::WRITABLE.bits()) == 0 {
+        if error.write() && !PteFlags::new(pte).is_writable() {
             let seg_ptr = match proc.seg.get_mut(seg_idx) {
                 Some(Some(s)) => core::ptr::addr_of_mut!(*s),
                 _ => return Err(FaultError::NoSegment),
@@ -245,7 +245,7 @@ fn handle_cow_or_zero_page(
 /// This is a critical operation for COW page handling.
 /// Copies PAGE_SIZE bytes from source physical address to destination.
 fn copy_page_content(src: u64, dst: u64) -> Result<(), FaultError> {
-    use crate::plan9_arch::x86_64::paging::{phys_to_virt, PAGESIZE};
+    use crate::plan9_arch::hal::paging::{phys_to_virt, PAGESIZE};
     
     let src_virt = phys_to_virt(crate::plan9_common::types::PhysAddr::new(src));
     let dst_virt = phys_to_virt(crate::plan9_common::types::PhysAddr::new(dst));
@@ -364,10 +364,9 @@ pub fn setup_cow_for_fork(child: &mut Proc, parent: &Proc) -> Result<(), FaultEr
 
                 let frame_addr = pte & PAGE_FRAME_MASK;
 
-                // Create a COW PTE: present, user, read-only, and marked with bit 9.
-                let flags = PteFlags::new((pte & 0xFFF) & !PteFlags::WRITABLE.bits())
-                    | PteFlags::PRESENT
-                    | PteFlags::USER;
+                // Create a COW PTE: present, user-accessible, read-only,
+                // and marked with the architecture's software COW bit.
+                let flags = PteFlags::USER_RO;
                 let cow_pte = frame_addr | flags.bits() | COW_PTE_BIT;
 
                 // Set the COW PTE in child's page table (also COW)
@@ -532,8 +531,7 @@ fn handle_swap_in(
     // The page is now present, not in swap
     let flags = if seg.is_cow() {
         // COW page - read-only initially
-        crate::plan9_arch::x86_64::paging::PteFlags::PRESENT.bits()
-            | crate::plan9_arch::x86_64::paging::PteFlags::USER.bits()
+        PteFlags::USER_RO.bits()
     } else {
         // Regular page - use segment's permissions
         seg.perm().to_flags().bits()
@@ -595,7 +593,7 @@ impl ProcSegment {
     /// Updates both the segment's page_table and the process's actual page table.
     pub fn map_page(&mut self, addr: u64, frame: PhysFrame, writable: bool) {
         
-        use crate::plan9_arch::x86_64::paging::{
+        use crate::plan9_arch::hal::paging::{
             phys_to_virt, PageTableIndices, PteFlags, PAGESIZE,
 //             KERNEL_VIRT_BASE, PT_ENTRIES,
         };
@@ -606,10 +604,7 @@ impl ProcSegment {
         let page_idx = (offset / PAGESIZE as u64) as usize;
 
         // Build the PTE value
-        let mut flags = PteFlags::PRESENT | PteFlags::USER;
-        if writable {
-            flags = PteFlags::new(flags.bits() | PteFlags::WRITABLE.bits());
-        }
+        let flags = if writable { PteFlags::USER_RW } else { PteFlags::USER_RO };
 
         // Update segment's page table
         self.set_pte(page_idx, frame.addr | flags.bits());
@@ -632,7 +627,7 @@ impl ProcSegment {
                     let pdpt_virt = phys_to_virt(pdpt_frame);
                     unsafe {
                         core::ptr::write_bytes(pdpt_virt.as_mut_ptr::<u64>(), 0, PT_ENTRIES);
-                        *pml4_entry_ptr = pdpt_frame.as_u64() | PteFlags::PRESENT.bits() | PteFlags::WRITABLE.bits();
+                        *pml4_entry_ptr = pdpt_frame.as_u64() | PteFlags::PAGE_TABLE.bits();
                     }
                 } else {
                     return;
@@ -648,7 +643,7 @@ impl ProcSegment {
                     let pd_virt = phys_to_virt(pd_frame);
                     unsafe {
                         core::ptr::write_bytes(pd_virt.as_mut_ptr::<u64>(), 0, PT_ENTRIES);
-                        *pdpt_entry_ptr = pd_frame.as_u64() | PteFlags::PRESENT.bits() | PteFlags::WRITABLE.bits();
+                        *pdpt_entry_ptr = pd_frame.as_u64() | PteFlags::PAGE_TABLE.bits();
                     }
                 } else {
                     return;
@@ -664,7 +659,7 @@ impl ProcSegment {
                     let pt_virt = phys_to_virt(pt_frame);
                     unsafe {
                         core::ptr::write_bytes(pt_virt.as_mut_ptr::<u64>(), 0, PT_ENTRIES);
-                        *pd_entry_ptr = pt_frame.as_u64() | PteFlags::PRESENT.bits() | PteFlags::WRITABLE.bits();
+                        *pd_entry_ptr = pt_frame.as_u64() | PteFlags::PAGE_TABLE.bits();
                     }
                 } else {
                     return;
@@ -680,7 +675,7 @@ impl ProcSegment {
             }
 
             // Flush TLB for this address
-            use crate::plan9_arch::x86_64::mmu::invlpg;
+            use crate::plan9_arch::hal::mmu::invlpg;
             invlpg(crate::plan9_common::types::VirtAddr::new(addr));
         }
     }
@@ -716,8 +711,8 @@ impl PhysFrame {
 /// Allocates a physical frame from the global allocator and zeros it.
 fn alloc_user_frame() -> Option<PhysFrame> {
     use crate::vm::frame_allocator;
-    use crate::plan9_arch::x86_64::paging::phys_to_virt;
-    use crate::plan9_arch::x86_64::paging::PAGESIZE;
+    use crate::plan9_arch::hal::paging::phys_to_virt;
+    use crate::plan9_arch::hal::paging::PAGESIZE;
 
     let allocator = frame_allocator();
     let phys = allocator.alloc_frame()?;
@@ -801,8 +796,8 @@ impl SegmentPerm {
         if self.read {
             flags = flags | PteFlags::USER;
         }
-        if self.write {
-            flags = flags | PteFlags::WRITABLE;
+        if !self.write {
+            flags = flags | PteFlags::READONLY;
         }
         if !self.exec {
             flags = flags | PteFlags::NX;

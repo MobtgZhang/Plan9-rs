@@ -250,17 +250,18 @@ pub unsafe fn idt_init() {
     // Initialise the legacy 8259 PIC so hardware IRQs (keyboard, timer, …)
     // are actually delivered to the CPU.  IRQ 0..7 map to IDT vectors 32..39,
     // IRQ 8..15 map to 40..47.  We remap them away from the exception range
-    // (0..31) and unmask IRQ0 (timer) and IRQ1 (keyboard).
+    // (0..31) but keep every IRQ masked.  Boot-time handlers (timer,
+    // keyboard) depend on the scheduler and device registry, which are not
+    // ready yet; `start_interrupts` unmasks them once those are initialised.
     pic_init();
-
-    // Enable maskable interrupts so the installed handlers can run.
-    crate::x86_64::sti();
+    // Leave IF=0: the caller enables interrupts after kernel init.
 }
 
 /// Initialise the two 8259 PIC chips (master + slave).
 ///
 /// Programs ICW1..ICW4 so IRQs map to IDT vectors 32..47, then masks all
-/// IRQs except IRQ0 (timer) and IRQ1 (keyboard).
+/// IRQs.  Unmasking is deferred to [`start_interrupts`] because the timer
+/// and keyboard handlers need the scheduler and device registry.
 fn pic_init() {
     // ICW1: init, edge-triggered, ICW4 needed.
     crate::x86_64::outb(0x20, 0x11);
@@ -286,12 +287,24 @@ fn pic_init() {
     crate::x86_64::outb(0xA1, 0x01);
     crate::x86_64::io_delay();
 
-    // OCW1: mask all, then unmask IRQ0 (timer) and IRQ1 (keyboard) on master.
-    // Master mask: ~(1<<0 | 1<<1) = 0xFC; slave: mask all = 0xFF.
-    crate::x86_64::outb(0x21, 0xFC);
+    // OCW1: mask every IRQ (master 0xFF, slave 0xFF) during boot.
+    crate::x86_64::outb(0x21, 0xFF);
     crate::x86_64::io_delay();
     crate::x86_64::outb(0xA1, 0xFF);
     crate::x86_64::io_delay();
+}
+
+/// Enable boot-time hardware IRQs and maskable interrupts.
+///
+/// Unmasks IRQ0 (timer) and IRQ1 (keyboard) on the master PIC and executes
+/// `sti`.  Must be called only after the scheduler and device registry are
+/// initialised, because both handlers dereference them.
+pub fn start_interrupts() {
+    crate::x86_64::outb(0x21, 0xFC); // unmask IRQ0 + IRQ1
+    crate::x86_64::io_delay();
+    crate::x86_64::outb(0xA1, 0xFF); // slave remains masked
+    crate::x86_64::io_delay();
+    crate::x86_64::sti();
 }
 
 /// Direct COM1 hex printout helper.

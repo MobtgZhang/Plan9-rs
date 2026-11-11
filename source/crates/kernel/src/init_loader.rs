@@ -18,7 +18,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::entry::BootInfo;
-use crate::plan9_arch::x86_64::paging::PAGESIZE;
+use crate::plan9_arch::hal::paging::PAGESIZE;
 use plan9_common::types::{PhysAddr, VirtAddr};
 use crate::plan9_common::sync::Spinlock;
 
@@ -272,9 +272,8 @@ pub unsafe fn write_pte(table: u64, index: usize, val: u64) {
 /// would otherwise make `map_user_page` treat a huge mapping as a PT pointer.
 /// The high canonical kernel mirror (PML4[256..511]) is copied verbatim.
 pub unsafe fn copy_kernel_pml4_into(new_pml4: PhysAddr) -> Option<()> {
-    // Read the boot PML4 from CR3.
-    let boot_pml4: u64;
-    core::arch::asm!("mov {0}, cr3", out(reg) boot_pml4);
+    // Read the boot PML4 from the current root table.
+    let boot_pml4: u64 = crate::plan9_arch::hal::mmu::cr3_read().as_u64();
     let boot = boot_pml4 & 0x000F_FFFF_FFFF_F000;
     let dst = new_pml4.as_u64();
 

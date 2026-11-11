@@ -8,7 +8,7 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::plan9_arch::x86_64::paging::{
+use crate::plan9_arch::hal::paging::{
     self, PteFlags,
     PageTableIndices, PAGESIZE, PT_ENTRIES, PHYS_MEMORY_VIRT, KERNEL_VIRT_BASE,
 };
@@ -419,7 +419,7 @@ impl VmManager {
         }
         unsafe {
             core::ptr::write(pt_entry_ptr as *mut u64, phys.as_u64() | entry_flags.bits());
-            core::arch::asm!("sfence", options(nostack, preserves_flags));
+            // (store ordering is provided by the TLB invalidate below)
         }
         invalidate_tlb(virt);
 
@@ -459,7 +459,7 @@ impl VmManager {
         // Clear the entry
         unsafe {
             core::ptr::write(pt_entry_ptr as *mut u64, 0);
-            core::arch::asm!("sfence", options(nostack, preserves_flags));
+            // (store ordering is provided by the TLB invalidate below)
         }
         invalidate_tlb(virt);
 
@@ -1331,8 +1331,9 @@ impl UserPageTable {
         let user_flags = flags | PteFlags::USER;
         unsafe {
             core::ptr::write(pt_entry_ptr as *mut u64, phys.as_u64() | user_flags.bits());
-            // sfence to ensure the PTE write is committed before TLB flush
-            core::arch::asm!("sfence", options(nostack, preserves_flags));
+            // Memory barrier to ensure the PTE write is committed before
+            // the TLB flush (the arch crate provides the right barrier).
+            crate::plan9_arch::hal::mmu::flush_tlb();
         }
 
         // Invalidate TLB for this address
@@ -1436,7 +1437,7 @@ impl UserPageTable {
 /// Must be called after `early_paging_init`. The mapping window is fixed
 /// and must not collide with existing critical mappings.
 pub unsafe fn map_phys_range(phys: u64, size: u64) -> *mut u8 {
-    use crate::plan9_arch::x86_64::paging::PAGE_SHIFT;
+    use crate::plan9_arch::hal::paging::PAGE_SHIFT;
 
     serial::put_bytes(b"[map_phys_range] phys=");
     serial::put_hex_u64(phys);
@@ -1453,8 +1454,7 @@ pub unsafe fn map_phys_range(phys: u64, size: u64) -> *mut u8 {
     let phys_offset = phys_aligned & 0x0FFF_FFFF; // 28 bits = 256 MiB window
     let base_virt = 0xFFFF_9000_0000_0000u64 | phys_offset;
 
-    let old_cr3: u64;
-    core::arch::asm!("mov {0}, cr3", out(reg) old_cr3, options(nostack));
+    let old_cr3: u64 = crate::plan9_arch::hal::mmu::cr3_read().as_u64();
     serial::put_bytes(b"[map_phys_range] CR3=0x");
     serial::put_hex_u64(old_cr3);
     serial::put_bytes(b"\n");
@@ -1473,7 +1473,7 @@ pub unsafe fn map_phys_range(phys: u64, size: u64) -> *mut u8 {
     while page_idx < pages {
         let cur_phys = phys_aligned + page_idx * page_size;
         let cur_virt = base_virt + page_idx * page_size;
-        let indices = crate::plan9_arch::x86_64::paging::PageTableIndices::from_virt(
+        let indices = crate::plan9_arch::hal::paging::PageTableIndices::from_virt(
             plan9_common::types::VirtAddr::new(cur_virt)
         );
 
@@ -1512,20 +1512,10 @@ pub unsafe fn map_phys_range(phys: u64, size: u64) -> *mut u8 {
         let pd_flags: u64 = 1u64 | (1u64 << 1) | (1u64 << 7) | (1u64 << 8) | (1u64 << 63);
         let new_pd_entry = cur_phys_aligned | pd_flags;
         core::ptr::write_volatile(pd_entry_ptr, new_pd_entry);
-        // sfence: order page-table stores vs. the CR3 reload that follows.
-        core::arch::asm!("sfence", options(nostack, preserves_flags));
         // Invalidate any cached translation for this address, then
-        // globally flush the TLB by reloading CR3.
-        core::arch::asm!(
-            "invlpg [{}]",
-            in(reg) cur_virt,
-            options(nostack),
-        );
-        core::arch::asm!(
-            "mov cr3, {0}",
-            in(reg) old_cr3,
-            options(nostack),
-        );
+        // globally flush the TLB by reloading the root table.
+        crate::plan9_arch::hal::mmu::invlpg(VirtAddr::new(cur_virt));
+        crate::plan9_arch::hal::mmu::cr3_write(PhysAddr::new(old_cr3));
 
         page_idx += 1;
     }
@@ -1541,10 +1531,7 @@ pub unsafe fn map_phys_range(phys: u64, size: u64) -> *mut u8 {
 
 /// Invalidate TLB entry for a specific virtual address
 fn invalidate_tlb(virt: VirtAddr) {
-    unsafe {
-        // Use INVLPG instruction on x86_64
-        core::arch::asm!("invlpg [{}]", in(reg) virt.as_u64(), options(nostack));
-    }
+    crate::plan9_arch::hal::mmu::invlpg(virt);
 }
 
 // ============================================================================
@@ -1634,6 +1621,6 @@ pub fn create_user_page_table() -> Option<PhysAddr> {
 /// This loads the new CR3 value to switch address spaces.
 /// Note: This should only be called from kernel context.
 pub fn switch_to_user_page_table(pml4_phys: PhysAddr) {
-    use crate::plan9_arch::x86_64::mmu::cr3_write;
+    use crate::plan9_arch::hal::mmu::cr3_write;
     cr3_write(pml4_phys);
 }

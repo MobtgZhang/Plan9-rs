@@ -82,6 +82,7 @@ pub mod syscall_trace;
 pub mod debug;
 pub mod debug_gating;
 pub mod watchdog;
+#[cfg(target_arch = "x86_64")]
 pub mod acpi;
 pub mod smp;
 pub mod sema;

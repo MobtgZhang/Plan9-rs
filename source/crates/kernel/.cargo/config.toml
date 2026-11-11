@@ -1,7 +1,30 @@
 [build]
-target = "x86_64-unknown-none"
+# No hardcoded target: build with `cargo build --target <triple>` for
+# x86_64-unknown-none, aarch64-unknown-none, riscv64gc-unknown-none-elf, or
+# loongarch64-unknown-none.
 
 [target.x86_64-unknown-none]
+runner = "none"
+rustflags = [
+  "-C", "relocation-model=static",
+  "-C", "panic=abort",
+]
+
+[target.aarch64-unknown-none]
+runner = "none"
+rustflags = [
+  "-C", "relocation-model=static",
+  "-C", "panic=abort",
+]
+
+[target.riscv64gc-unknown-none-elf]
+runner = "none"
+rustflags = [
+  "-C", "relocation-model=static",
+  "-C", "panic=abort",
+]
+
+[target.loongarch64-unknown-none]
 runner = "none"
 rustflags = [
   "-C", "relocation-model=static",
