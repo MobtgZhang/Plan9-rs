@@ -30,6 +30,14 @@ pub const SYS_PUTS: usize = 49;
 pub const SYS_GETPID: usize = 50;
 pub const SYS_WAIT: usize = 51;
 
+pub const SYS_PIPE: usize = 10;
+pub const SYS_PREAD: usize = 11;
+pub const SYS_PWRITE: usize = 12;
+pub const SYS_REMOVE: usize = 13;
+
+/// Plan 9 create-permission bit: create a directory instead of a file.
+pub const DMDIR: u32 = 0x8000_0000;
+
 #[inline(always)]
 pub unsafe fn syscall0(n: usize) -> i64 {
     let n64 = n as u64;
@@ -125,8 +133,24 @@ pub fn open(path: *const u8, flags: u32) -> i64 {
     unsafe { syscall2(SYS_OPEN, path as u64, flags as u64) }
 }
 
-pub fn create(path: *const u8, perm: u32) -> i64 {
-    unsafe { syscall2(SYS_CREATE, path as u64, perm as u64) }
+/// Full Plan 9 create: `create(name, omode, perm)`.
+pub fn create3(path: *const u8, omode: u32, perm: u32) -> i64 {
+    unsafe { syscall3(SYS_CREATE, path as u64, omode as u64, perm as u64) }
+}
+
+/// Remove a file (Plan 9 `remove`).
+pub fn remove(path: *const u8) -> i64 {
+    unsafe { syscall1(SYS_REMOVE, path as u64) }
+}
+
+/// Create a pipe; `fds` receives [read_fd, write_fd].
+pub fn pipe(fds: &mut [i64; 2]) -> i64 {
+    unsafe { syscall1(SYS_PIPE, fds.as_mut_ptr() as u64) }
+}
+
+/// Plan 9 `dup(oldfd, newfd)`: install the duplicate at `newfd`.
+pub fn dup2(oldfd: i64, newfd: i64) -> i64 {
+    unsafe { syscall2(SYS_DUP, oldfd as u64, newfd as u64) }
 }
 
 pub fn close(fd: i64) -> i64 {
