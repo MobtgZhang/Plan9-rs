@@ -631,7 +631,15 @@ impl Chan {
         match whence {
             0 => self.offset = offset,
             1 => self.offset = self.offset.saturating_add(offset),
-            2 => self.offset = offset, // no file length available -> treat as end
+            2 => {
+                // Seek to end-of-file: ask the device for the file length.
+                let dev = devs_mut().get_mut(self.dev).ok_or(VfsError::Enoent)?;
+                let len = dev
+                    .stat(self)
+                    .map(|d| d.length)
+                    .map_err(|_| VfsError::Eio)?;
+                self.offset = len;
+            }
             _ => return Err(VfsError::Einval),
         }
         Ok(self.offset)
