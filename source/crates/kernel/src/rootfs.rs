@@ -270,8 +270,12 @@ impl Dev for RootFsDev {
         if self.find_child(node.id, name).is_some() {
             return Err(DevError::Eexists);
         }
-        let id = self.insert(node.id, name, false, perm | 0o100000, Vec::new());
-        ch.qid = crate::chan::Qid::new(id, 0, qidtype::FILE);
+        // Plan 9 DMDIR (0x80000000) in the permission bits requests a
+        // directory; strip it before storing the mode.
+        let is_dir = perm & 0x8000_0000 != 0;
+        let mode = (perm & 0x7FF) | 0o100000;
+        let id = self.insert(node.id, name, is_dir, mode, Vec::new());
+        ch.qid = crate::chan::Qid::new(id, 0, if is_dir { qidtype::DIR } else { qidtype::FILE });
         Ok(())
     }
 
