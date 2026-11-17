@@ -673,7 +673,17 @@ impl ConsDev {
         {
             let mut buf = self.input_buffer.lock();
             if !buf.is_empty() {
-                return Some(buf.remove(0));
+                let b = buf.remove(0);
+                // QEMU mirrors a keystroke to both PS/2 (→ input_buffer via IRQ)
+                // and serial.  If the serial mirror is already buffered,
+                // consume and collapse it so it is not delivered again on
+                // the next get_char() call.
+                if let Some(s) = crate::cons::serial_getchar() {
+                    if s != b {
+                        crate::cons::unread_serial(s);
+                    }
+                }
+                return Some(b);
             }
         }
 
@@ -735,35 +745,22 @@ impl ConsDev {
         // The interrupt path may have just consumed this keystroke and
         // queued it in `input_buffer`; QEMU keeps the scancode port
         // readable for a short while after the IRQ, so a naive poll here
-        // would deliver the key a second time.  The buffered read at the
-        // top of `get_char` saw the queued bytes first, so when we reach
-        // this point with the flag set, the flag refers to the *next*
-        // key still in flight — stand down once per delivered IRQ.
+        // would deliver the key a second time.  Stand down once per
+        // delivered IRQ — the data is already in `input_buffer` and will
+        // be returned by the buffered read above on the next call.
         if crate::keymap::irq_delivered_pending() {
             crate::keymap::clear_irq_delivered();
             return None;
         }
 
-        // On port-I/O architectures, poll the PS/2 keyboard output
-        // buffer (port 0x60) when the OBF bit (bit 0 of port 0x64) is
-        // set.  Elsewhere (aarch64 PL011) there is no PS/2 controller:
-        // the console's serial transport delivers the bytes instead.
+        // On port-I/O architectures the keyboard IRQ handler is the sole
+        // reader of port 0x60 (see `keyboard_interrupt` in trap.rs).
+        // QEMU keeps the scancode port readable after the IRQ, so polling
+        // it here would deliver the same key a second time.  Do not read
+        // port 0x60 from the polling path; input arrives exclusively
+        // through the IRQ → `input_buffer` path above.
         #[cfg(target_arch = "x86_64")]
-        loop {
-            let status: u8 = crate::plan9_arch::hal::io::inb(0x64);
-            if (status & 0x01) == 0 {
-                return None;
-            }
-            let scan: u8 = crate::plan9_arch::hal::io::inb(0x60);
-            let bytes = crate::keymap::translate(scan);
-            if bytes.is_empty() {
-                // Modifier or unmapped key: keep polling for a real one.
-                continue;
-            }
-            let mut staged = self.pending_input.lock();
-            staged.extend_from_slice(bytes);
-            return Some(staged.remove(0));
-        }
+        return None;
 
         // Non-port-I/O architectures have no PS/2 controller; console
         // input arrives through the serial transport in `get_char`.
