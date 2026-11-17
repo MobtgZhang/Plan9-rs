@@ -1,0 +1,256 @@
+[package]
+name = "plan9-cmd"
+version = "0.1.0"
+edition = "2021"
+description = "Plan 9 user-space commands, ported to Rust and built for the bare-metal x86_64 kernel"
+
+[lib]
+name = "cmd"
+path = "src/lib.rs"
+
+# The classic Plan 9 /bin + /rc/bin command set.  Each binary is a thin
+# no_std entry stub around a module in src/lib.rs.
+[[bin]]
+name = "rc"
+path = "src/bin/rc.rs"
+
+[[bin]]
+name = "echo"
+path = "src/bin/echo.rs"
+
+[[bin]]
+name = "pwd"
+path = "src/bin/pwd.rs"
+
+[[bin]]
+name = "ls"
+path = "src/bin/ls.rs"
+
+[[bin]]
+name = "cat"
+path = "src/bin/cat.rs"
+
+[[bin]]
+name = "date"
+path = "src/bin/date.rs"
+
+[[bin]]
+name = "sleep"
+path = "src/bin/sleep.rs"
+
+[[bin]]
+name = "wc"
+path = "src/bin/wc.rs"
+
+[[bin]]
+name = "head"
+path = "src/bin/head.rs"
+
+[[bin]]
+name = "tail"
+path = "src/bin/tail.rs"
+
+[[bin]]
+name = "grep"
+path = "src/bin/grep.rs"
+
+[[bin]]
+name = "sort"
+path = "src/bin/sort.rs"
+
+[[bin]]
+name = "uniq"
+path = "src/bin/uniq.rs"
+
+[[bin]]
+name = "cp"
+path = "src/bin/cp.rs"
+
+[[bin]]
+name = "mv"
+path = "src/bin/mv.rs"
+
+[[bin]]
+name = "rm"
+path = "src/bin/rm.rs"
+
+[[bin]]
+name = "mkdir"
+path = "src/bin/mkdir.rs"
+
+[[bin]]
+name = "touch"
+path = "src/bin/touch.rs"
+
+[[bin]]
+name = "ps"
+path = "src/bin/ps.rs"
+
+[[bin]]
+name = "kill"
+path = "src/bin/kill.rs"
+
+[[bin]]
+name = "seq"
+path = "src/bin/seq.rs"
+
+[[bin]]
+name = "du"
+path = "src/bin/du.rs"
+
+[[bin]]
+name = "tee"
+path = "src/bin/tee.rs"
+
+[[bin]]
+name = "tr"
+path = "src/bin/tr.rs"
+
+[[bin]]
+name = "cut"
+path = "src/bin/cut.rs"
+
+[[bin]]
+name = "stat"
+path = "src/bin/stat.rs"
+
+[[bin]]
+name = "time"
+path = "src/bin/time.rs"
+
+[[bin]]
+name = "test"
+path = "src/bin/test.rs"
+
+[[bin]]
+name = "whoami"
+path = "src/bin/whoami.rs"
+
+[[bin]]
+name = "hostname"
+path = "src/bin/hostname.rs"
+
+[[bin]]
+name = "id"
+path = "src/bin/id.rs"
+
+[[bin]]
+name = "chmod"
+path = "src/bin/chmod.rs"
+
+[[bin]]
+name = "chown"
+path = "src/bin/chown.rs"
+
+[[bin]]
+name = "useradd"
+path = "src/bin/useradd.rs"
+
+[[bin]]
+name = "usermod"
+path = "src/bin/usermod.rs"
+
+[[bin]]
+name = "group"
+path = "src/bin/group.rs"
+
+[[bin]]
+name = "su"
+path = "src/bin/su.rs"
+
+[[bin]]
+name = "passwd"
+path = "src/bin/passwd.rs"
+
+# Extended command set.
+
+[[bin]]
+name = "clear"
+path = "src/bin/clear.rs"
+
+[[bin]]
+name = "env"
+path = "src/bin/env.rs"
+
+[[bin]]
+name = "basename"
+path = "src/bin/basename.rs"
+
+[[bin]]
+name = "dirname"
+path = "src/bin/dirname.rs"
+
+[[bin]]
+name = "true"
+path = "src/bin/true.rs"
+
+[[bin]]
+name = "false"
+path = "src/bin/false.rs"
+
+[[bin]]
+name = "cmp"
+path = "src/bin/cmp.rs"
+
+[[bin]]
+name = "diff"
+path = "src/bin/diff.rs"
+
+[[bin]]
+name = "nl"
+path = "src/bin/nl.rs"
+
+[[bin]]
+name = "more"
+path = "src/bin/more.rs"
+
+[[bin]]
+name = "rmdir"
+path = "src/bin/rmdir.rs"
+
+[[bin]]
+name = "ln"
+path = "src/bin/ln.rs"
+
+[[bin]]
+name = "uptime"
+path = "src/bin/uptime.rs"
+
+[[bin]]
+name = "who"
+path = "src/bin/who.rs"
+
+[[bin]]
+name = "expr"
+path = "src/bin/expr.rs"
+
+[[bin]]
+name = "fortune"
+path = "src/bin/fortune.rs"
+
+[[bin]]
+name = "units"
+path = "src/bin/units.rs"
+
+[[bin]]
+name = "dc"
+path = "src/bin/dc.rs"
+
+[[bin]]
+name = "ed"
+path = "src/bin/ed.rs"
+
+[[bin]]
+name = "yes"
+path = "src/bin/yes.rs"
+[[bin]]
+name = "tty"
+path = "src/bin/tty.rs"
+
+[[bin]]
+name = "uname"
+path = "src/bin/uname.rs"
+
+[[bin]]
+name = "printf"
+path = "src/bin/printf.rs"

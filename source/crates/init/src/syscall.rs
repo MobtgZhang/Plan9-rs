@@ -40,76 +40,135 @@ pub const DMDIR: u32 = 0x8000_0000;
 
 #[inline(always)]
 pub unsafe fn syscall0(n: usize) -> i64 {
-    let n64 = n as u64;
-    let r: u64;
-    asm!(
-        "int 0x80",
-        inout("rax") n64 => r,
-        out("rcx") _,
-        out("r8") _,
-        out("r9") _,
-        out("r10") _,
-        out("r11") _,
-        options(nostack, preserves_flags),
-    );
-    r as i64
+    #[cfg(target_arch = "x86_64")]
+    {
+        let n64 = n as u64;
+        let r: u64;
+        asm!(
+            "int 0x80",
+            inout("rax") n64 => r,
+            out("rcx") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+            options(nostack, preserves_flags),
+        );
+        return r as i64;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let r: u64;
+        asm!(
+            "svc #0",
+            in("x8") n,
+            inout("x0") 0u64 => r,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
 }
 
 #[inline(always)]
 pub unsafe fn syscall1(n: usize, a0: u64) -> i64 {
-    let n64 = n as u64;
-    let r: u64;
-    asm!(
-        "int 0x80",
-        inout("rax") n64 => r,
-        in("rdi") a0,
-        out("rcx") _,
-        out("r8") _,
-        out("r9") _,
-        out("r10") _,
-        out("r11") _,
-        options(nostack, preserves_flags),
-    );
-    r as i64
+    #[cfg(target_arch = "x86_64")]
+    {
+        let n64 = n as u64;
+        let r: u64;
+        asm!(
+            "int 0x80",
+            inout("rax") n64 => r,
+            in("rdi") a0,
+            out("rcx") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+            options(nostack, preserves_flags),
+        );
+        return r as i64;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let r: u64;
+        asm!(
+            "svc #0",
+            in("x8") n,
+            inout("x0") a0 => r,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
 }
 
 #[inline(always)]
 pub unsafe fn syscall2(n: usize, a0: u64, a1: u64) -> i64 {
-    let n64 = n as u64;
-    let r: u64;
-    asm!(
-        "int 0x80",
-        inout("rax") n64 => r,
-        in("rdi") a0,
-        in("rsi") a1,
-        out("rcx") _,
-        out("r8") _,
-        out("r9") _,
-        out("r10") _,
-        out("r11") _,
-        options(nostack, preserves_flags),
-    );
-    r as i64
+    #[cfg(target_arch = "x86_64")]
+    {
+        let n64 = n as u64;
+        let r: u64;
+        asm!(
+            "int 0x80",
+            inout("rax") n64 => r,
+            in("rdi") a0,
+            in("rsi") a1,
+            out("rcx") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+            options(nostack, preserves_flags),
+        );
+        return r as i64;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let r: u64;
+        asm!(
+            "svc #0",
+            in("x8") n,
+            inout("x0") a0 => r,
+            in("x1") a1,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
 }
 
 #[inline(always)]
 pub unsafe fn syscall3(n: usize, a0: u64, a1: u64, a2: u64) -> i64 {
-    let n64 = n as u64;
-    let r: u64;
-    asm!(
-        "int 0x80",
-        inout("rax") n64 => r,
-        in("rdi") a0,
-        in("rsi") a1,
-        in("rdx") a2,
-        out("rcx") _,
-        out("r8") _,
-        out("r9") _,
-        out("r10") _,
-        out("r11") _,
-        options(nostack, preserves_flags),
-    );
-    r as i64
+    #[cfg(target_arch = "x86_64")]
+    {
+        let n64 = n as u64;
+        let r: u64;
+        asm!(
+            "int 0x80",
+            inout("rax") n64 => r,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            out("rcx") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+            options(nostack, preserves_flags),
+        );
+        return r as i64;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let r: u64;
+        asm!(
+            "svc #0",
+            in("x8") n,
+            inout("x0") a0 => r,
+            in("x1") a1,
+            in("x2") a2,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
 }
 
 pub fn exit(code: i32) -> ! {
@@ -117,7 +176,10 @@ pub fn exit(code: i32) -> ! {
         syscall1(SYS_EXITS, code as u64);
     }
     loop {
+        #[cfg(target_arch = "x86_64")]
         unsafe { asm!("hlt", options(nostack, preserves_flags)) }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { asm!("wfi", options(nostack, preserves_flags)) }
     }
 }
 

@@ -23,6 +23,7 @@ use core::arch::global_asm;
 // function would get a normal function prologue before its body and would
 // no longer see that stack layout.  Use a tiny assembly entry stub that
 // reads argc/argv and then calls the Rust implementation.
+#[cfg(target_arch = "x86_64")]
 global_asm!(r#"
     .section .text.start, "ax", @progbits
     .global _start
@@ -33,6 +34,22 @@ _start:
     mov     rdx, rsp
     call    ssh_main
     hlt
+    .size _start, . - _start
+"#);
+
+// aarch64 build of the ssh binary is a placeholder — the SSH port is
+// x86_64-only; provide a valid entry point that exits immediately.
+#[cfg(target_arch = "aarch64")]
+global_asm!(r#"
+    .section .text.start, "ax", @progbits
+    .global _start
+    .type _start, @function
+_start:
+    mov     x8, #2                      /* SYS_EXITS */
+    svc     #0
+hang_ssh:
+    wfi
+    b       hang_ssh
     .size _start, . - _start
 "#);
 
@@ -259,6 +276,9 @@ pub extern "C" fn ssh_main(argc: u64, argv: u64, initial_rsp: u64) -> ! {
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {
+        #[cfg(target_arch = "x86_64")]
         unsafe { core::arch::asm!("hlt", options(nostack, preserves_flags)) }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("wfi", options(nostack, preserves_flags)) }
     }
 }

@@ -63,21 +63,32 @@ fn main() -> ! {
     // is just a loader, the boot script lives in `rc`). Falls back
     // to the built-in shell if `rc` cannot be executed.
     //
-    // For now the built-in shell starts immediately; rc/bash exec can be
-    // enabled once the exec path is validated.
+    // Plan 9's init respawns the shell when it terminates; here we
+    // respawn a few times (guarding against a crash loop) before
+    // settling on the built-in shell.
     let run_rc = true;
     if run_rc {
-        let (_n, path_buf) = cstr("/rc/bin/rc");
-        let argv_arr: [*const u8; 2] = [path_buf.as_ptr(), core::ptr::null()];
-        let pid = fork();
-        if pid == 0 {
-            // Child: exec the rc script.
-            exec(path_buf.as_ptr(), argv_arr.as_ptr(), 1);
-            // exec failed: exit so init's parent loop continues.
-            exit(127);
-        } else if pid > 0 {
-            // Parent: wait for rc, then continue with the shell fallback.
-            let _ = wait(pid as i32);
+        let mut respawns = 0;
+        while respawns < 3 {
+            let (_n, path_buf) = cstr("/rc/bin/rc");
+            let argv_arr: [*const u8; 2] = [path_buf.as_ptr(), core::ptr::null()];
+            let pid = fork();
+            if pid == 0 {
+                // Child: exec the rc script.
+                exec(path_buf.as_ptr(), argv_arr.as_ptr(), 1);
+                // exec failed: exit so init's parent loop continues.
+                exit(127);
+            } else if pid > 0 {
+                // Parent: wait for rc, then respawn it like init would.
+                let status = wait(pid as i32);
+                print("[init] rc exited with status ");
+                let mut b = [0u8; 16];
+                print(format_u64(status as u64, &mut b));
+                print("\n");
+                respawns += 1;
+            } else {
+                break;
+            }
         }
     }
 
@@ -157,7 +168,10 @@ fn main() -> ! {
             exit(0);
         } else if cmd == "halt" {
             loop {
-                unsafe { asm!("hlt", options(nostack, preserves_flags)) }
+                #[cfg(target_arch = "x86_64")]
+        unsafe { asm!("hlt", options(nostack, preserves_flags)) }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { asm!("wfi", options(nostack, preserves_flags)) }
             }
         } else if cmd == "fork" {
             let p = fork();
@@ -340,7 +354,10 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let _ = core::fmt::write(&mut out, format_args!("{}", info.message()));
     write_str(1, "\n");
     loop {
+        #[cfg(target_arch = "x86_64")]
         unsafe { core::arch::asm!("hlt", options(nostack, preserves_flags)) }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("wfi", options(nostack, preserves_flags)) }
     }
 }
 

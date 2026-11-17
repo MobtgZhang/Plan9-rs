@@ -107,9 +107,19 @@ fn read_line(buf: &mut [u8]) -> usize {
         }
         let b = buf[idx];
         if b == b'\n' || b == b'\r' {
+            out(b"\r\n");
             break;
         }
+        // Local echo so interactive typing is visible.
+        if b == 0x7f || b == 0x08 {
+            if idx > 0 {
+                idx -= 1;
+                out(b"\x08 \x08");
+            }
+            continue;
+        }
         if idx + 1 < buf.len() {
+            out(&[b]);
             idx += 1;
         }
     }
@@ -956,6 +966,15 @@ fn main() -> ! {
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {
+        #[cfg(target_arch = "x86_64")]
         unsafe { core::arch::asm!("hlt", options(nostack, preserves_flags)) }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("wfi", options(nostack, preserves_flags)) }
     }
+}
+
+/// Binary entry point (the kernel jumps here in ring 3).
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    main()
 }
