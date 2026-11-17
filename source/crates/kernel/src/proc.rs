@@ -630,9 +630,16 @@ pub type Pid = u32;
 
 /// A saved ring-3 register/IRET frame.
 ///
-/// The assembly syscall stub copies these fields from the kernel stack
-/// after the user registers and the CPU's IRET frame.  `frame_ptr` points
-/// at the first saved register (R15); the IRET fields start at +80 bytes.
+/// x86_64: the assembly syscall stub copies these fields from the kernel
+/// stack after the user registers and the CPU's IRET frame.  `frame_ptr`
+/// points at the first saved register (R15); the IRET fields start at
+/// +80 bytes.
+///
+/// aarch64: the vector table saves a 272-byte trap frame — x0..x30 at
+/// [8*i], PC at [248], PSTATE at [256], user SP at [264]; the syscall
+/// number travels in x8 and the return value in x0.  This struct is
+/// byte-for-byte that frame, so `kernel_resume_user` can ERET from it.
+#[cfg(not(target_arch = "aarch64"))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SavedUserFrame {
@@ -653,6 +660,65 @@ pub struct SavedUserFrame {
     pub ss: u64,
 }
 
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SavedUserFrame {
+    /// x0..x30; the syscall return value travels in x[0], the syscall
+    /// number in x[8].
+    pub x: [u64; 31],
+    pub pc: u64,
+    pub pstate: u64,
+    pub sp: u64,
+}
+
+impl SavedUserFrame {
+    /// User resume address (RIP / PC).
+    #[inline]
+    pub fn entry(&self) -> u64 {
+        #[cfg(not(target_arch = "aarch64"))]
+        { self.rip }
+        #[cfg(target_arch = "aarch64")]
+        { self.pc }
+    }
+
+    /// User stack pointer (RSP / SP).
+    #[inline]
+    pub fn stack(&self) -> u64 {
+        #[cfg(not(target_arch = "aarch64"))]
+        { self.rsp }
+        #[cfg(target_arch = "aarch64")]
+        { self.sp }
+    }
+
+    /// Set the user resume address.
+    #[inline]
+    pub fn set_entry(&mut self, v: u64) {
+        #[cfg(not(target_arch = "aarch64"))]
+        { self.rip = v; }
+        #[cfg(target_arch = "aarch64")]
+        { self.pc = v; }
+    }
+
+    /// Set the user stack pointer.
+    #[inline]
+    pub fn set_stack(&mut self, v: u64) {
+        #[cfg(not(target_arch = "aarch64"))]
+        { self.rsp = v; }
+        #[cfg(target_arch = "aarch64")]
+        { self.sp = v; }
+    }
+
+    /// Set the syscall return value (RAX / x0).
+    #[inline]
+    pub fn set_ret(&mut self, v: u64) {
+        #[cfg(not(target_arch = "aarch64"))]
+        { self.rax = v; }
+        #[cfg(target_arch = "aarch64")]
+        { self.x[0] = v; }
+    }
+}
+
 /// Label for context switching (setjmp/longjmp style)
 /// Stores the minimal state needed to restore execution
 #[derive(Debug, Clone, Copy, Default)]
@@ -668,6 +734,12 @@ pub struct Label {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
+    /// AArch64-only callee-saved registers x25-x28 (ignored on x86_64,
+    /// where these fields remain 0).
+    pub r25: u64,
+    pub r26: u64,
+    pub r27: u64,
+    pub r28: u64,
 }
 
 impl Label {
@@ -682,6 +754,10 @@ impl Label {
             r13: 0,
             r14: 0,
             r15: 0,
+            r25: 0,
+            r26: 0,
+            r27: 0,
+            r28: 0,
         }
     }
 
@@ -1674,6 +1750,9 @@ pub struct Proc {
     // === Current Working Directory ===
     /// Current working directory channel
     pub dot: Option<Box<dyn Chan>>,
+    /// Canonical textual path of the working directory (empty = "/").
+    /// Kept for `pwd`/`getcwd`; `dot` alone cannot render a path.
+    pub cwd_path: Vec<u8>,
 
     // === Next process in queue ===
     /// Next process in ready/wait queue
@@ -1714,6 +1793,16 @@ pub struct Proc {
     /// Ring-3 register/IRET frame used to resume this process in user mode.
     /// Populated by the syscall stub on each trap from ring 3.
     pub user_frame: Option<SavedUserFrame>,
+
+    // === Credentials ===
+    /// User id (0 = root / hostowner).
+    pub uid: u32,
+    /// Group id.
+    pub gid: u32,
+    /// Supplementary groups.
+    pub groups: alloc::vec::Vec<u32>,
+    /// Login name, used by the shell prompt and `whoami`.
+    pub uname: [u8; 32],
 }
 
 impl Proc {
@@ -1762,6 +1851,7 @@ impl Proc {
             insyscall: false,
             nsyscall: 0,
             dot: None,
+            cwd_path: Vec::new(),
             next: None,
             qnext: None,
             cpu_affinity: CpuMask::all(),
@@ -1774,6 +1864,19 @@ impl Proc {
             exec_stack: 0,
             exec_argc: 0,
             user_frame: None,
+            uid: 0,
+            gid: 0,
+            groups: alloc::vec::Vec::new(),
+            // The console starts as the host owner; `login`/`su` replace it
+            // once a real user authenticates.
+            uname: {
+                let mut n = [0u8; 32];
+                n[0] = b'r';
+                n[1] = b'o';
+                n[2] = b'o';
+                n[3] = b't';
+                n
+            },
         }
     }
 
@@ -1804,6 +1907,12 @@ impl Proc {
     /// - With FLAGFMEM: shares memory
     pub fn fork_groups(&mut self, parent: Option<&Proc>, flags: u32) {
         if let Some(p) = parent {
+            // Credentials are inherited by every child; `su`/`login` change
+            // them explicitly through SYS_SETUID.
+            self.uid = p.uid;
+            self.gid = p.gid;
+            self.groups = p.groups.clone();
+            self.uname = p.uname;
             // Handle file descriptor group based on flags
             if flags & rfork::FLAGFDG == 0 {
                 // Copy file descriptors (default behavior in Plan 9)

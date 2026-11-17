@@ -642,6 +642,10 @@ impl Scheduler {
                         r13: ctx.r13,
                         r14: ctx.r14,
                         r15: ctx.r15,
+                        r25: ctx.r25,
+                        r26: ctx.r26,
+                        r27: ctx.r27,
+                        r28: ctx.r28,
                     };
                 }
             }
@@ -675,6 +679,10 @@ impl Scheduler {
                     r13: proc_label.r13,
                     r14: proc_label.r14,
                     r15: proc_label.r15,
+                    r25: proc_label.r25,
+                    r26: proc_label.r26,
+                    r27: proc_label.r27,
+                    r28: proc_label.r28,
                 };
                 let ctx = Context::from_label(&arch_label);
                 // Restore the saved context: jump to the saved PC with the
@@ -849,6 +857,10 @@ impl Scheduler {
             // Fork process groups based on flags
             proc.fork_groups(Some(p), flags);
 
+            // Inherit the textual working-directory path (`dot` itself is
+            // per-process; userland's `pwd` reads this through GETCWD).
+            proc.cwd_path = p.cwd_path.clone();
+
             // Inherit the parent's segment table (metadata only: the child
             // gets its own page-table copy or shares the parent's, depending
             // on FLAGFMEM below, but /proc should report the same layout).
@@ -868,7 +880,6 @@ impl Scheduler {
                         Some(f) => f,
                         None => return None,
                     };
-                    crate::serial::put_bytes(b"[sched] fork: child pml4 allocated\n");
                     unsafe {
                         if crate::init_loader::copy_kernel_pml4_into(child_pml4).is_none() {
                                 return None;
@@ -895,7 +906,7 @@ impl Scheduler {
             // fork syscall return point with RAX = 0.
             if let Some(parent_frame) = p.user_frame {
                 let mut child_frame = parent_frame;
-                child_frame.rax = 0;
+                child_frame.set_ret(0);
                 proc.user_frame = Some(child_frame);
             }
         } else {
@@ -933,6 +944,10 @@ impl Scheduler {
                 r13: 0,
                 r14: 0,
                 r15: 0,
+                r25: 0,
+                r26: 0,
+                r27: 0,
+                r28: 0,
             };
         }
 

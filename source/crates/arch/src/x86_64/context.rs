@@ -23,6 +23,12 @@ pub struct Label {
     pub r14: u64,
     /// Callee-saved register R15
     pub r15: u64,
+    /// AArch64-only callee-saved registers x25-x28 (unused on x86_64,
+    /// kept 0 for label-layout compatibility).
+    pub r25: u64,
+    pub r26: u64,
+    pub r27: u64,
+    pub r28: u64,
     /// Stack pointer
     pub sp: u64,
     /// Program counter
@@ -39,6 +45,10 @@ impl Label {
             r13: 0,
             r14: 0,
             r15: 0,
+            r25: 0,
+            r26: 0,
+            r27: 0,
+            r28: 0,
             sp: 0,
             pc: 0,
         }
@@ -71,6 +81,11 @@ pub struct Context {
     pub r14: u64,
     /// Callee-saved register R15
     pub r15: u64,
+    /// AArch64-only callee-saved registers x25-x28 (unused on x86_64).
+    pub r25: u64,
+    pub r26: u64,
+    pub r27: u64,
+    pub r28: u64,
     /// Stack pointer
     pub rsp: u64,
     /// Return address / program counter
@@ -117,6 +132,10 @@ impl Context {
             r13: label.r13,
             r14: label.r14,
             r15: label.r15,
+            r25: label.r25,
+            r26: label.r26,
+            r27: label.r27,
+            r28: label.r28,
             rsp: label.sp,
             ret: label.pc,
         }
@@ -131,6 +150,10 @@ impl Context {
             r13: self.r13,
             r14: self.r14,
             r15: self.r15,
+            r25: self.r25,
+            r26: self.r26,
+            r27: self.r27,
+            r28: self.r28,
             sp: self.rsp,
             pc: self.ret,
         }

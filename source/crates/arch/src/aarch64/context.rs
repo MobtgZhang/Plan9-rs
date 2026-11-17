@@ -9,6 +9,7 @@
 //!   * `r13` ← x22
 //!   * `r14` ← x23
 //!   * `r15` ← x24
+//!   * `r25`-`r28` ← x25-x28 (callee-saved, AArch64-only)
 //!   * `rsp` ← SP_EL1 (kernel stack pointer)
 //!   * `ret` ← x30 (LR — the "return address" analog of x86 `[rsp]`)
 
@@ -32,6 +33,14 @@ pub struct Label {
     pub r14: u64,
     /// Callee-saved register x24
     pub r15: u64,
+    /// Callee-saved register x25
+    pub r25: u64,
+    /// Callee-saved register x26
+    pub r26: u64,
+    /// Callee-saved register x27
+    pub r27: u64,
+    /// Callee-saved register x28
+    pub r28: u64,
     /// Stack pointer
     pub sp: u64,
     /// Program counter
@@ -41,7 +50,9 @@ pub struct Label {
 impl Label {
     /// Create a new empty label
     pub const fn new() -> Self {
-        Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, sp: 0, pc: 0 }
+        Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0,
+               r25: 0, r26: 0, r27: 0, r28: 0,
+               sp: 0, pc: 0 }
     }
 
     /// Check if the label has been set
@@ -70,6 +81,14 @@ pub struct Context {
     pub r14: u64,
     /// Callee-saved register x24
     pub r15: u64,
+    /// Callee-saved register x25
+    pub r25: u64,
+    /// Callee-saved register x26
+    pub r26: u64,
+    /// Callee-saved register x27
+    pub r27: u64,
+    /// Callee-saved register x28
+    pub r28: u64,
     /// Stack pointer
     pub rsp: u64,
     /// Return address / program counter
@@ -110,6 +129,10 @@ impl Context {
             r13: label.r13,
             r14: label.r14,
             r15: label.r15,
+            r25: label.r25,
+            r26: label.r26,
+            r27: label.r27,
+            r28: label.r28,
             rsp: label.sp,
             ret: label.pc,
         }
@@ -124,6 +147,10 @@ impl Context {
             r13: self.r13,
             r14: self.r14,
             r15: self.r15,
+            r25: self.r25,
+            r26: self.r26,
+            r27: self.r27,
+            r28: self.r28,
             sp: self.rsp,
             pc: self.ret,
         }
@@ -147,6 +174,10 @@ pub unsafe fn save_context(ctx: &mut Context) -> i32 {
         "str x22, [{ctx}, #24]",
         "str x23, [{ctx}, #32]",
         "str x24, [{ctx}, #40]",
+        "str x25, [{ctx}, #64]",
+        "str x26, [{ctx}, #72]",
+        "str x27, [{ctx}, #80]",
+        "str x28, [{ctx}, #88]",
         // Save stack pointer.
         "mov x9, sp",
         "str x9, [{ctx}, #48]",
@@ -173,6 +204,10 @@ pub unsafe fn restore_context(ctx: &Context, non_zero: i32) -> ! {
         "ldr x22, [{ctx}, #24]",
         "ldr x23, [{ctx}, #32]",
         "ldr x24, [{ctx}, #40]",
+        "ldr x25, [{ctx}, #64]",
+        "ldr x26, [{ctx}, #72]",
+        "ldr x27, [{ctx}, #80]",
+        "ldr x28, [{ctx}, #88]",
         // Restore stack pointer.
         "ldr x9, [{ctx}, #48]",
         "mov sp, x9",
