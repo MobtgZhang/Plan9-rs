@@ -77,7 +77,10 @@ Plan9-Rust/
 │       │   │   └── entry.rs   # kstart
 │       │   └── Cargo.toml
 │       ├── bootloader/
-│       ├── drivers/           # PCI、存储、网络、显示等
+│       ├── cmd/                # Plan 9 /bin 命令集（no_std，x86_64 裸机 ELF）
+│       │   ├── src/bin/        # rc echo ls cat date ...（28 个独立程序）
+│       │   └── src/            # 共享运行时：syscall、行输入、格式化
+│       ├── drivers/            # PCI、存储、网络、显示等
 │       ├── fs/                # 文件系统
 │       ├── ipc/
 │       ├── net/
@@ -214,6 +217,27 @@ Last updated: 2026-11-12
 - [x] `cargo test` 覆盖同步、devfs、rio、fat、regexp
 - [x] 四架构冒烟测试均无 panic
 - [x] 早期 boot 串口输出已收敛到必要诊断信息
+
+### P8 — Plan 9 命令集与 rc shell (✅ done)
+- [x] 新 crate `plan9-cmd`：28 个独立的裸机 `/bin` 程序
+      （rc echo pwd ls cat date sleep wc head tail grep sort uniq cp mv
+       rm mkdir touch ps kill seq du tee tr cut stat time test），
+       每个程序都是 `int 0x80` 门的 no_std ELF，语义对齐
+       `plan9/sys/src/cmd/*` 原作
+- [x] `rc` shell（`term%` 提示符）：`;` 命令列表、`#` 注释、
+      `|` 管道、`<` `>` `>>` 重定向、完整 argv 传递、
+      依次搜索 `/bin`、`/rc/bin`、`/boot`
+- [x] 内核新增 `TIME` 系统调用：CMOS RTC（`crates/kernel/src/rtc.rs`）
+      提供真实日历时间，供 `date` 使用；uptime 供 `time` 使用
+- [x] 内核新增 `GETCWD` 系统调用：`CHDIR` 记录规范化路径，
+      `pwd`/`getwd` 由内核返回（fork 继承）
+- [x] rootfs 目录 `stat` 现在带 `CHDIR` 位，`ls -l` 能渲染目录标志
+- [x] 用户程序栈扩大到 64 KiB；exec 加载器支持 `.bss`（memsz>filesz）
+- [x] 构建工具：全部命令安装进 rootfs `/bin`，`rc` 同时装入
+      `/rc/bin/rc`；ISO 目录树修复 `plan9root/boot/rootfs.cpio`
+      缺失导致 GRUB 找不到 RAM root 的问题
+- [x] init 以 Plan 9 方式 respawn `/rc/bin/rc`（最多 3 次），
+      之后退回内置 shell
 
 ## 许可
 

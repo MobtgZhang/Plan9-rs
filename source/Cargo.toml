@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/*",
+    "uefiboot",
     "crates/grub-cfg",
     "build_tool",
 ]

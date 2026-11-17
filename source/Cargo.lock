@@ -244,6 +244,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "plan9-cmd"
+version = "0.1.0"
+
+[[package]]
 name = "plan9-common"
 version = "0.1.0"
 
@@ -332,6 +336,10 @@ version = "0.1.0"
 dependencies = [
  "plan9-common",
 ]
+
+[[package]]
+name = "plan9-uefiboot"
+version = "0.1.0"
 
 [[package]]
 name = "plan9-userspace"
