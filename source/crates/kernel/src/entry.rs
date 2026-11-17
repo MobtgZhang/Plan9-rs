@@ -285,7 +285,7 @@ pub struct MemoryRegion {
     pub region_type: u32,
 }
 impl MemoryRegion {
-    pub fn is_available(&self) -> bool { self.region_type == 1 }
+    pub fn is_available(&self) -> bool { self.region_type == 7 }
 }
 
 #[derive(Debug, Clone)]
@@ -562,11 +562,14 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     serial::init();
     serial::put_bytes(b"[kernel] after_init\n");
 
-    // Non-x86_64 bring-up: the architecture console is live, so run the
+    // Non-x86_64 fallback bring-up: without a valid Multiboot2 info
+    // pointer (e.g. a plain `-kernel` boot, where x0 holds the DTB
+    // pointer) there is no memory map and no modules, so run the
     // architecture early init + paging bring-up and then park with a
-    // banner. The x86 Multiboot2 machinery below does not apply.
+    // banner.  With a valid loader hand-off we skip this and use the
+    // common bootinfo path below.
     #[cfg(not(target_arch = "x86_64"))]
-    {
+    if magic != MB2_MAGIC && magic != 0x36D7620A {
         // The architecture trait registry stores Box<dyn Arch>; bootstrap
         // the static heap before early_init() so that allocation succeeds.
         serial::put_bytes(b"[kernel] non-x86_64: bootstrap heap\n");
@@ -593,6 +596,17 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     serial::put_bytes(b"[kernel] calling plan9_arch::early_init...\n");
     plan9_arch::early_init();
     serial::put_bytes(b"[kernel] arch early_init done\n");
+
+    // Non-x86_64: GRUB left x86_64 with paging already on, but the UEFI
+    // loader drops us on aarch64 with the MMU disabled (VA = PA).  Bring
+    // the MMU up now — identity mappings keep every kernel address valid,
+    // and the user image will need real translation once we ERET to EL0.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        serial::put_bytes(b"[kernel] non-x86_64: paging_init (enable MMU)\n");
+        plan9_arch::paging_init();
+        serial::put_bytes(b"[kernel] non-x86_64: MMU enabled\n");
+    }
 
     // 2. Validate the Multiboot2 magic. GRUB builds in the wild have been
     //    observed to hand us 0x36D7620A as well as the documented
@@ -819,6 +833,17 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
         plan9_arch::hal::idt::start_interrupts();
     }
 
+    // aarch64: bring up the GIC and arm the generic-timer tick so the
+    // scheduler gets preemption points in user mode.
+    #[cfg(target_arch = "aarch64")]
+    {
+        serial::put_bytes(b"[kstart] gic::init\n");
+        crate::trap::init_interrupts_aarch64();
+        plan9_arch::aarch64::timer::set_oneshot(1);
+        serial::put_bytes(b"[kstart] enabling interrupts\n");
+        unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
+    }
+
     // Step 5 — load init and switch to user mode.
     // Bring the other CPUs online first: they park until the scheduler is
     // made multi-CPU, but bring-up is the hard part of SMP.
@@ -928,6 +953,11 @@ fn install_rootfs(boot: &BootInfo) {
         crate::vfs::set_root_chan(chan);
         serial::put_bytes(b"[kstart] root channel installed\n");
     }
+
+    // Seed /etc/passwd, /etc/group and the home directories.  This runs
+    // after the archive import so that a shipped /etc is never clobbered.
+    crate::upasswd::bootstrap();
+    serial::put_bytes(b"[kstart] user database ready\n");
 }
 
 /// Bind the kernel devices into the Plan 9 `/dev` namespace.
@@ -1034,18 +1064,34 @@ fn switch_to_user(image: crate::init_loader::InitImage) -> ! {
     let frame_ptr = frame_page as *mut u64;
 
     unsafe {
-        // scratch (consumed by the trampoline's `add rsp, 8`).
-        core::ptr::write_volatile(frame_ptr.add(0), 0);
-        // RIP
-        core::ptr::write_volatile(frame_ptr.add(1), image.entry);
-        // CS (user)
-        core::ptr::write_volatile(frame_ptr.add(2), switch_to_user::USER_CS as u64);
-        // RFLAGS
-        core::ptr::write_volatile(frame_ptr.add(3), switch_to_user::USER_RFLAGS_INIT);
-        // RSP
-        core::ptr::write_volatile(frame_ptr.add(4), image.user_sp);
-        // SS (user)
-        core::ptr::write_volatile(frame_ptr.add(5), switch_to_user::USER_DS as u64);
+        #[cfg(target_arch = "x86_64")]
+        {
+            // scratch (consumed by the trampoline's `add rsp, 8`).
+            core::ptr::write_volatile(frame_ptr.add(0), 0);
+            // RIP
+            core::ptr::write_volatile(frame_ptr.add(1), image.entry);
+            // CS (user)
+            core::ptr::write_volatile(frame_ptr.add(2), switch_to_user::USER_CS as u64);
+            // RFLAGS
+            core::ptr::write_volatile(frame_ptr.add(3), switch_to_user::USER_RFLAGS_INIT);
+            // RSP
+            core::ptr::write_volatile(frame_ptr.add(4), image.user_sp);
+            // SS (user)
+            core::ptr::write_volatile(frame_ptr.add(5), switch_to_user::USER_DS as u64);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // aarch64 trampoline frame layout (see `build_user_frame`):
+            // [0] scratch, [1] entry, [2] pstate, [3] user SP.
+            // Build through the arch helper so the pstate bits are set
+            // correctly (EL0t, SP_EL0 active, interrupts enabled).
+            switch_to_user::build_user_frame(
+                frame_page,
+                image.entry,
+                image.user_sp,
+                0, // root table installed separately by the trampoline
+            );
+        }
     }
 
     let pml4_phys = image.pml4.as_u64();

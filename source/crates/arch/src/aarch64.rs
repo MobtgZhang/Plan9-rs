@@ -162,30 +162,31 @@ fn program_mmu_config() {
     let mair: u64 = 0xFF | (0x00u64 << 8);
     write_sysreg!("MAIR_EL1", mair);
 
-    // TCR_EL1 fields:
+    // TCR_EL1 fields (ARMv8 layout):
     //   T0SZ (bits 5:0)    = 16  → 48-bit lower VA range
     //   IRGN0 (bits 9:8)   = 01  → write-back
     //   ORGN0 (bits 11:10) = 01  → write-back
     //   SH0 (bits 13:12)   = 11  → inner shareable
     //   TG0 (bits 15:14)   = 00  → 4 KiB granule
-    //   IPS (bits 34:32)   = 010 → 40-bit PA (1 TiB)
-    //   T1SZ (bits 39:32)  = 16  → 48-bit upper VA range (8-bit field;
-    //        overlaps IPS [34:32] which we leave 0 → 4 GiB PA, enough
-    //        for QEMU virt default RAM layouts)
-    //   TG1 (bits 31:30)   = 10  → 4 KiB granule (TG1 encoding differs!)
+    //   T1SZ (bits 21:16)  = 16  → 48-bit upper VA range
+    //   TG1 (bits 31:30)   = 10  → 4 KiB granule (TG1 encoding differs
+    //        from TG0: 4 KiB is 0b10 here!)
     //   SH1 (bits 29:28)   = 11  → inner shareable
     //   ORGN1 (bits 27:26) = 01  → write-back
     //   IRGN1 (bits 25:24) = 01  → write-back
+    //   IPS (bits 34:32)   = 010 → 40-bit PA (1 TiB) — must cover the
+    //        QEMU virt PCIe ECAM at PA 0x40_1000_0000 (258 GiB).
     let t0_half: u64 = 16              // T0SZ
         | (0b01 << 8)                  // IRGN0
         | (0b01 << 10)                 // ORGN0
         | (0b11 << 12)                 // SH0
         | (0b00 << 14);                // TG0 = 4K
-    let t1_half: u64 = (16 << 32)      // T1SZ
+    let t1_half: u64 = (16 << 16)      // T1SZ (bits 21:16)
+        | (0b10 << 30)                 // TG1 = 4K (bits 31:30, inverted encoding)
         | (0b01 << 24)                 // IRGN1
         | (0b01 << 26)                 // ORGN1
         | (0b11 << 28)                 // SH1
-        | (0b00 << 30);                // TG1 = 4K
+        | (0b010 << 32);               // IPS = 40-bit PA (1 TiB)
     write_sysreg!("TCR_EL1", t0_half | t1_half);
 }
 
@@ -263,6 +264,17 @@ pub fn paging_init() {
         // GIC at 0x0800_0000). Map it as Device-nGnRnE so the UART remains
         // accessible after the MMU is enabled.
         (*l1).0[0] = paging::PteFlags::KERNEL_RW.attr_dev().bits();
+
+        // PCIe ECAM window (QEMU virt: VIRT_PCIE_ECAM = 0x4010_0000_0000,
+        // a 256 MiB configuration space window inside the 1 GiB block at
+        // 0x4000_0000_0000). Map that block identity as Device memory so
+        // the PCI configuration readers survive the MMU being enabled.
+        // The entry lives in the same L1 table as the identity blocks
+        // below, so `copy_kernel_half` (L0 index 0) propagates it into
+        // every per-process address space.
+        const ECAM_BLOCK: usize = (0x40_1000_0000u64 >> 30) as usize; // = 257
+        (*l1).0[ECAM_BLOCK] = ((ECAM_BLOCK as u64) << 30)
+            | paging::PteFlags::KERNEL_RW.attr_dev().bits();
 
         for i in 0..IDENTITY_GIB {
             let vi = paging::PageTableIndices::from_virt(plan9_common::types::VirtAddr::new(
