@@ -8,6 +8,8 @@
 //! (or through `super::mmio`) so no assembly or raw pointer arithmetic is
 //! needed outside the `plan9_arch` crate.
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 /// Physical base of the PL011 on QEMU's virt machine.
 pub const UART0_BASE: u64 = 0x0900_0000;
 
@@ -30,6 +32,25 @@ mod fr {
     pub const RXFE: u32 = 1 << 4;   // Receive FIFO empty
     pub const TXFF: u32 = 1 << 5;   // Transmit FIFO full
     pub const BUSY: u32 = 1 << 3;   // UART busy
+}
+
+/// Last byte transmitted on this UART.  QEMU's virt machine (and many
+/// serial backends) loop TX back to RX, so the kernel's own echo is
+/// received as if it were fresh keyboard input.  `getc()` suppresses a
+/// received byte equal to `LAST_TX_BYTE` (then clears the tracker so a
+/// legitimate repeated character typed by the user is still delivered on
+/// the next call).
+pub static LAST_TX_BYTE: AtomicU8 = AtomicU8::new(0);
+
+/// Read and clear the last-transmitted byte tracker.  Used by the console
+/// input path to suppress echo loopback on bytes buffered in `SER_RX`.
+pub fn take_last_tx_byte() -> u8 {
+    LAST_TX_BYTE.swap(0, Ordering::AcqRel)
+}
+
+/// Peek at the last-transmitted byte without clearing it.
+pub fn last_tx_byte() -> u8 {
+    LAST_TX_BYTE.load(Ordering::Acquire)
 }
 
 /// Configured baud rate. QEMU's model ignores the divisors, but real
@@ -73,6 +94,7 @@ pub fn init() {
 
 /// Transmit one byte (blocking until the TX FIFO has room).
 pub fn putc(b: u8) {
+    LAST_TX_BYTE.store(b, Ordering::Release);
     unsafe {
         while read(reg::FR) & fr::TXFF != 0 {
             core::hint::spin_loop();
@@ -93,12 +115,26 @@ pub fn write_bytes(bytes: &[u8]) {
 }
 
 /// Receive one byte if available (non-blocking).
+///
+/// Suppresses UART echo loopback: when QEMU or the serial backend loops
+/// TX back to RX, the kernel's own echo is received as input.  A received
+/// byte equal to `LAST_TX_BYTE` is discarded (the tracker is cleared so a
+/// legitimate repeated character typed by the user is delivered on the
+/// next call).
 pub fn getc() -> Option<u8> {
     unsafe {
-        if read(reg::FR) & fr::RXFE != 0 {
-            None
-        } else {
-            Some((read(reg::DR) & 0xFF) as u8)
+        loop {
+            if read(reg::FR) & fr::RXFE != 0 {
+                return None;
+            }
+            let b = (read(reg::DR) & 0xFF) as u8;
+            let last_tx = LAST_TX_BYTE.load(Ordering::Acquire);
+            if b == last_tx && last_tx != 0 {
+                // Likely our own echo: suppress and try the next byte.
+                LAST_TX_BYTE.store(0, Ordering::Release);
+                continue;
+            }
+            return Some(b);
         }
     }
 }
