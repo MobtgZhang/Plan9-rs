@@ -47,6 +47,15 @@ fn record_user_seg(tag: u8, base: u64, top: u64) {
 /// relocate the whole image uniformly to 1 GiB (USER_BASE).  This keeps the
 /// kernel's low identity mapping (0..64 MiB) intact in the user PML4 and
 /// prevents user program pages from overwriting kernel code/IDT/GDT pages.
+/// Base of the relocated user program image.
+///
+/// x86_64: 1 GiB — just above the preserved low identity map.
+/// aarch64: 512 GiB — the boot root's L0[0] covers the whole first 512 GiB
+/// (its L1 table holds the Device/RAM/ECAM identity blocks), so the user
+/// image must live in L0[1] to avoid colliding with those entries.
+#[cfg(target_arch = "aarch64")]
+const USER_LOAD_BASE: u64 = 0x0000_0080_0000_0000; // 512 GiB
+#[cfg(not(target_arch = "aarch64"))]
 const USER_LOAD_BASE: u64 = 0x0000_0000_4000_0000;
 
 /// Where the user stack lives.
@@ -60,6 +69,110 @@ const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_USER:     u64 = 1 << 2;
 const PTE_PS:       u64 = 1 << 7;   // 2 MiB / 1 GiB huge-page bit
 const PTE_NX:       u64 = 1 << 63;
+
+// ============================================================================
+// AArch64 descriptor translation
+//
+// The loader's flag vocabulary is x86_64 (PRESENT | WRITABLE | USER | NX,
+// plus a PTE_RDONLY marker at bit 7 written by the exec loader).  On
+// aarch64 those bit positions mean different things, so every entry is
+// routed through `leaf_flags` (final-level descriptors) or given proper
+// table descriptors (`PTE_MID_FLAGS`):
+//
+//   bit 0        Valid
+//   bit 1        Table/Block select — set for level-3 (leaf) descriptors
+//                and for L0–L2 *table* descriptors; clear for 1 GiB / 2 MiB
+//                block descriptors.
+//   bits [4:2]   AttrIndx (MAIR) — must be 0 (Normal cacheable) for user
+//                memory; the x86 PTE_USER bit (1<<2) would otherwise select
+//                Device memory, which is execute-never.
+//   bit 6        AP[1] — EL0 accessibility.
+//   bit 7        AP[2] — read-only.
+//   bit 10       AF (access flag) — required, or the first access faults.
+//   bit 54       UXN.
+// ============================================================================
+
+/// Intermediate (L0–L2) table descriptor flags.
+#[cfg(target_arch = "aarch64")]
+const PTE_MID_FLAGS: u64 = PTE_PRESENT | (1 << 1); // Valid + Table
+#[cfg(not(target_arch = "aarch64"))]
+const PTE_MID_FLAGS: u64 = PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+
+/// aarch64 access flag (required on leaf descriptors).
+#[cfg(target_arch = "aarch64")]
+pub const PTE_AF:       u64 = 1 << 10;
+#[cfg(not(target_arch = "aarch64"))]
+pub const PTE_AF:       u64 = 0;
+
+/// aarch64 AP[1] (EL0 accessibility), set for user pages.
+#[cfg(target_arch = "aarch64")]
+const PTE_EL0:      u64 = 1 << 6;
+#[cfg(not(target_arch = "aarch64"))]
+const PTE_EL0:      u64 = 0;
+
+/// aarch64 UXN (bit 54) where x86 uses NX (bit 63).
+#[cfg(target_arch = "aarch64")]
+const PTE_UXN:      u64 = 1 << 54;
+#[cfg(not(target_arch = "aarch64"))]
+const PTE_UXN:      u64 = 0;
+
+/// aarch64 AP[2] (read-only) marker in the caller flag vocabulary; a
+/// no-op on x86_64 (where bit 7 is the PAT bit, left clear for user
+/// pages).
+#[cfg(target_arch = "aarch64")]
+const PTE_RDONLY:   u64 = 1 << 7;
+#[cfg(not(target_arch = "aarch64"))]
+const PTE_RDONLY:   u64 = 0;
+
+/// Read-only marker in the caller flag vocabulary (used by the exec
+/// loader in `syscall.rs`).  No-op on x86_64.
+pub const PTE_RDONLY_CALLER: u64 = PTE_RDONLY;
+
+/// Translate an x86-style leaf flag set into arch-correct descriptor bits.
+///
+/// `flags` uses the x86 vocabulary: PRESENT | WRITABLE(bit1) | USER(bit2) |
+/// RDONLY(bit7) | NX(bit63).  On aarch64 this maps to Valid + leaf + AF +
+/// AP[1] (EL0) + AP[2] (read-only) + UXN, with AttrIndx left at 0 (Normal
+/// cacheable) so user code stays executable.
+#[inline]
+fn leaf_flags(flags: u64) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut f = PTE_PRESENT          // Valid
+            | (1 << 1)                   // leaf (level-3) descriptor
+            | PTE_AF                     // Access flag
+            | 0b11 << 8;                 // SH = inner-shareable
+        if flags & PTE_USER != 0 {
+            f |= PTE_EL0;                // AP[1]: accessible at EL0
+        }
+        if flags & PTE_WRITABLE == 0 || flags & PTE_RDONLY != 0 {
+            f |= 1 << 7;                 // AP[2]: read-only
+        }
+        if flags & PTE_NX != 0 {
+            f |= PTE_UXN;                // UXN
+        }
+        f
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        flags
+    }
+}
+
+/// True when a descriptor read at an intermediate level is a block/huge
+/// entry rather than a next-level table pointer (aarch64: TABLE bit clear;
+/// x86: PS bit set).
+#[inline]
+fn is_block_desc(desc: u64) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        desc & (1 << 1) == 0
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        desc & PTE_PS != 0
+    }
+}
 
 /// ELF64 program header types we care about.
 const PT_LOAD: u32 = 1;
@@ -159,7 +272,7 @@ pub fn load_init(boot: &BootInfo) -> Option<InitImage> {
             };
             let vaddr = stack_base + page * PAGESIZE as u64;
             if map_user_page(new_pml4, vaddr, phys.as_u64(),
-                             PTE_PRESENT | PTE_WRITABLE | PTE_USER).is_none() {
+                             PTE_PRESENT | PTE_WRITABLE | PTE_USER | PTE_AF).is_none() {
                 crate::serial::put_bytes(b"[init_loader] stack map failed\n");
                 return None;
             }
@@ -171,6 +284,34 @@ pub fn load_init(boot: &BootInfo) -> Option<InitImage> {
     crate::serial::put_bytes(b"[init_loader] entry=");
     crate::serial::put_hex_u64(entry);
     crate::serial::put_bytes(b"\n");
+
+    // DEBUG: walk the user root table to the entry page and dump its
+    // first 32 bytes via the TTBR1 direct-map window, so the loaded
+    // contents can be compared with the ELF file bytes.
+    unsafe {
+        let (i4, i3, i2, i1) = virt_indices(entry);
+        let l1 = read_pte(new_pml4.as_u64(), i4) & 0x000F_FFFF_FFFF_F000;
+        let pd = read_pte(l1, i3) & 0x000F_FFFF_FFFF_F000;
+        let pt = read_pte(pd, i2) & 0x000F_FFFF_FFFF_F000;
+        let pte = read_pte(pt, i1);
+        crate::serial::put_bytes(b"[dbg] l1=");
+        crate::serial::put_hex_u64(l1);
+        crate::serial::put_bytes(b" pte=");
+        crate::serial::put_hex_u64(pte);
+        crate::serial::put_bytes(b"\n");
+        let page_phys = pte & 0x000F_FFFF_FFFF_F000;
+        // Read via the boot root's RAM identity map (VA = PA) — the
+        // TTBR1 direct-map window only covers the first identity blocks.
+        let win = page_phys + (entry & 0xFFF);
+        crate::serial::put_bytes(b"[dbg] entry bytes:");
+        let p = win as *const u8;
+        const HEX: [u8; 16] = *b"0123456789abcdef";
+        for k in 0..32 {
+            let b = p.add(k).read_volatile();
+            crate::serial::put_bytes(&[HEX[(b >> 4) as usize], HEX[(b & 0xF) as usize], b' ']);
+        }
+        crate::serial::put_bytes(b"\n");
+    }
 
     Some(InitImage {
         pml4:    new_pml4,
@@ -216,37 +357,37 @@ pub unsafe fn map_user_page(
 
     let pml4_base = pml4.as_u64();
     let pml4e = read_pte(pml4_base, i4);
-    let pdpt_phys = if pml4e & PTE_PRESENT != 0 {
+    let pdpt_phys = if pml4e & PTE_PRESENT != 0 && !is_block_desc(pml4e) {
         pml4e & 0x000F_FFFF_FFFF_F000
     } else {
         let new = alloc_pte_page(pml4)?;
-        write_pte(pml4_base, i4, new | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+        write_pte(pml4_base, i4, new | PTE_MID_FLAGS);
         new
     };
 
     let pdpte = read_pte(pdpt_phys, i3);
-    let pd_phys = if (pdpte & PTE_PRESENT) != 0 && (pdpte & PTE_PS) == 0 {
+    let pd_phys = if (pdpte & PTE_PRESENT) != 0 && !is_block_desc(pdpte) {
         pdpte & 0x000F_FFFF_FFFF_F000
     } else {
         // Allocate a fresh PD, replacing either a missing entry or a 1 GiB
         // huge-page entry.
         let new = alloc_pte_page(pml4)?;
-        write_pte(pdpt_phys, i3, new | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+        write_pte(pdpt_phys, i3, new | PTE_MID_FLAGS);
         new
     };
 
     let pde = read_pte(pd_phys, i2);
-    let pt_phys = if (pde & PTE_PRESENT) != 0 && (pde & PTE_PS) == 0 {
+    let pt_phys = if (pde & PTE_PRESENT) != 0 && !is_block_desc(pde) {
         pde & 0x000F_FFFF_FFFF_F000
     } else {
         // Allocate a fresh PT, replacing either a missing entry or a 2 MiB
         // huge-page entry.
         let new = alloc_pte_page(pml4)?;
-        write_pte(pd_phys, i2, new | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+        write_pte(pd_phys, i2, new | PTE_MID_FLAGS);
         new
     };
 
-    write_pte(pt_phys, i1, paddr | flags);
+    write_pte(pt_phys, i1, paddr | leaf_flags(flags));
     let mut cache = TABLE_CACHE.lock();
     cache.push(pt_phys);
     Some(())
@@ -281,37 +422,64 @@ pub unsafe fn copy_kernel_pml4_into(new_pml4: PhysAddr) -> Option<()> {
     if (boot_low & PTE_PRESENT) == 0 {
         return None;
     }
-    let boot_pdpt = boot_low & 0x000F_FFFF_FFFF_F000;
 
-    // Keep the kernel's 0..1 GiB identity map (PDPT slot 0) but do not
-    // reuse the boot PDPT page itself; slot 1 belongs to the user image.
-    let new_pdpt = alloc_pte_page(new_pml4)?;
-    let low_pdpt0 = read_pte(boot_pdpt, 0);
-    if (low_pdpt0 & PTE_PRESENT) == 0 {
-        return None;
+    // ------------------------------------------------------------------
+    // aarch64: the boot root's L0[0] points at an L1 table whose entries
+    // are 1 GiB *block* descriptors — the low Device window (PL011, GIC),
+    // the RAM identity blocks, and the PCIe ECAM block.  Copy the whole
+    // L1 table into a fresh table and link it with a proper table
+    // descriptor (Valid + TABLE bit): the kernel keeps executing from its
+    // identity mapping (kernel image, stacks, trap code) after the root
+    // switch, and the ECAM stays reachable for run-time PCI access.
+    // ------------------------------------------------------------------
+    #[cfg(target_arch = "aarch64")]
+    {
+        let src_l1 = boot_low & 0x000F_FFFF_FFFF_F000;
+        let new_l1 = alloc_pte_page(new_pml4)?;
+        for i in 0..512usize {
+            let v = read_pte(src_l1, i);
+            write_pte(new_l1, i, v);
+        }
+        write_pte(dst, 0, new_l1 | PTE_MID_FLAGS);
+        return Some(());
     }
-    write_pte(new_pdpt, 0, low_pdpt0);
 
-    // Preserve the boot kernel's PCI/MMIO mapping at PDPT slot 2
-    // (0x80000000..0xBFFFFFFF).  Without this, the AHCI BAR at
-    // 0x810c4000 is unavailable while a syscall runs in the user PML4,
-    // and filesystem reads fault after user mode starts.
-    let low_pdpt2 = read_pte(boot_pdpt, 2);
-    if (low_pdpt2 & PTE_PRESENT) != 0 {
-        write_pte(new_pdpt, 2, low_pdpt2);
-    }
+    // ------------------------------------------------------------------
+    // x86_64: keep the kernel's 0..1 GiB identity map (PDPT slot 0) but
+    // do not reuse the boot PDPT page itself; slot 1 belongs to the user
+    // image.
+    // ------------------------------------------------------------------
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let boot_pdpt = boot_low & 0x000F_FFFF_FFFF_F000;
+        let new_pdpt = alloc_pte_page(new_pml4)?;
+        let low_pdpt0 = read_pte(boot_pdpt, 0);
+        if (low_pdpt0 & PTE_PRESENT) == 0 {
+            return None;
+        }
+        write_pte(new_pdpt, 0, low_pdpt0);
 
-    // Dedicated PD for the user region 1..2 GiB.  Slot 1 is not inherited
-    // from GRUB, so no huge 2 MiB PDEs can appear there.
-    let new_pd = alloc_pte_page(new_pml4)?;
-    write_pte(new_pdpt, 1, new_pd | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+        // Preserve the boot kernel's PCI/MMIO mapping at PDPT slot 2
+        // (0x80000000..0xBFFFFFFF).  Without this, the AHCI BAR at
+        // 0x810c4000 is unavailable while a syscall runs in the user PML4,
+        // and filesystem reads fault after user mode starts.
+        let low_pdpt2 = read_pte(boot_pdpt, 2);
+        if (low_pdpt2 & PTE_PRESENT) != 0 {
+            write_pte(new_pdpt, 2, low_pdpt2);
+        }
 
-    write_pte(dst, 0, new_pdpt | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+        // Dedicated PD for the user region 1..2 GiB.  Slot 1 is not inherited
+        // from GRUB, so no huge 2 MiB PDEs can appear there.
+        let new_pd = alloc_pte_page(new_pml4)?;
+        write_pte(new_pdpt, 1, new_pd | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
 
-    // High-half kernel mirror.
-    for i in 256..512 {
-        let v = read_pte(boot, i);
-        write_pte(dst, i, v);
+        write_pte(dst, 0, new_pdpt | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+
+        // High-half kernel mirror.
+        for i in 256..512 {
+            let v = read_pte(boot, i);
+            write_pte(dst, i, v);
+        }
     }
 
     Some(())
@@ -326,28 +494,28 @@ pub unsafe fn copy_user_mappings(parent_pml4: u64, child_pml4: PhysAddr) -> Opti
 
     for i4 in 0..256usize {
         let pml4e = read_pte(parent_pml4, i4);
-        if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
+        if pml4e & PTE_PRESENT == 0 || is_block_desc(pml4e) {
             continue;
         }
         let pdpt = pml4e & 0x000F_FFFF_FFFF_F000;
 
         for i3 in 0..512usize {
             let pdpte = read_pte(pdpt, i3);
-            if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
+            if pdpte & PTE_PRESENT == 0 || is_block_desc(pdpte) {
                 continue;
             }
             let pd = pdpte & 0x000F_FFFF_FFFF_F000;
 
             for i2 in 0..512usize {
                 let pde = read_pte(pd, i2);
-                if pde & PTE_PRESENT == 0 || pde & PTE_PS != 0 {
+                if pde & PTE_PRESENT == 0 || is_block_desc(pde) {
                     continue;
                 }
                 let pt = pde & 0x000F_FFFF_FFFF_F000;
 
                 for i1 in 0..512usize {
                     let pte = read_pte(pt, i1);
-                    if pte & PTE_PRESENT == 0 || pte & PTE_PS != 0 {
+                    if pte & PTE_PRESENT == 0 {
                         continue;
                     }
 
@@ -528,8 +696,12 @@ unsafe fn map_elf_segments(pml4: PhysAddr, module: &crate::entry::RawModuleInfo)
             }
 
             // Build PTE flags from program-header flags.
-            let mut flags = PTE_PRESENT | PTE_USER;
-            if ph.p_flags & 0x2 != 0 { flags |= PTE_WRITABLE; }
+            let mut flags = PTE_PRESENT | PTE_USER | PTE_AF;
+            if ph.p_flags & 0x2 != 0 {
+                flags |= PTE_WRITABLE;
+            } else {
+                flags |= PTE_RDONLY;
+            }
             if ph.p_flags & 0x1 == 0 { flags |= PTE_NX; }
             map_user_page(pml4, cur_vaddr, phys.as_u64(), flags)?;
             cur_vaddr += PAGESIZE as u64;
