@@ -39,10 +39,11 @@ pub fn init_timer() {
         // QEMU always provides a nonzero CNTFRQ, but be defensive.
         FRQ.store(24_000_000, Ordering::Relaxed);
     }
-    // Disable the comparator interrupt; the kernel polls `current_tick`.
+    // Disable the comparator interrupt; the kernel polls `current_tick`
+    // between one-shot rearms.
     unsafe {
-        // CNTP_CTL: bit0 Enable=0, bit1 IMask=1 (masked)
-        write_sysreg!("CNTP_CTL_EL0", 0x2u64);
+        // CNTV_CTL: bit0 Enable=0, bit1 IMask=1 (masked)
+        write_sysreg!("CNTV_CTL_EL0", 0x2u64);
     }
     super::cpu::isb();
 }
@@ -75,14 +76,18 @@ pub fn ms_since_boot() -> u64 {
 
 /// Program a one-shot deadline `ticks` scheduler ticks from now.
 /// The comparator interrupt will fire when it expires (if unmasked).
+///
+/// Uses the *virtual* timer (CNTV) whose PPI 27 (= GIC interrupt id 27)
+/// is the one routed by the GIC; the physical timer's PPI would need a
+/// different GIC id.
 pub fn set_oneshot(ticks: u64) {
     let f = frequency();
     let delta = (ticks * f / HZ).max(1);
     unsafe {
-        // CNTP_TVAL: countdown ticks from now.
-        write_sysreg!("CNTP_TVAL_EL0", delta);
+        // CNTV_TVAL: countdown ticks from now.
+        write_sysreg!("CNTV_TVAL_EL0", delta);
         // Enable + unmask: bit0 Enable=1, bit1 IMask=0.
-        write_sysreg!("CNTP_CTL_EL0", 0x1u64);
+        write_sysreg!("CNTV_CTL_EL0", 0x1u64);
     }
     super::cpu::isb();
 }

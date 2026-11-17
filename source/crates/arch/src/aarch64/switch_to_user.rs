@@ -22,7 +22,12 @@ use crate::write_sysreg;
 
 /// Initial user PSTATE: EL0 with SP_EL0, all DAIF inherited cleared
 /// (interrupts enabled). Bits: [3:0]=0b0100 EL0h, [9:6]=0 DAIF clear.
-pub const USER_PSTATE_INIT: u64 = 0b0100;
+/// Initial SPSR for user mode.
+///
+/// Bits [3:0] = 0b0000 selects EL0t (user mode with SP_EL0).  With no
+/// DAIF bits set, interrupts are enabled on the ERET.  (0b0100 would be
+/// EL1t — the kernel must never ERET into EL1 to run user code.)
+pub const USER_PSTATE_INIT: u64 = 0b0000;
 
 /// Selectors kept for API parity with the x86_64 module (AArch64 has no
 /// GDT; these are informational only).
@@ -90,42 +95,42 @@ pub unsafe fn switch_to_user_trampoline(pml4_phys: u64, frame_ptr: u64) -> ! {
 
 /// Resume a user process after a kernel-mode syscall/trap.
 ///
-/// `frame_ptr` points to a full trap frame saved by the vector entry
-/// code; `pml4_phys` is the process root table. Equivalent to the x86
-/// `kernel_resume_user(frame_ptr, pml4_phys)` used after a syscall.
+/// `frame_ptr` points to a full 272-byte trap frame saved by the vector
+/// entry code (x0..x30 at [8*i], PC at [248], PSTATE at [256], user SP
+/// at [264]); `pml4_phys` is the process root table. Equivalent to the
+/// x86 `kernel_resume_user(frame_ptr, pml4_phys)` used after a syscall.
 ///
 /// # Safety
 /// Never returns.
 pub unsafe fn kernel_resume_user(frame_ptr: u64, pml4_phys: u64) -> ! {
     write_sysreg!("TTBR0_EL1", pml4_phys);
     super::cpu::dsb_sy();
-    // The trap frame ends with { pc, pstate, sp } — restore and eret.
     core::arch::asm!(
-        // frame_ptr is in x0 (SysV-ish: first argument).
-        "mov x19, x0",
-        // Restore general registers x0-x18 (skip x19 = frame base).
-        "ldp x0, x1, [x19]",
-        "ldp x2, x3, [x19, #16]",
-        "ldp x4, x5, [x19, #32]",
-        "ldp x6, x7, [x19, #48]",
-        "ldp x8, x9, [x19, #64]",
-        "ldp x10, x11, [x19, #80]",
-        "ldp x12, x13, [x19, #96]",
-        "ldp x14, x15, [x19, #112]",
-        "ldp x16, x17, [x19, #128]",
-        "ldp x18, x20, [x19, #144]",
-        "ldp x21, x22, [x19, #160]",
-        "ldp x23, x24, [x19, #176]",
-        "ldp x25, x26, [x19, #192]",
-        "ldp x27, x28, [x19, #208]",
-        "ldp x29, x30, [x19, #224]",
-        // pc, pstate, sp are the last three words.
-        "ldr x20, [x19, #248]",  // pc
-        "ldr x21, [x19, #256]",  // pstate
-        "ldr x22, [x19, #264]",  // sp
-        "msr elr_el1, x20",
-        "msr spsr_el1, x21",
+        // The frame base lives in x20; its saved value ([base+160]) is
+        // reloaded last, after every other read through the base.
+        "mov x20, x0",
+        "ldp x0, x1, [x20]",
+        "ldp x2, x3, [x20, #16]",
+        "ldp x4, x5, [x20, #32]",
+        "ldp x6, x7, [x20, #48]",
+        "ldp x8, x9, [x20, #64]",
+        "ldp x10, x11, [x20, #80]",
+        "ldp x12, x13, [x20, #96]",
+        "ldp x14, x15, [x20, #112]",
+        "ldp x16, x17, [x20, #128]",
+        "ldp x18, x19, [x20, #144]",
+        "ldr x21, [x20, #168]",
+        "ldr x22, [x20, #264]",  // user SP
+        "ldr x23, [x20, #248]",  // PC
+        "ldr x24, [x20, #256]",  // PSTATE
+        "ldp x25, x26, [x20, #200]",
+        "ldp x27, x28, [x20, #216]",
+        "ldr x29, [x20, #232]",
+        "ldr x30, [x20, #240]",
+        "ldr x20, [x20, #160]",  // x20 last (base no longer needed)
         "msr sp_el0, x22",
+        "msr elr_el1, x23",
+        "msr spsr_el1, x24",
         "eret",
         in("x0") frame_ptr,
         options(noreturn, nostack)
