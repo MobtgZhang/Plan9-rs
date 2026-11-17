@@ -509,11 +509,26 @@ pub fn serial_puts(s: &[u8]) {
 ///
 /// Bytes are served from the software RX buffer first (see `poll_serial_rx`),
 /// then straight from the UART.
+///
+/// On AArch64 the QEMU virt machine (and many serial backends) loop TX back
+/// to RX, so the kernel's own echo is received as if it were fresh keyboard
+/// input.  A received byte equal to the last transmitted byte is discarded
+/// as echo (the tracker is cleared so a legitimate repeated character typed
+/// by the user is still delivered on the next call).
 pub fn serial_getchar() -> Option<u8> {
     {
         let mut buf = SER_RX.lock();
         if !buf.is_empty() {
-            return Some(buf.remove(0));
+            let b = buf.remove(0);
+            #[cfg(target_arch = "aarch64")]
+            {
+                let last_tx = crate::plan9_arch::hal::console::last_tx_byte();
+                if b == last_tx && last_tx != 0 {
+                    crate::plan9_arch::hal::console::take_last_tx_byte();
+                    return serial_getchar();
+                }
+            }
+            return Some(b);
         }
     }
     unsafe {
