@@ -313,7 +313,10 @@ fn arch_log(s: &[u8]) {
         unsafe {
             // Preserve RDX: the exception handler receives `rip` in RDX and
             // must not overwrite it while emitting diagnostics.  R10 is a
-            // scratch register used only inside the asm block.
+            // scratch register used only inside the asm block.  `volatile`
+            // is required: these blocks write to an I/O port, which the
+            // compiler cannot see as a side effect, so unmarked asm! calls
+            // may be reordered or removed entirely.
             core::arch::asm!(
                 "mov r10w, dx",
                 "mov dx, 0x3F8",
@@ -355,6 +358,21 @@ pub unsafe extern "C" fn default_exception_handler(
     arch_log(b" error=");
     arch_log_dec(error_code);
     arch_log_hex(b" rip=", rip);
+    // CR2 (page-fault address) and DR state, for #PF/#DB diagnosis.
+    let mut cr2: u64;
+    core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
+    arch_log_hex(b" cr2=", cr2);
+    if vector == 1 {
+        let mut dr6: u64;
+        let mut dr7: u64;
+        core::arch::asm!(
+            "mov {}, dr6",
+            "mov {}, dr7",
+            out(reg) dr6, out(reg) dr7, options(nomem, nostack)
+        );
+        arch_log_hex(b" dr6=", dr6);
+        arch_log_hex(b" dr7=", dr7);
+    }
     arch_log(b"\n");
     loop {
         unsafe { core::arch::asm!("hlt", options(nostack, preserves_flags)); }
