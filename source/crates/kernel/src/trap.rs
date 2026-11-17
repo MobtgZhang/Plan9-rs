@@ -350,61 +350,40 @@ fn check_and_deliver_alarms() {
 /// to ASCII, and pushes the character into the console device's input buffer
 /// so that reads on `/dev/console` (fd 0) can return typed characters.
 fn keyboard_interrupt() {
-    // Diagnostic: mark that we entered the keyboard interrupt.
-    crate::serial::put_bytes(b"[kbd] irq\n");
+    // Claim the keyboard controller so the polling read path stands down
+    // while this interrupt is being processed.
+    crate::keymap::IN_IRQ_MARK();
+    let delivered = keyboard_interrupt_inner();
+    if delivered {
+        crate::keymap::mark_irq_delivered();
+    }
+    crate::keymap::IN_IRQ_CLEAR();
+    // Acknowledge the keyboard interrupt on the PIC (IRQ1).
+    pic_eoi(1);
+}
 
+/// Body of the keyboard interrupt; returns true when a keystroke was
+/// delivered to the console input buffer.
+fn keyboard_interrupt_inner() -> bool {
     // Read scancode from PS/2 keyboard data port.
     let scan: u8 = crate::plan9_arch::hal::io::inb(0x60);
 
-    crate::serial::put_bytes(b"[kbd] scan=");
-    crate::serial::put_hex_u32(scan as u32);
-    crate::serial::put_bytes(b"\n");
-
-    // Ignore break codes (bit 7 set) and the 0xE0 extended prefix.
-    let is_press = (scan & 0x80) == 0;
-    let scan = scan & 0x7F;
-    if scan == 0xE0 || !is_press {
-        // Send EOI and wait for the next scan code.
-        pic_eoi(1);
-        return;
-    }
-
-    // Scan-code set 1 -> ASCII (lowercase, no modifier tracking).
-    let ascii = match scan {
-        0x02 => Some(b'1'), 0x03 => Some(b'2'), 0x04 => Some(b'3'), 0x05 => Some(b'4'),
-        0x06 => Some(b'5'), 0x07 => Some(b'6'), 0x08 => Some(b'7'), 0x09 => Some(b'8'),
-        0x0A => Some(b'9'), 0x0B => Some(b'0'), 0x0C => Some(b'-'), 0x0D => Some(b'='),
-        0x0E => Some(0x7F), // Backspace
-        0x0F => Some(b'\t'), // Tab
-        0x10 => Some(b'q'), 0x11 => Some(b'w'), 0x12 => Some(b'e'), 0x13 => Some(b'r'),
-        0x14 => Some(b't'), 0x15 => Some(b'y'), 0x16 => Some(b'u'), 0x17 => Some(b'i'),
-        0x18 => Some(b'o'), 0x19 => Some(b'p'), 0x1A => Some(b'['), 0x1B => Some(b']'),
-        0x1C => Some(b'\n'), // Enter
-        0x1E => Some(b'a'), 0x1F => Some(b's'), 0x20 => Some(b'd'), 0x21 => Some(b'f'),
-        0x22 => Some(b'g'), 0x23 => Some(b'h'), 0x24 => Some(b'j'), 0x25 => Some(b'k'),
-        0x26 => Some(b'l'), 0x27 => Some(b';'), 0x28 => Some(b'\''), 0x29 => Some(b'`'),
-        0x2B => Some(b'\\'), 0x2C => Some(b'z'), 0x2D => Some(b'x'), 0x2E => Some(b'c'),
-        0x2F => Some(b'v'), 0x30 => Some(b'b'), 0x31 => Some(b'n'), 0x32 => Some(b'm'),
-        0x33 => Some(b','), 0x34 => Some(b'.'), 0x35 => Some(b'/'),
-        0x39 => Some(b' '), // Space
-        _ => None,
-    };
-
-    if let Some(c) = ascii {
-        // Deliver to the console device so `/dev/console` reads return input.
+    // Translate through the shared keymap so that modifiers, Caps Lock and
+    // the extended cursor keys behave the same here and in the polling path.
+    let bytes = crate::keymap::translate(scan);
+    if !bytes.is_empty() {
         if let Some(idx) = crate::dev::devs().find_by_char('c') {
             if let Some(dev) = crate::dev::devs_mut().get_mut(idx) {
                 if let Some(cons) =
                     dev.as_any_mut().downcast_mut::<crate::dev::ConsDev>()
                 {
-                    cons.add_input(&[c]);
+                    cons.add_input(bytes);
+                    return true;
                 }
             }
         }
     }
-
-    // Acknowledge the keyboard interrupt on the PIC (IRQ1).
-    pic_eoi(1);
+    false
 }
 
 /// Send End-Of-Interrupt to the master PIC for the given IRQ line.
@@ -432,6 +411,7 @@ pub fn handle_interrupt(vector: usize) {
 
 /// System call handler - dispatches to syscall module
 /// Called from the syscall entry stub with the syscall number in rdi
+#[cfg(target_arch = "x86_64")]
 fn syscall_handler(
     num: usize,
     a0: u64,
@@ -497,12 +477,19 @@ fn syscall_handler(
                 let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
                 if p.has_exec_context() && result >= 0 {
                     let mut f = p.user_frame.unwrap_or_default();
-                    f.rip = p.get_exec_entry();
-                    f.rsp = p.get_exec_stack();
-                    f.rax = 0;
-                    f.cs = 0x23;
-                    f.ss = 0x2B;
-                    f.rflags = 1 << 9;
+                    f.set_entry(p.get_exec_entry());
+                    f.set_stack(p.get_exec_stack());
+                    f.set_ret(0);
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        f.cs = 0x23;
+                        f.ss = 0x2B;
+                        f.rflags = 1 << 9;
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        f.pstate = plan9_arch::hal::switch_to_user::USER_PSTATE_INIT;
+                    }
                     p.user_frame = Some(f);
                     p.clear_exec_context();
                     p.insyscall = false;
@@ -533,7 +520,404 @@ fn syscall_handler(
     result
 }
 
-/// Get whether to use exec context for syscall return
+/// ============================================================================
+// AArch64 trap entry (called from arch/aarch64/boot.S vector table)
+// ============================================================================
+
+/// EL0 synchronous exception dispatcher.
+///
+/// SVC from EL0 (EC=0x15) vectors to the sync slot; everything else is a
+/// genuine fault.  `fp` points at the 272-byte trap frame saved by the
+/// vector stub: x0..x30 at [8*i], PC at [248], PSTATE at [256], user SP
+/// at [264].
+///
+/// Returns the (possibly modified) frame pointer for the stub's
+/// restore-and-ERET; real faults never return.
+///
+/// # Safety
+/// `fp` must point at a live trap frame on the kernel stack.
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn aarch64_el0_sync_handler(fp: *mut u64) -> u64 {
+    let esr = read_esr_el1();
+    let ec = (esr >> 26) & 0x3F;
+    if ec == 0x15 {
+        // SVC — the Plan 9 syscall gate.
+        return aarch64_svc_handler(fp);
+    }
+    // Any other synchronous exception from user mode is fatal.
+    let far = read_far_el1();
+    crate::cons::puts(b"\nPANIC: aarch64 user sync exception\n");
+    if let Some(p) = crate::proc::curproc() {
+        crate::cons::puts(b"  pid=");
+        crate::serial::put_hex_u64(p.pid as u64);
+        crate::cons::puts(b" text=");
+        crate::serial::put_bytes(&p.text[0..16.min(p.text.len())]);
+        crate::cons::puts(b"\n");
+    }
+    crate::cons::puts(b"  ESR=");
+    crate::serial::put_hex_u64(esr);
+    // DEBUG: dump the live MMU configuration so a bad root/range split
+    // can be told apart from a bad mapping.
+    let (ttbr0, ttbr1, tcr, sctlr, mair) = {
+        let t0: u64;
+        let t1: u64;
+        let tc: u64;
+        let sc: u64;
+        let ma: u64;
+        core::arch::asm!(
+            "mrs {t0}, ttbr0_el1",
+            "mrs {t1}, ttbr1_el1",
+            "mrs {tc}, tcr_el1",
+            "mrs {sc}, sctlr_el1",
+            "mrs {ma}, mair_el1",
+            t0 = out(reg) t0,
+            t1 = out(reg) t1,
+            tc = out(reg) tc,
+            sc = out(reg) sc,
+            ma = out(reg) ma,
+            options(nostack),
+        );
+        (t0, t1, tc, sc, ma)
+    };
+    crate::cons::puts(b"  TTBR0=");
+    crate::serial::put_hex_u64(ttbr0);
+    crate::cons::puts(b" TTBR1=");
+    crate::serial::put_hex_u64(ttbr1);
+    crate::cons::puts(b"\n  TCR=");
+    crate::serial::put_hex_u64(tcr);
+    crate::cons::puts(b" SCTLR=");
+    crate::serial::put_hex_u64(sctlr);
+    crate::cons::puts(b"\n  MAIR=");
+    crate::serial::put_hex_u64(mair);
+    crate::cons::puts(b"\n");
+    // Dump the saved user frame (if any) so we can tell whether a blocked
+    // syscall/restore path clobbered the user callee-saved registers.
+    if let Some(p) = crate::proc::curproc() {
+        if let Some(f) = p.user_frame.as_ref() {
+            crate::cons::puts(b"  uframe x28=");
+            crate::serial::put_hex_u64(f.x[28]);
+            crate::cons::puts(b" pc=");
+            crate::serial::put_hex_u64(f.pc);
+            crate::cons::puts(b" sp=");
+            crate::serial::put_hex_u64(f.sp);
+            crate::cons::puts(b" pstate=");
+            crate::serial::put_hex_u64(f.pstate);
+            crate::cons::puts(b"\n");
+        }
+    }
+    // Dump the full trap frame: x30 (LR) identifies the caller of a
+    // faulting leaf function such as memset.
+    crate::cons::puts(b"  regs:");
+    for r in 0..31 {
+        if r % 4 == 0 {
+            crate::cons::puts(b"\n   ");
+        }
+        crate::cons::puts(b" x");
+        let hi = (r / 10) as u8;
+        let lo = (r % 10) as u8;
+        crate::serial::put_bytes(&[b'0' + hi, b'0' + lo, b'=']);
+        crate::serial::put_hex_u64(*fp.add(r as usize));
+    }
+    crate::cons::puts(b"\n");
+    crate::cons::puts(b" FAR=");
+    crate::serial::put_hex_u64(far);
+    crate::cons::puts(b"\n  pc=");
+    crate::serial::put_hex_u64(*fp.add(31));
+    crate::cons::puts(b" sp=");
+    crate::serial::put_hex_u64(*fp.add(33));
+    crate::cons::puts(b"\n");
+    hlt_forever();
+}
+
+/// SVC from EL0: the Plan 9 syscall gate.
+///
+/// `fp` points at the 272-byte trap frame saved by the vector stub:
+/// x0..x30 at [8*i], PC at [248], PSTATE at [256], user SP at [264].
+/// The syscall number travels in x8, arguments in x0-x5, the return
+/// value is written back into x0.
+///
+/// # Safety
+/// `fp` must point at a live trap frame on the kernel stack.
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn aarch64_svc_handler(fp: *mut u64) -> u64 {
+    let num = *fp.add(8) as usize;
+    let a0 = *fp.add(0);
+    let a1 = *fp.add(1);
+    let a2 = *fp.add(2);
+    let a3 = *fp.add(3);
+    let a4 = *fp.add(4);
+    let a5 = *fp.add(5);
+    crate::cons::puts(b"[svc] num=");
+    crate::serial::put_hex_u64(num as u64);
+    crate::cons::puts(b" a0=");
+    crate::serial::put_hex_u64(a0);
+    crate::cons::puts(b"\n");
+
+    let mut x = [0u64; 31];
+    for i in 0..31 {
+        x[i] = *fp.add(i);
+    }
+    let saved = SavedUserFrame {
+        x,
+        pc: *fp.add(31),
+        pstate: *fp.add(32),
+        sp: *fp.add(33),
+    };
+
+    // Process context, mirroring the x86_64 syscall path.
+    if let Some(proc) = curproc() {
+        let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
+        p.insyscall = true;
+        p.nsyscall += 1;
+        p.user_frame = Some(saved);
+        SYSCALL_USE_EXEC_CONTEXT = false;
+        SYSCALL_EXEC_ENTRY = 0;
+    }
+
+    let frame = SyscallFrame {
+        exc: crate::trap::ExceptionFrame {
+            error_code: 0,
+            rip: saved.pc,
+            cs: 0,
+            rflags: saved.pstate,
+            rsp: saved.sp,
+            ss: 0,
+        },
+        syscall_num: num as u64,
+        arg0: a0,
+        arg1: a1,
+        arg2: a2,
+        arg3: a3,
+        arg4: a4,
+        arg5: a5,
+        ret: 0,
+    };
+
+    let result = crate::syscall::dispatch(num, &frame);
+
+    // exec: resume at the new program image instead of returning into
+    // the old user frame (mirrors the x86_64 sysret-exec path).
+    if num == crate::syscall::nr::EXEC {
+        if let Some(proc) = curproc() {
+            let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
+            if p.has_exec_context() && result >= 0 {
+                let mut f = p.user_frame.unwrap_or_default();
+                f.set_entry(p.get_exec_entry());
+                f.set_stack(p.get_exec_stack());
+                f.set_ret(0);
+                f.pstate = plan9_arch::hal::switch_to_user::USER_PSTATE_INIT;
+                p.user_frame = Some(f);
+                p.clear_exec_context();
+                p.insyscall = false;
+
+                let frame_ptr = p
+                    .user_frame
+                    .as_ref()
+                    .map(|fr| fr as *const SavedUserFrame as u64)
+                    .unwrap_or(0);
+                let root = p.mmupdb.as_u64();
+                plan9_arch::hal::switch_to_user::kernel_resume_user(frame_ptr, root);
+            }
+        }
+    }
+
+    if let Some(proc) = curproc() {
+        let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
+        p.insyscall = false;
+    }
+
+    *fp = result as u64;
+    fp as u64
+}
+
+/// IRQ from EL0 (timer tick): acknowledge, rearm, and maybe preempt.
+///
+/// # Safety
+/// `fp` must point at a live trap frame on the kernel stack.
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn aarch64_irq_handler(fp: *mut u64) -> u64 {
+    // Timer IRQ only: acknowledge and advance the scheduler's tick.
+    // Preemption is deliberately NOT done here — it happens at the next
+    // user-mode yield or blocking syscall, so that non-preemption-safe
+    // kernel code (e.g. the UART polling loop in uart::putc) is never
+    // interrupted mid-instruction with caller-saved registers clobbered.
+    gic_irq_eoi();
+    crate::sched::scheduler().timer_tick();
+    fp as u64
+}
+
+/// Synchronous exception (data abort, bad instruction, ...) — fatal.
+///
+/// # Safety
+/// `fp` must point at a live trap frame on the kernel stack.
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn aarch64_sync_handler(fp: *mut u64) -> ! {
+    let esr = read_esr_el1();
+    let far = read_far_el1();
+    crate::cons::puts(b"\nPANIC: aarch64 sync exception\n");
+    crate::cons::puts(b"  ESR=");
+    crate::serial::put_hex_u64(esr);
+    crate::cons::puts(b" FAR=");
+    crate::serial::put_hex_u64(far);
+    crate::cons::puts(b"\n  frame pc=");
+    crate::serial::put_hex_u64(*fp.add(31));
+    crate::cons::puts(b" sp=");
+    crate::serial::put_hex_u64(*fp.add(33));
+    crate::cons::puts(b"\n");
+    hlt_forever();
+}
+
+/// Kernel-mode synchronous exception (from the EL1 vector stub, which now
+/// passes a pointer to the full 272-byte trap frame in x0).  Fatal.
+/// Dumps ESR/FAR/ELR and every GPR so a clobbered return address or
+/// function pointer (e.g. a jump to PC=0x65) can be identified.
+///
+/// # Safety
+/// Never returns; called only from `vec_el1_sync`.
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn aarch64_sync_el1_handler(fp: *mut u64) -> ! {
+    let esr = read_esr_el1();
+    let far = read_far_el1();
+    let elr = *fp.add(31); // ELR saved at frame offset 248
+    crate::cons::puts(b"\nPANIC: aarch64 kernel sync exception\n");
+    crate::cons::puts(b"  ESR=");
+    crate::serial::put_hex_u64(esr);
+    crate::cons::puts(b" FAR=");
+    crate::serial::put_hex_u64(far);
+    crate::cons::puts(b" ELR=");
+    crate::serial::put_hex_u64(elr);
+    crate::cons::puts(b"\n");
+    // Dump x0-x30 (frame[0..30]).
+    crate::cons::puts(b"  regs:");
+    for r in 0..31usize {
+        if r % 4 == 0 {
+            crate::cons::puts(b"\n   ");
+        }
+        crate::cons::puts(b" x");
+        let hi = (r / 10) as u8;
+        let lo = (r % 10) as u8;
+        crate::serial::put_bytes(&[b'0' + hi, b'0' + lo, b'=']);
+        crate::serial::put_hex_u64(*fp.add(r));
+    }
+    crate::cons::puts(b"\n");
+    loop {
+        crate::plan9_arch::hal::hlt();
+    }
+}
+
+/// Kernel-mode IRQ (EL1): acknowledge the GIC and return.  No scheduling
+/// from kernel mode — preemption happens at the next user-mode tick.
+///
+/// # Safety
+/// Called only from the EL1 IRQ vector with a minimal 64-byte frame.
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn aarch64_irq_el1_handler() {
+    gic_irq_eoi();
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn hlt_forever() -> ! {
+    loop {
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn read_esr_el1() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, esr_el1", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn read_far_el1() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, far_el1", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+// ---- GICv2 (QEMU virt: GICD @0x0800_0000, GICC @0x0801_0000) ------------
+
+#[cfg(target_arch = "aarch64")]
+mod gic {
+    const GICD_BASE: u64 = 0x0800_0000;
+    const GICC_BASE: u64 = 0x0801_0000;
+    /// Generic timer virtual interrupt (PPI 11 → GIC id 27).
+    pub const IRQ_CNTV: usize = 27;
+
+    #[inline]
+    pub unsafe fn gicd_read(off: usize) -> u32 {
+        core::ptr::read_volatile((GICD_BASE + off as u64) as *const u32)
+    }
+
+    #[inline]
+    pub unsafe fn gicd_write(off: usize, v: u32) {
+        core::ptr::write_volatile((GICD_BASE + off as u64) as *mut u32, v);
+    }
+
+    #[inline]
+    pub unsafe fn gicc_read(off: usize) -> u32 {
+        core::ptr::read_volatile((GICC_BASE + off as u64) as *const u32)
+    }
+
+    #[inline]
+    pub unsafe fn gicc_write(off: usize, v: u32) {
+        core::ptr::write_volatile((GICC_BASE + off as u64) as *mut u32, v);
+    }
+
+    /// Bring up the GIC CPU interface and enable the generic timer IRQ.
+    pub fn init() {
+        unsafe {
+            // Distributor: enable group 0 + group 1.
+            gicd_write(0x000, 0x3);
+            // Route the timer PPI to this CPU and enable it.
+            let id = IRQ_CNTV;
+            // GICD_ISENABLER<n> for ids 32n..; id 27 lives in ISENABLER0.
+            gicd_write(0x100, 1u32 << (id & 31));
+            // GICC: priority mask (all), enable.
+            gicc_write(0x004, 0xFF);
+            gicc_write(0x000, 0x1);
+        }
+    }
+
+    /// Acknowledge the pending IRQ and send EOI.  Rearm the timer when
+    /// the tick interrupt fired.
+    pub unsafe fn irq_eoi() {
+        let iar = gicc_read(0x00C);
+        let id = (iar & 0x3FF) as usize;
+        if id < 1020 {
+            if id == IRQ_CNTV {
+                // Rearm the oneshot comparator for the next tick.
+                plan9_arch::aarch64::timer::set_oneshot(1);
+                // Account the tick so `sched_ticks()` advances.
+                crate::sched::scheduler().timer_tick();
+            }
+            gicc_write(0x010, iar);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn gic_irq_eoi() {
+    unsafe { gic::irq_eoi() }
+}
+
+/// Initialize the aarch64 interrupt subsystem (GIC + timer IRQ).
+#[cfg(target_arch = "aarch64")]
+pub fn init_interrupts_aarch64() {
+    gic::init();
+}
+
+// Get whether to use exec context for syscall return
 #[inline]
 pub fn should_use_exec_context() -> bool {
     unsafe { SYSCALL_USE_EXEC_CONTEXT }
@@ -821,6 +1205,7 @@ pub fn init() {
 /// The arch crate cannot depend on the kernel crate, so it declares this
 /// symbol externally. The kernel provides the real implementation here and
 /// routes the call through the full VFS/process-aware syscall table.
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn kernel_syscall_from_user(
     num: u64,

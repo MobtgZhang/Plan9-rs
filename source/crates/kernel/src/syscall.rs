@@ -7,6 +7,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::format;
 use alloc::vec;
@@ -136,6 +137,36 @@ pub mod nr {
     pub const GETPID: usize = 50;
     /// wait - wait for a child process (prototype extension)
     pub const WAIT: usize = 51;
+    /// time - read wall clock / uptime (prototype extension)
+    ///
+    /// arg0 = 0: seconds since the Unix epoch from the CMOS RTC
+    /// arg0 = 1: milliseconds of uptime since kernel start
+    /// arg0 = 2: boot time (Unix epoch seconds, cached)
+    pub const TIME: usize = 52;
+    /// getcwd - copy the working directory path into a user buffer
+    /// (prototype extension backing `pwd` / `getwd`).
+    pub const GETCWD: usize = 53;
+    /// getuid - current user id (0 = root/hostowner).
+    pub const GETUID: usize = 54;
+    /// setuid - change credentials; only root may switch uid.
+    pub const SETUID: usize = 55;
+    /// getgid - current group id.
+    pub const GETGID: usize = 56;
+    /// getuser - copy the login name into a user buffer.
+    pub const GETUSER: usize = 57;
+    /// getgroups - copy the supplementary group list into a user buffer.
+    pub const GETGROUPS: usize = 58;
+    /// chmod - change a file's permission bits.
+    pub const CHMOD: usize = 59;
+    /// chown - change a file's owner and group.
+    pub const CHOWN: usize = 60;
+    /// acl - add, replace or remove an access-control entry.
+    pub const ACL: usize = 61;
+    /// auth - verify a login name and password.
+    pub const AUTH: usize = 62;
+    /// login - change the caller's credentials (verifying a password when
+    /// the caller is not root).
+    pub const LOGIN: usize = 63;
 
     /// Total number of syscalls
     pub const NUM: usize = 64;
@@ -402,6 +433,18 @@ impl SyscallTable {
         table[nr::PUTS] = Some(|nr, args| sys_internalputs(&SyscallFrame { nr, args }));
         table[nr::GETPID] = Some(|nr, args| sys_internalgetpid(&SyscallFrame { nr, args }));
         table[nr::WAIT] = Some(|nr, args| sys_internalwait(&SyscallFrame { nr, args }));
+        table[nr::TIME] = Some(|nr, args| sys_internaltime(&SyscallFrame { nr, args }));
+        table[nr::GETCWD] = Some(|nr, args| sys_internalgetcwd(&SyscallFrame { nr, args }));
+        table[nr::GETUID] = Some(|nr, args| sys_internalgetuid(&SyscallFrame { nr, args }));
+        table[nr::SETUID] = Some(|nr, args| sys_internalsetuid(&SyscallFrame { nr, args }));
+        table[nr::GETGID] = Some(|nr, args| sys_internalgetgid(&SyscallFrame { nr, args }));
+        table[nr::GETUSER] = Some(|nr, args| sys_internalgetuser(&SyscallFrame { nr, args }));
+        table[nr::GETGROUPS] = Some(|nr, args| sys_internalgetgroups(&SyscallFrame { nr, args }));
+        table[nr::CHMOD] = Some(|nr, args| sys_internalchmod(&SyscallFrame { nr, args }));
+        table[nr::CHOWN] = Some(|nr, args| sys_internalchown(&SyscallFrame { nr, args }));
+        table[nr::ACL] = Some(|nr, args| sys_internalacl(&SyscallFrame { nr, args }));
+        table[nr::AUTH] = Some(|nr, args| sys_internalauth(&SyscallFrame { nr, args }));
+        table[nr::LOGIN] = Some(|nr, args| sys_internallogin(&SyscallFrame { nr, args }));
 
         Self { handlers: table }
     }
@@ -460,6 +503,17 @@ pub fn syscalls() -> &'static SyscallTable {
     // SAFETY: Once `ready` is observed as `true` the cell permanently
     // contains `Some(table)` and is never written to again.
     unsafe {
+        let slot = &*SYSCALL_TABLE.inner.get();
+        if slot.is_none() {
+            // Defensive: if `ready` is set but the slot is empty (should not
+            // happen on a single CPU), re-initialise rather than panic.
+            crate::cons::puts(b"\n[WARN] syscalls(): re-initialising empty table\n");
+            let slot_mut = &mut *SYSCALL_TABLE.inner.get();
+            *slot_mut = Some(SyscallTable::new());
+            SYSCALL_TABLE
+                .ready
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
         let slot = &*SYSCALL_TABLE.inner.get();
         slot.as_ref().unwrap()
     }
@@ -593,6 +647,47 @@ fn sys_internalwait(frame: &SyscallFrame) -> Result<usize> {
     }
 }
 
+/// TIME - read wall-clock / uptime (prototype extension).
+///
+/// arg0 = 0: seconds since the Unix epoch, from the CMOS RTC.
+/// arg0 = 1: milliseconds since kernel start (uptime).
+/// arg0 = 2: boot time in Unix epoch seconds.
+fn sys_internaltime(frame: &SyscallFrame) -> Result<usize> {
+    /// Boot time cached on first query, in Unix epoch seconds.
+    static BOOT_TIME: core::sync::atomic::AtomicI64 =
+        core::sync::atomic::AtomicI64::new(0);
+
+    match frame.arg(0) {
+        0 => {
+            let now = crate::rtc::now_unix().ok_or(Error::Einval)? as i64;
+            let boot = BOOT_TIME.load(core::sync::atomic::Ordering::Relaxed);
+            if boot == 0 {
+                let uptime_ms = crate::timer::ticks_to_ms(crate::timer::get_ticks()) as i64;
+                let computed = now - uptime_ms / 1000;
+                let _ = BOOT_TIME.compare_exchange(
+                    0,
+                    computed,
+                    core::sync::atomic::Ordering::Relaxed,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            Ok(now as usize)
+        }
+        1 => Ok(crate::timer::ticks_to_ms(crate::timer::get_ticks()) as usize),
+        2 => {
+            let mut boot = BOOT_TIME.load(core::sync::atomic::Ordering::Relaxed);
+            if boot == 0 {
+                let now = crate::rtc::now_unix().ok_or(Error::Einval)? as i64;
+                let uptime_ms = crate::timer::ticks_to_ms(crate::timer::get_ticks()) as i64;
+                boot = now - uptime_ms / 1000;
+                BOOT_TIME.store(boot, core::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(boot as usize)
+        }
+        _ => Err(Error::Einval),
+    }
+}
+
 /// PUTS - write a NUL-terminated string to stdout (fd 1).
 ///
 /// This prototype extension follows Plan 9's "everything through a channel"
@@ -670,6 +765,39 @@ pub fn exec_syscall(path: *const u8, argv: *const *const u8, envp: *const *const
         Ok(_) => 0,
         Err(e) => e.to_isize(),
     }
+}
+
+/// DEBUG: translate a user virtual address through a process PML4 to a
+/// physical address (0 if unmapped).  Used only by exec diagnostics.
+unsafe fn translate_user_paddr(pml4_phys: u64, vaddr: u64) -> u64 {
+    use crate::init_loader::{read_pte, write_pte};
+    let _ = write_pte;
+    const PRESENT: u64 = 1;
+    const PS: u64 = 1 << 7;
+    let mask = 0x000F_FFFF_FFFF_F000;
+    let i4 = ((vaddr >> 39) & 0x1FF) as usize;
+    let i3 = ((vaddr >> 30) & 0x1FF) as usize;
+    let i2 = ((vaddr >> 21) & 0x1FF) as usize;
+    let i1 = ((vaddr >> 12) & 0x1FF) as usize;
+
+    let pml4e = read_pte(pml4_phys, i4);
+    if pml4e & PRESENT == 0 { return 0; }
+    let pdpt = pml4e & mask;
+    let pdpte = read_pte(pdpt, i3);
+    if pdpte & PRESENT == 0 { return 0; }
+    if pdpte & PS != 0 {
+        return (pdpte & mask) + (vaddr & 0x3FFF_FFFF);
+    }
+    let pd = pdpte & mask;
+    let pde = read_pte(pd, i2);
+    if pde & PRESENT == 0 { return 0; }
+    if pde & PS != 0 {
+        return (pde & mask) + (vaddr & 0x1F_FFFF);
+    }
+    let pt = pde & mask;
+    let pte = read_pte(pt, i1);
+    if pte & PRESENT == 0 { return 0; }
+    (pte & mask) + (vaddr & 0xFFF)
 }
 
 /// EXEC - execute program
@@ -827,6 +955,8 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
             let mut flags = 1u64 | 4u64; // present + user
             if p_flags & 2 != 0 {
                 flags |= 2u64; // writable
+            } else {
+                flags |= crate::init_loader::PTE_RDONLY_CALLER; // read-only
             }
             if p_flags & 1 == 0 {
                 flags |= 1u64 << 63; // non-executable
@@ -844,6 +974,18 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
 
     // Build and map the user stack for the new image.
     let sp = build_exec_stack(&args, &envp, entry, proc)?;
+
+    // Safety: never resume user mode at an unmapped entry point — the
+    // resulting page fault in ring 3 would otherwise hand control to
+    // garbage code.  A 0-entry ELF (e.g. a corrupt image) is rejected here.
+    let ent_pa = unsafe { translate_user_paddr(pml4.as_u64(), entry) };
+    let sp_pa = unsafe { translate_user_paddr(pml4.as_u64(), sp) };
+    if ent_pa == 0 || sp_pa == 0 {
+        crate::serial::put_bytes(b"[exec] image not mapped: ");
+        crate::serial::put_bytes(&path);
+        crate::serial::put_bytes(b"\n");
+        return Err(Error::Ebadexec);
+    }
 
     // Publish the new image's segment table for /proc/N/mem and status:
     // the PT_LOAD segments plus the freshly mapped user stack.
@@ -1080,7 +1222,9 @@ fn build_exec_stack(
 ) -> Result<u64> {
     const PAGE_SIZE: usize = 4096;
     const TOP: u64 = 0x0000_7FFF_FFFF_F000;
-    const PAGES: usize = 4;
+    // 16 pages = 64 KiB of user stack: comfortable for command programs
+    // that keep line arenas on the stack.
+    const PAGES: usize = 16;
     const SIZE: usize = PAGES * PAGE_SIZE;
 
     let pml4 = proc.mmupdb;
@@ -1337,7 +1481,7 @@ fn sys_internalexits(frame: &SyscallFrame) -> Result<usize> {
 
                     // Resume the parent at its saved wait-syscall frame.
                     let mut f = p.user_frame.unwrap_or_default();
-                    f.rax = status as u64;
+                    f.set_ret(status as u64);
                     p.user_frame = Some(f);
                     p.state = State::Ready;
 
@@ -1671,7 +1815,8 @@ fn sys_internaldup(frame: &SyscallFrame) -> Result<usize> {
         if let Some(mut old) = fgrp.close_fd(newfd) {
             old.close();
         }
-        if !fgrp.set_fd(newfd, dup_chan) {
+        let ok = fgrp.set_fd(newfd, dup_chan);
+        if !ok {
             return Err(Error::Ebadfd);
         }
         Ok(newfd as usize)
@@ -1830,7 +1975,7 @@ pub fn create_pipe_channel() -> Result<(Box<dyn crate::proc::Chan>, Box<dyn crat
 
     // We need to get a mutable reference for the write end
     let write_end = Box::new(PipeWriteEnd {
-        buffer: unsafe { &mut *leaked_ptr },
+        buffer: leaked_ptr,
     });
 
     Ok((read_end, write_end))
@@ -1853,7 +1998,7 @@ fn sys_internalpipe(frame: &SyscallFrame) -> Result<usize> {
     }
 
     // Verify we can write to the user pointer
-    if !is_user_addr(fds_ptr) || !is_user_addr(fds_ptr + 7) {
+    if !is_user_addr(fds_ptr) || !is_user_addr(fds_ptr + 15) {
         return Err(Error::Ebadf);
     }
 
@@ -1884,11 +2029,12 @@ fn sys_internalpipe(frame: &SyscallFrame) -> Result<usize> {
         return Err(Error::Enomem);
     }
 
-    // Write the file descriptors to user memory
-    // Note: In real implementation, we would use copyout
+    // Write the file descriptors to user memory.  The user ABI uses one
+    // 64-bit slot per descriptor (`long fd[2]` in Plan 9), so the array is
+    // 16 bytes: fds[0] = read, fds[1] = write.
     unsafe {
-        core::ptr::write(fds_ptr as *mut i32, read_fd);
-        core::ptr::write((fds_ptr as *mut i32).add(1), write_fd);
+        core::ptr::write(fds_ptr as *mut i64, read_fd as i64);
+        core::ptr::write((fds_ptr as *mut i64).add(1), write_fd as i64);
     }
 
     Ok(0)
@@ -1910,18 +2056,18 @@ impl PipeReadEnd {
 }
 
 /// Real pipe write end channel
-pub struct PipeWriteEnd<'a> {
-    buffer: &'a mut PipeBuffer,
+pub struct PipeWriteEnd {
+    buffer: *mut PipeBuffer,
 }
 
-// SAFETY: PipeWriteEnd wraps a mutable reference to PipeBuffer which is Send + Sync.
+// SAFETY: PipeWriteEnd wraps a raw pointer to a PipeBuffer which is Send + Sync.
 // Proper synchronization is handled at the usage site.
-unsafe impl<'a> Send for PipeWriteEnd<'a> {}
-unsafe impl<'a> Sync for PipeWriteEnd<'a> {}
+unsafe impl Send for PipeWriteEnd {}
+unsafe impl Sync for PipeWriteEnd {}
 
-impl<'a> PipeWriteEnd<'a> {
+impl PipeWriteEnd {
     fn get_buffer(&mut self) -> &mut PipeBuffer {
-        &mut *self.buffer
+        unsafe { &mut *self.buffer }
     }
 }
 
@@ -1961,7 +2107,7 @@ impl crate::proc::Chan for PipeReadEnd {
     }
 }
 
-impl<'a> crate::proc::Chan for PipeWriteEnd<'a> {
+impl crate::proc::Chan for PipeWriteEnd {
     fn read(&mut self, _buf: &mut [u8]) -> crate::proc::Result<usize> {
         // Cannot read from write end
         Err(crate::proc::Error::Eperm)
@@ -1989,9 +2135,9 @@ impl<'a> crate::proc::Chan for PipeWriteEnd<'a> {
     }
 
     fn dup(&self) -> Box<dyn crate::proc::Chan> {
-        // dup() on a borrowed pipe write end is not supported
-        // In a real implementation, we would need proper Arc<Mutex<PipeBuffer>>
-        panic!("PipeWriteEnd::dup() not supported with borrowed reference");
+        // The buffer is leaked at creation and shared by both ends, so dup
+        // simply re-wraps the same pointer (mirrors PipeReadEnd::dup).
+        Box::new(PipeWriteEnd { buffer: self.buffer })
     }
 }
 
@@ -2027,7 +2173,14 @@ fn sys_internalstat(frame: &SyscallFrame) -> Result<usize> {
     let mut chan = namec(&path, amode, 0, 0)?;
     let de = crate::dev::dev_stat(&mut chan)?;
     let name = core::str::from_utf8(&de.name).unwrap_or("?");
-    let text = format!("{} {} {} {}\n", name, de.mode, de.length, de.qid.path);
+    // Devices disagree about which bit marks a directory (Plan 9 uses
+    // DMDIR, several of ours use the Unix S_IFDIR nibble), so normalise the
+    // reported mode from the authoritative qid type.
+    let mut mode = de.mode;
+    if de.qid.type_ & crate::dev::qidtype::DIR != 0 {
+        mode |= 0x8000_0000;
+    }
+    let text = format!("{} {} {} {}\n", name, mode, de.length, de.qid.path);
     let bytes = text.as_bytes();
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, _n) };
     let count = core::cmp::min(bytes.len(), buf.len());
@@ -2470,11 +2623,402 @@ fn sys_internalchdir(frame: &SyscallFrame) -> Result<usize> {
     // Set new current directory
     proc.dot = Some(Box::new(dev_to_proc_chan(chan)));
 
+    // Track the canonical textual path for `pwd`/`getcwd`.  Paths are
+    // resolved lexically against the previous directory, matching what a
+    // POSIX `getcwd` would report.
+    proc.cwd_path = canonicalize_cwd(&proc.cwd_path, &path);
+
+    Ok(0)
+}
+
+/// Resolve `arg` against `prev`, folding "." and ".." lexically.
+/// Absolute arguments replace the previous directory outright.
+fn canonicalize_cwd(prev: &[u8], arg: &[u8]) -> Vec<u8> {
+    // Seed components from the previous directory unless the argument is
+    // itself absolute.
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    if arg.first() != Some(&b'/') {
+        for c in prev.split(|&c| c == b'/').filter(|c| !c.is_empty()) {
+            out.push(c.to_vec());
+        }
+    }
+    // Seed components from the previous directory unless the argument is
+    // itself absolute.
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    if arg.first() != Some(&b'/') {
+        for c in prev.split(|&c| c == b'/').filter(|c| !c.is_empty()) {
+            out.push(c.to_vec());
+        }
+    }
+    for c in arg.split(|&c| c == b'/').filter(|c| !c.is_empty()) {
+        match c {
+            b"." => {}
+            b".." => {
+                out.pop();
+            }
+            other => out.push(other.to_vec()),
+        }
+    }
+
+    let mut result = Vec::with_capacity(out.len() * 8 + 1);
+    for c in &out {
+        result.push(b'/');
+        result.extend_from_slice(c);
+    }
+    if result.is_empty() {
+        result.push(b'/');
+    }
+    result
+}
+
+/// GETCWD - copy the current working directory path into a user buffer.
+///
+/// Prototype extension backing `pwd` and Plan 9 programs that call
+/// `getwd()`; the kernel tracks the canonical path on each CHDIR.
+fn sys_internalgetcwd(frame: &SyscallFrame) -> Result<usize> {
+    let buf_ptr = frame.arg(0);
+    let cap = frame.arg(1) as usize;
+
+    if buf_ptr == 0 || !is_user_addr(buf_ptr) {
+        return Err(Error::Ebadf);
+    }
+    if cap == 0 {
+        return Err(Error::Ebadf);
+    }
+
+    let proc = curproc().ok_or(Error::Eperm)?;
+    let path = if proc.cwd_path.is_empty() { b"/".to_vec() } else { proc.cwd_path.clone() };
+    let bytes = &path[..core::cmp::min(path.len(), cap - 1)];
+
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, cap) };
+    buf[..bytes.len()].copy_from_slice(bytes);
+    buf[bytes.len()] = 0; // NUL-terminate
+    Ok(bytes.len())
+}
+
+/// GETUID - return the caller's user id.
+fn sys_internalgetuid(_frame: &SyscallFrame) -> Result<usize> {
+    let proc = curproc().ok_or(Error::Eperm)?;
+    Ok(proc.uid as usize)
+}
+
+/// GETGID - return the caller's primary group id.
+fn sys_internalgetgid(_frame: &SyscallFrame) -> Result<usize> {
+    let proc = curproc().ok_or(Error::Eperm)?;
+    Ok(proc.gid as usize)
+}
+
+/// SETUID - change the caller's credentials.
+///
+/// arg0 = uid, arg1 = gid, arg2 = pointer to the login name (optional).
+///
+/// Only uid 0 (root / hostowner) may change uid.  A non-root process may
+/// only call this with its own uid (a no-op), matching Plan 9's rule that
+/// credentials are not privileged state.
+fn sys_internalsetuid(frame: &SyscallFrame) -> Result<usize> {
+    let new_uid = frame.arg(0) as u32;
+    let new_gid = frame.arg(1) as u32;
+    let name_ptr = frame.arg(2);
+
+    let proc = curproc_mut().ok_or(Error::Eperm)?;
+    if proc.uid != 0 && new_uid != proc.uid {
+        return Err(Error::Eperm);
+    }
+
+    proc.uid = new_uid;
+    proc.gid = new_gid;
+
+    if name_ptr != 0 && is_user_addr(name_ptr) {
+        let name = copy_cstring_from_user(name_ptr)?;
+        let n = core::cmp::min(name.len(), proc.uname.len() - 1);
+        proc.uname[..n].copy_from_slice(&name[..n]);
+        proc.uname[n] = 0;
+    }
+    Ok(0)
+}
+
+/// GETUSER - copy the caller's login name into a user buffer.
+fn sys_internalgetuser(frame: &SyscallFrame) -> Result<usize> {
+    let buf_ptr = frame.arg(0);
+    let cap = frame.arg(1) as usize;
+    if buf_ptr == 0 || cap == 0 || !is_user_addr(buf_ptr) {
+        return Err(Error::Ebadf);
+    }
+
+    let proc = curproc().ok_or(Error::Eperm)?;
+    let len = proc
+        .uname
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(proc.uname.len());
+
+    // Fall back to the canonical name for uid 0 before login runs.
+    let name: &[u8] = if len == 0 { b"glenda" } else { &proc.uname[..len] };
+    let n = core::cmp::min(name.len(), cap - 1);
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, cap) };
+    buf[..n].copy_from_slice(&name[..n]);
+    buf[n] = 0;
+    Ok(n)
+}
+
+/// GETGROUPS - copy the supplementary group ids into a user buffer.
+///
+/// Each group is written as a 32-bit little-endian word; the return value
+/// is the number of groups copied.
+fn sys_internalgetgroups(frame: &SyscallFrame) -> Result<usize> {
+    let buf_ptr = frame.arg(0);
+    let cap = frame.arg(1) as usize;
+    if buf_ptr == 0 || !is_user_addr(buf_ptr) {
+        return Err(Error::Ebadf);
+    }
+    let proc = curproc().ok_or(Error::Eperm)?;
+    let max = core::cmp::min(proc.groups.len(), cap / 4);
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u32, max) };
+    for (i, g) in proc.groups.iter().take(max).enumerate() {
+        buf[i] = *g;
+    }
+    Ok(max)
+}
+
+/// CHMOD - change a file's permission bits.
+///
+/// arg0 = path, arg1 = new permission bits (low nine bits).
+///
+/// Only the owner (or root) may change a file's mode.
+fn sys_internalchmod(frame: &SyscallFrame) -> Result<usize> {
+    let path_ptr = frame.arg(0);
+    let mode = frame.arg(1) as u32;
+
+    if path_ptr == 0 || !is_user_addr(path_ptr) {
+        return Err(Error::Ebadf);
+    }
+    let path = copy_cstring_from_user(path_ptr)?;
+
+    let mut chan = namec(&path, crate::vfs::NamecMode::Walk, 0, 0)?;
+    let de = crate::dev::dev_stat(&mut chan)?;
+
+    let proc = curproc().ok_or(Error::Eperm)?;
+    if proc.uid != 0 && proc.uid != de.uid {
+        let _ = crate::dev::dev_close(&mut chan);
+        return Err(Error::Eperm);
+    }
+
+    let mut dir = de.clone();
+    dir.mode = (de.mode & !0o777) | (mode & 0o777);
+    dir.uid = de.uid;
+    dir.gid = de.gid;
+    let rc = crate::dev::dev_wstat(&mut chan, &dir);
+    let _ = crate::dev::dev_close(&mut chan);
+    rc?;
+    Ok(0)
+}
+
+/// CHOWN - change a file's owner and group.
+///
+/// arg0 = path, arg1 = new uid, arg2 = new gid.  A value of `u32::MAX`
+/// leaves the corresponding field unchanged.
+///
+/// Only root may hand a file to another user; an owner may change the group
+/// to one they belong to.
+fn sys_internalchown(frame: &SyscallFrame) -> Result<usize> {
+    let path_ptr = frame.arg(0);
+    let new_uid = frame.arg(1) as u32;
+    let new_gid = frame.arg(2) as u32;
+
+    if path_ptr == 0 || !is_user_addr(path_ptr) {
+        return Err(Error::Ebadf);
+    }
+    let path = copy_cstring_from_user(path_ptr)?;
+
+    let mut chan = namec(&path, crate::vfs::NamecMode::Walk, 0, 0)?;
+    let de = crate::dev::dev_stat(&mut chan)?;
+    let proc = curproc().ok_or(Error::Eperm)?;
+
+    if proc.uid != 0 {
+        // Non-root: must own the file, and may not change the user id.
+        if proc.uid != de.uid {
+            return Err(Error::Eperm);
+        }
+        if new_uid != u32::MAX && new_uid != de.uid {
+            return Err(Error::Eperm);
+        }
+        if new_gid != u32::MAX
+            && new_gid != de.gid
+            && !proc.groups.iter().any(|g| *g == new_gid)
+        {
+            return Err(Error::Eperm);
+        }
+    }
+
+    let mut dir = de.clone();
+    if new_uid != u32::MAX {
+        dir.uid = new_uid;
+    }
+    if new_gid != u32::MAX {
+        dir.gid = new_gid;
+    }
+    let rc = crate::dev::dev_wstat(&mut chan, &dir);
+    let _ = crate::dev::dev_close(&mut chan);
+    rc?;
+    Ok(0)
+}
+
+/// ACL - manage access-control entries.
+///
+/// arg0 = path
+/// arg1 = uid
+/// arg2 = bits (0o7 mask); 0 removes the entry
+/// arg3 = 0 to set/remove an entry, 1 to query it (the bits are returned)
+///
+/// Only root or the file owner may modify the list.
+fn sys_internalacl(frame: &SyscallFrame) -> Result<usize> {
+    let path_ptr = frame.arg(0);
+    let uid = frame.arg(1) as u32;
+    let bits = frame.arg(2) as u32;
+    let query = frame.arg(3) != 0;
+
+    if path_ptr == 0 || !is_user_addr(path_ptr) {
+        return Err(Error::Ebadf);
+    }
+    let path = copy_cstring_from_user(path_ptr)?;
+
+    let mut chan = namec(&path, crate::vfs::NamecMode::Walk, 0, 0)?;
+    let de = crate::dev::dev_stat(&mut chan)?;
+    let _ = crate::dev::dev_close(&mut chan);
+
+    let proc = curproc().ok_or(Error::Eperm)?;
+    if proc.uid != 0 && proc.uid != de.uid {
+        return Err(Error::Eperm);
+    }
+
+    // Locate the RAM root device backing the path.
+    let root_idx = crate::dev::devs()
+        .find_by_char('/')
+        .ok_or(Error::Enoent)?;
+    let dev = crate::dev::devs_mut()
+        .get_mut(root_idx)
+        .ok_or(Error::Enoent)?;
+    let rf = dev
+        .as_any_mut()
+        .downcast_mut::<crate::rootfs::RootFsDev>()
+        .ok_or(Error::Enoent)?;
+
+    let node_id = de.qid.path;
+    if query {
+        let mut granted = 0u32;
+        for e in rf.acl_entries(node_id) {
+            if e.uid == uid {
+                granted = e.bits;
+            }
+        }
+        return Ok(granted as usize);
+    }
+    if !rf.set_acl(node_id, uid, bits) {
+        return Err(Error::Enoent);
+    }
+    Ok(0)
+}
+
+/// AUTH - verify a login name and password.
+///
+/// arg0 = login name, arg1 = password.  Returns 0 when the credentials are
+/// valid and `Eperm` otherwise.  Unlike `LOGIN` this never changes the
+/// caller's credentials, which makes it usable by `su`/`login` without
+/// granting anything until the check succeeded.
+fn sys_internalauth(frame: &SyscallFrame) -> Result<usize> {
+    let name_ptr = frame.arg(0);
+    let pass_ptr = frame.arg(1);
+
+    if name_ptr == 0 || pass_ptr == 0 {
+        return Err(Error::Ebadf);
+    }
+    if !is_user_addr(name_ptr) || !is_user_addr(pass_ptr) {
+        return Err(Error::Ebadf);
+    }
+
+    let name = core::str::from_utf8(&copy_cstring_from_user(name_ptr)?)
+        .map_err(|_| Error::Einval)?
+        .to_string();
+    let pass = core::str::from_utf8(&copy_cstring_from_user(pass_ptr)?)
+        .map_err(|_| Error::Einval)?
+        .to_string();
+
+    if crate::upasswd::user_by_name(&name).is_none() {
+        return Err(Error::Enoent);
+    }
+    if !crate::upasswd::verify_password(&name, &pass) {
+        return Err(Error::Eperm);
+    }
+    Ok(0)
+}
+
+/// LOGIN - switch the caller to another user.
+///
+/// arg0 = login name, arg1 = password (may be NUL when the caller is root).
+///
+/// Root may switch to any account without a password; everyone else must
+/// prove the password, and may not become root by guessing.
+fn sys_internallogin(frame: &SyscallFrame) -> Result<usize> {
+    let name_ptr = frame.arg(0);
+    let pass_ptr = frame.arg(1);
+
+    if name_ptr == 0 || !is_user_addr(name_ptr) {
+        return Err(Error::Ebadf);
+    }
+    let name = core::str::from_utf8(&copy_cstring_from_user(name_ptr)?)
+        .map_err(|_| Error::Einval)?
+        .to_string();
+
+    let entry = match crate::upasswd::user_by_name(&name) {
+        Some(e) => e,
+        None => return Err(Error::Enoent),
+    };
+
+    let caller = curproc().ok_or(Error::Eperm)?;
+    let caller_root = caller.uid == 0;
+    let already = caller.uid == entry.uid;
+
+    if !caller_root && !already {
+        if pass_ptr == 0 || !is_user_addr(pass_ptr) {
+            return Err(Error::Eperm);
+        }
+        let pass = core::str::from_utf8(&copy_cstring_from_user(pass_ptr)?)
+            .map_err(|_| Error::Einval)?
+            .to_string();
+        if !crate::upasswd::verify_password(&name, &pass) {
+            return Err(Error::Eperm);
+        }
+    }
+
+    let groups = crate::upasswd::groups_of(&entry);
+    let home = entry.home.clone();
+
+    let proc = curproc_mut().ok_or(Error::Eperm)?;
+    proc.uid = entry.uid;
+    proc.gid = entry.gid;
+    proc.groups = groups;
+    let nb = entry.name.as_bytes();
+    let n = core::cmp::min(nb.len(), proc.uname.len() - 1);
+    proc.uname[..n].copy_from_slice(&nb[..n]);
+    proc.uname[n] = 0;
+
+    // Move to the new home directory when it exists; a failed chdir is
+    // harmless and leaves the caller where it was.
+    if !home.is_empty() {
+        if let Ok(mut chan) = namec(&home.as_bytes().to_vec(), crate::vfs::NamecMode::Walk, 0, 0) {
+            if let Some(p) = curproc_mut() {
+                if let Some(mut old) = p.dot.take() {
+                    old.close();
+                }
+                p.dot = Some(Box::new(crate::vfs::DevChanAdapter::new(chan)));
+                p.cwd_path = home.as_bytes().to_vec();
+            }
+        }
+    }
     Ok(0)
 }
 
 /// NOTIFY - set exception handler
-///
 /// Sets the function that will be called when a note (signal) is posted to the process.
 fn sys_internalnotify(frame: &SyscallFrame) -> Result<usize> {
     let fn_ptr = frame.arg(0);
