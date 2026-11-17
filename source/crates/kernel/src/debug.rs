@@ -521,7 +521,9 @@ impl Dev for DebugDev {
             mtime: 0,
             length: 0,
             name: b"debug".to_vec(),
-        })
+            uid: 0,
+            gid: 0,
+})
     }
 
     fn dev_char(&self) -> char {

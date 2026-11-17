@@ -285,34 +285,25 @@ impl DisplayEngine for VirtioGpuEngine {
 
 /// Scan PCI buses for the virtio-gpu device and return its BAR0.
 fn find_virtio_gpu_device() -> Option<u64> {
-    use crate::plan9_arch::hal::outl;
-    use crate::plan9_arch::hal::inl;
-
-    let config_addr = 0xCF8u16;
-    let config_data = 0xCFCu16;
+    // Route all config-space reads through the drivers-crate PCI access
+    // functions: they use the 0xCF8/CFC port pair on x86_64 and the MMIO
+    // ECAM window on aarch64.
+    use plan9_drivers::pci::{pci_config_read, PciConfigAddr};
 
     for bus in 0..=255u8 {
         for dev in 0..32u8 {
             for func in 0..8u8 {
-                let make_addr = |offset: u32| -> u32 {
-                    0x80000000u32
-                        | ((bus as u32) << 16)
-                        | ((dev as u32) << 11)
-                        | ((func as u32) << 8)
-                        | (offset & 0xFC)
+                let read_at = |offset: u32| -> u32 {
+                    pci_config_read(PciConfigAddr::new(bus, dev, func, offset as u8))
                 };
                 // Read vendor ID (offset 0)
-                let addr = make_addr(0);
-                unsafe { outl(config_addr, addr); }
-                let vendor = unsafe { inl(config_data) } as u16;
+                let vendor = read_at(0) as u16;
                 if vendor == 0xFFFF {
                     continue;
                 }
 
                 // Read device ID at offset 2
-                let addr2 = make_addr(2);
-                unsafe { outl(config_addr, addr2); }
-                let device = unsafe { inl(config_data) } as u16;
+                let device = (read_at(2) >> 16) as u16;
 
                 if vendor == VIRTIO_VENDOR_ID && device == VIRTIO_GPU_DEVICE_ID {
                     serial::put_bytes(b"[virtio-gpu] PCI match bus=");
@@ -324,12 +315,12 @@ fn find_virtio_gpu_device() -> Option<u64> {
                     serial::put_bytes(b"\n");
 
                     // Read BAR0 (offset 0x10)
-                    let bar0 = read_bar_at(&make_addr, 0x10);
+                    let bar0 = read_at(0x10);
                     if bar0 != 0 {
                         serial::put_bytes(b"[virtio-gpu] BAR0=0x");
-                        serial::put_hex_u64(bar0);
+                        serial::put_hex_u64(bar0 as u64);
                         serial::put_bytes(b"\n");
-                        return Some(bar0 & !0xFu64);
+                        return Some((bar0 & !0xF) as u64);
                     }
                 }
             }
@@ -338,18 +329,6 @@ fn find_virtio_gpu_device() -> Option<u64> {
 
     serial::put_bytes(b"[virtio-gpu] no device found\n");
     None
-}
-
-/// Read a 32-bit BAR from PCI config space using a closure that builds
-/// the address for the current device's bus/dev/func.
-fn read_bar_at(make_addr: &dyn Fn(u32) -> u32, offset: u32) -> u64 {
-    use crate::plan9_arch::hal::outl;
-    use crate::plan9_arch::hal::inl;
-
-    let addr = make_addr(offset);
-    unsafe { outl(0xCF8, addr); }
-    let val = unsafe { inl(0xCFC) };
-    val as u64
 }
 
 #[inline]

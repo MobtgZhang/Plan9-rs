@@ -96,7 +96,9 @@ impl Dev for ConsoleDev {
             mtime: 0,
             length: 0,
             name: b"cons".to_vec(),
-        })
+            uid: 0,
+            gid: 0,
+})
     }
 
     fn wstat(&mut self, _ch: &mut Chan, _dir: &DirEntry) -> Result<(), Error> {
@@ -361,25 +363,24 @@ impl SerialDev {
             name: if port == 0x3F8 { "com1" } else { "com2" },
         }
     }
-    
-    /// Initialize the serial port (stub for non-x86_64)
-    pub fn init(&self) {
-        // No serial port on non-x86_64 architectures
-    }
-    
-    /// Read a byte from the serial port (stub for non-x86_64)
+
+    /// Initialize the serial port (PL011 is configured at boot; nothing
+    /// to do here).
+    pub fn init(&self) {}
+
+    /// Read a byte from the PL011 receive FIFO (non-blocking).
     pub fn read_byte(&self) -> Option<u8> {
-        None
+        crate::plan9_arch::hal::console::getc()
     }
 
-    /// Current line-status register (stub for non-x86_64).
+    /// Current line-status register (always "ready" on PL011).
     pub fn lsr(&self) -> u8 {
-        0
+        0x20
     }
-    
-    /// Write a byte to the serial port (stub for non-x86_64)
-    pub fn write_byte(&self, _byte: u8) {
-        // No serial port on non-x86_64 architectures
+
+    /// Write a byte to the PL011.
+    pub fn write_byte(&self, byte: u8) {
+        crate::plan9_arch::hal::console::putc(byte);
     }
 }
 
@@ -531,6 +532,22 @@ pub fn serial_getchar() -> Option<u8> {
 /// fast typists would lose keystrokes.  Every console interaction drains
 /// the UART into this buffer first.
 static SER_RX: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// Push a byte back to the front of the software serial RX buffer.
+///
+/// Used by the console device when the PS/2 and serial transports deliver
+/// different bytes for one poll: the serial byte is preserved for the next
+/// read instead of being dropped.
+pub fn unread_serial(b: u8) {
+    let mut guard = SER_RX.lock();
+    guard.insert(0, b);
+}
+
+/// Look at the next serial RX byte without consuming it.
+pub fn serial_peek() -> Option<u8> {
+    let guard = SER_RX.lock();
+    guard.first().copied()
+}
 
 /// Move every byte waiting in the UART FIFO into the software RX buffer.
 ///

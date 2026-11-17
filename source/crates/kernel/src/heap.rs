@@ -114,6 +114,14 @@ pub static mut STATIC_HEAP: StaticHeap = StaticHeap {
 /// Virtual/physical region reserved for the main boot heap. It lies above
 /// the kernel image, inside the identity-mapped boot window, and is marked
 /// reserved in the frame allocator before any frames are handed out.
+///
+/// On x86_64 QEMU RAM starts at physical 0, so 16 MiB is ordinary RAM.
+/// On aarch64 virt the RAM base is 0x4000_0000 — the low 1 GiB is the
+/// MMIO window and holds no usable memory — so the boot heap lives at
+/// RAM+32 MiB. `frame_alloc` reserves this range either way.
+#[cfg(target_arch = "aarch64")]
+pub const BOOT_HEAP_START: u64 = 0x4200_0000; // RAM base + 32 MiB
+#[cfg(not(target_arch = "aarch64"))]
 pub const BOOT_HEAP_START: u64 = 0x0100_0000; // 16 MiB
 pub const BOOT_HEAP_SIZE:  u64 = 0x0200_0000; // 32 MiB
 pub const BOOT_HEAP_END:   u64 = BOOT_HEAP_START + BOOT_HEAP_SIZE;

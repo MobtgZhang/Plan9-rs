@@ -348,7 +348,9 @@ impl Dev for KmesgDev {
             mtime: 0,
             length: kmesg().available() as u64,
             name: b"kmesg".to_vec(),
-        })
+            uid: 0,
+            gid: 0,
+})
     }
 
     fn wstat(&mut self, _ch: &mut Chan, _dir: &DirEntry) -> Result<(), Error> {

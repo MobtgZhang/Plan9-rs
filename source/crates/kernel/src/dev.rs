@@ -179,6 +179,10 @@ pub struct DirEntry {
     pub length: u64,
     /// Name
     pub name: Vec<u8>,
+    /// Owning user id
+    pub uid: u32,
+    /// Owning group id
+    pub gid: u32,
 }
 
 impl Clone for DirEntry {
@@ -191,6 +195,8 @@ impl Clone for DirEntry {
             mtime: self.mtime,
             length: self.length,
             name: self.name.clone(),
+            uid: self.uid,
+            gid: self.gid,
         }
     }
 }
@@ -302,6 +308,16 @@ pub trait Dev: Send + Sync {
     fn wstat(&mut self, ch: &mut Chan, dir: &DirEntry) -> Result<(), Error> {
         let _ = (ch, dir);
         Err(Error::Eperm)
+    }
+
+    /// Truncate a file to zero length.
+    ///
+    /// Devices that model a byte-addressable file override this; the
+    /// default is a no-op success so that opening a device (console, pipe,
+    /// clock) for writing never fails because of a truncation request.
+    fn truncate(&mut self, ch: &mut Chan) -> Result<(), Error> {
+        let _ = ch;
+        Ok(())
     }
     
     /// Remove file
@@ -601,6 +617,9 @@ pub struct ConsDev {
     name: &'static str,
     /// Console input buffer
     input_buffer: Mutex<Vec<u8>>,
+    /// Bytes produced by a single PS/2 key press but not yet delivered
+    /// (escape sequences are several bytes long).
+    pending_input: Mutex<Vec<u8>>,
     /// Console output state
     output_lock: ConsoleLock,
     /// VGA availability flag - set to true when VGA is initialized
@@ -613,6 +632,7 @@ impl ConsDev {
         Self {
             name: "cons",
             input_buffer: Mutex::new(Vec::new()),
+            pending_input: Mutex::new(Vec::new()),
             output_lock: Spinlock::new(()),
             // VGA starts as unavailable, will be enabled when VGA is initialized
             vga_available: Spinlock::new(false),
@@ -644,53 +664,111 @@ impl ConsDev {
     /// so that typed characters are available even when the IRQ path has not
     /// delivered them (e.g. QEMU `sendkey` via the monitor does not raise a
     /// real PS/2 interrupt).
+    ///
+    /// QEMU mirrors a keystroke to both the emulated PS/2 keyboard and the
+    /// serial port when `-serial stdio` is used together with a display, so
+    /// the same key can arrive twice.  We therefore sample both transports
+    /// and, when they carry the same byte, consume both and deliver it once.
     fn get_char(&self) -> Option<u8> {
-        let mut buf = self.input_buffer.lock();
-        if buf.is_empty() {
-            drop(buf);
-        } else {
-            return Some(buf.remove(0));
+        {
+            let mut buf = self.input_buffer.lock();
+            if !buf.is_empty() {
+                return Some(buf.remove(0));
+            }
         }
 
-        // Poll PS/2 keyboard output buffer (port 0x60) when the OBF bit
-        // (bit 0 of port 0x64) is set.
-        let status: u8 = crate::plan9_arch::hal::io::inb(0x64);
-        if (status & 0x01) == 0 {
-            // Fall back to serial if no keyboard input
-            return crate::cons::serial_getchar();
-        }
+        // QEMU mirrors every keystroke to *both* transports (PS/2 keyboard
+        // and serial port) when a display is attached.  Always sample both
+        // before deciding, otherwise the serial mirror of one key lingers
+        // in the UART buffer and is later delivered again as a "new" key —
+        // the classic `dir` -> `dirr` double-typing.
+        let ps2 = self.poll_ps2();
+        let ser = crate::cons::serial_getchar();
 
-        let scan: u8 = crate::plan9_arch::hal::io::inb(0x60);
-
-        // Ignore break codes and the 0xE0 extended prefix.
-        if (scan & 0x80) != 0 || (scan & 0x7F) == 0xE0 {
-            return crate::cons::serial_getchar();
-        }
-        let scan = scan & 0x7F;
-
-        let ascii = match scan {
-            0x02 => Some(b'1'), 0x03 => Some(b'2'), 0x04 => Some(b'3'), 0x05 => Some(b'4'),
-            0x06 => Some(b'5'), 0x07 => Some(b'6'), 0x08 => Some(b'7'), 0x09 => Some(b'8'),
-            0x0A => Some(b'9'), 0x0B => Some(b'0'), 0x0C => Some(b'-'), 0x0D => Some(b'='),
-            0x0E => Some(0x7F),
-            0x0F => Some(b'\t'),
-            0x10 => Some(b'q'), 0x11 => Some(b'w'), 0x12 => Some(b'e'), 0x13 => Some(b'r'),
-            0x14 => Some(b't'), 0x15 => Some(b'y'), 0x16 => Some(b'u'), 0x17 => Some(b'i'),
-            0x18 => Some(b'o'), 0x19 => Some(b'p'), 0x1A => Some(b'['), 0x1B => Some(b']'),
-            0x1C => Some(b'\n'),
-            0x1E => Some(b'a'), 0x1F => Some(b's'), 0x20 => Some(b'd'), 0x21 => Some(b'f'),
-            0x22 => Some(b'g'), 0x23 => Some(b'h'), 0x24 => Some(b'j'), 0x25 => Some(b'k'),
-            0x26 => Some(b'l'), 0x27 => Some(b';'), 0x28 => Some(b'\''), 0x29 => Some(b'`'),
-            0x2B => Some(b'\\'), 0x2C => Some(b'z'), 0x2D => Some(b'x'), 0x2E => Some(b'c'),
-            0x2F => Some(b'v'), 0x30 => Some(b'b'), 0x31 => Some(b'n'), 0x32 => Some(b'm'),
-            0x33 => Some(b','), 0x34 => Some(b'.'), 0x35 => Some(b'/'),
-            0x39 => Some(b' '),
-            _ => None,
+        // QEMU mirrors one keystroke to both transports with a small skew:
+        // the serial byte may trail the PS/2 byte by several interrupts.
+        // When only one transport delivered, peek at the other (draining
+        // its FIFO first) to catch a lagging mirror before returning.
+        let ser = match ser {
+            Some(b) => Some(b),
+            None => {
+                crate::cons::poll_serial_rx();
+                match crate::cons::serial_peek() {
+                    Some(b) if Some(b) == ps2 => {
+                        // Mirror caught up: consume and collapse.
+                        let _ = crate::cons::serial_getchar();
+                        None
+                    }
+                    _ => None,
+                }
+            }
         };
-        if let Some(c) = ascii {
-            return Some(c);
+
+        match (ps2, ser) {
+            (Some(a), Some(b)) => {
+                // Mirror of the same keystroke: collapse to one character.
+                // If they differ, keep the serial byte for the next read so
+                // no input is lost.
+                if a != b {
+                    crate::cons::unread_serial(b);
+                }
+                Some(a)
+            }
+            (Some(a), None) => Some(a),
+            (None, s) => s,
         }
-        crate::cons::serial_getchar()
+    }
+
+    /// Poll the PS/2 keyboard controller and translate one complete key.
+    ///
+    /// A single key can produce several bytes (an escape sequence) or none
+    /// at all (a modifier), so translated output is staged in
+    /// `pending_input` and drained one byte at a time.
+    fn poll_ps2(&self) -> Option<u8> {
+        {
+            let mut staged = self.pending_input.lock();
+            if !staged.is_empty() {
+                return Some(staged.remove(0));
+            }
+        }
+
+        // The interrupt path may have just consumed this keystroke and
+        // queued it in `input_buffer`; QEMU keeps the scancode port
+        // readable for a short while after the IRQ, so a naive poll here
+        // would deliver the key a second time.  The buffered read at the
+        // top of `get_char` saw the queued bytes first, so when we reach
+        // this point with the flag set, the flag refers to the *next*
+        // key still in flight — stand down once per delivered IRQ.
+        if crate::keymap::irq_delivered_pending() {
+            crate::keymap::clear_irq_delivered();
+            return None;
+        }
+
+        // On port-I/O architectures, poll the PS/2 keyboard output
+        // buffer (port 0x60) when the OBF bit (bit 0 of port 0x64) is
+        // set.  Elsewhere (aarch64 PL011) there is no PS/2 controller:
+        // the console's serial transport delivers the bytes instead.
+        #[cfg(target_arch = "x86_64")]
+        loop {
+            let status: u8 = crate::plan9_arch::hal::io::inb(0x64);
+            if (status & 0x01) == 0 {
+                return None;
+            }
+            let scan: u8 = crate::plan9_arch::hal::io::inb(0x60);
+            let bytes = crate::keymap::translate(scan);
+            if bytes.is_empty() {
+                // Modifier or unmapped key: keep polling for a real one.
+                continue;
+            }
+            let mut staged = self.pending_input.lock();
+            staged.extend_from_slice(bytes);
+            return Some(staged.remove(0));
+        }
+
+        // Non-port-I/O architectures have no PS/2 controller; console
+        // input arrives through the serial transport in `get_char`.
+        #[cfg(not(target_arch = "x86_64"))]
+        return None;
     }
 
     /// Write characters to output (screen/serial)
@@ -925,7 +1003,9 @@ impl RamDev {
             mtime: 0,
             length: 0,
             name: b"dev".to_vec(),
-        });
+            uid: 0,
+            gid: 0,
+});
 
         entries.push(DirEntry {
             dev: devtype::SD,
@@ -935,7 +1015,9 @@ impl RamDev {
             mtime: 0,
             length: 0,
             name: b"tmp".to_vec(),
-        });
+            uid: 0,
+            gid: 0,
+});
 
         Self {
             name: "ram",
@@ -962,7 +1044,9 @@ impl RamDev {
             mtime: 0,
             length: 0,
             name: name.as_bytes().to_vec(),
-        });
+            uid: 0,
+            gid: 0,
+});
     }
 
     /// Find an entry by name
@@ -1474,8 +1558,21 @@ pub fn dev_close(chan: &mut Chan) -> Result<(), Error> {
     Ok(())
 }
 
+/// Truncate the file behind `chan` to zero length.
+pub fn dev_truncate(chan: &mut Chan) -> Result<(), Error> {
+    let dev = devs_mut().get_mut(chan.dev).ok_or(Error::Enoent)?;
+    dev.truncate(chan)
+}
+
 /// Get device channel status
+
 pub fn dev_stat(chan: &mut Chan) -> Result<DirEntry, Error> {
     let dev = devs_mut().get_mut(chan.dev).ok_or(Error::Enoent)?;
     dev.stat(chan)
+}
+
+/// Apply a directory-entry update to the file behind `chan`.
+pub fn dev_wstat(chan: &mut Chan, dir: &DirEntry) -> Result<(), Error> {
+    let dev = devs_mut().get_mut(chan.dev).ok_or(Error::Enoent)?;
+    dev.wstat(chan, dir)
 }

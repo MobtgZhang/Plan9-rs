@@ -190,7 +190,9 @@ impl Dev for SrvDev {
             mtime: 0,
             length: 0,
             name: b"srv".to_vec(),
-        })
+            uid: 0,
+            gid: 0,
+})
     }
 
     fn wstat(&mut self, _chan: &mut Chan, _dir: &DirEntry) -> Result<(), DevError> {

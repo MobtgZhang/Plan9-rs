@@ -567,6 +567,14 @@ fn walk_from_root(
         }
     }
 
+    if let NamecMode::Remove = amode {
+        if let Some(dev) = devs_mut().get_mut(chan.dev) {
+            dev.remove(&mut chan).map_err(VfsError::from_dev_error)?;
+        } else {
+            return Err(VfsError::Enoent);
+        }
+    }
+
     Ok(chan)
 }
 
@@ -769,6 +777,10 @@ pub fn sys_create(path: &[u8], mode: u32, perm: u32) -> Result<i32, VfsError> {
     let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
     dev.open(&mut chan, mode as u8)
         .map_err(VfsError::from_dev_error)?;
+    // Plan 9 `create` truncates an existing file.  Opening an existing
+    // file goes through the walk path, so the truncation has to happen
+    // here rather than in the device's create hook.
+    crate::dev::dev_truncate(&mut chan).map_err(VfsError::from_dev_error)?;
     alloc_fd(chan)
 }
 

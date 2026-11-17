@@ -343,7 +343,9 @@ impl Dev for FsDev {
                 mtime: 0,
                 length: 0,
                 name: b"fs".to_vec(),
-            });
+                uid: 0,
+                gid: 0,
+});
         }
         let (_, node, fs) = self.node_of(ch)?;
         let info = fs.node_info(node).map_err(|_| DevError::Eio)?;
@@ -361,7 +363,9 @@ impl Dev for FsDev {
             mtime: 0,
             length: info.size,
             name,
-        })
+                uid: 0,
+                gid: 0,
+})
     }
 
     fn create(&mut self, _ch: &mut Chan, _name: &str, _mode: u8, _perm: u32) -> Result<(), DevError> {

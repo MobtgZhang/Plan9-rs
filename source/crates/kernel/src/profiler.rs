@@ -435,7 +435,9 @@ impl Dev for ProfDev {
             mtime: 0,
             length: config.count() * (core::mem::size_of::<ProfSample>() as u64),
             name: b"prof".to_vec(),
-        })
+            uid: 0,
+            gid: 0,
+})
     }
 
     fn dev_char(&self) -> char {

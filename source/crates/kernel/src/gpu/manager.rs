@@ -24,6 +24,7 @@ pub fn is_initialised() -> bool {
 /// Initialise the GPU subsystem.
 pub fn init_from_bootinfo(fb_config: Option<&crate::entry::FramebufferConfig>) {
     use super::gop::GopEngine;
+    #[cfg(target_arch = "x86_64")]
     use super::bochs_vbe::BochsVbeEngine;
     use super::virtio_gpu::VirtioGpuEngine;
 
@@ -39,12 +40,17 @@ pub fn init_from_bootinfo(fb_config: Option<&crate::entry::FramebufferConfig>) {
         }
     }
 
-    // Priority 2: QEMU Bochs VBE via PCI
-    serial::put_bytes(b"[gpu::manager] trying Bochs VBE...\n");
-    if let Some(bochs) = BochsVbeEngine::new() {
-        serial::put_bytes(b"[gpu::manager] using Bochs VBE engine\n");
-        store_engine(Box::new(bochs));
-        return;
+    // Priority 2: QEMU Bochs VBE via PCI (port-I/O dispi interface —
+    // x86_64 only; the aarch64 virt board has no Bochs VGA and the port
+    // access would fault).
+    #[cfg(target_arch = "x86_64")]
+    {
+        serial::put_bytes(b"[gpu::manager] trying Bochs VBE...\n");
+        if let Some(bochs) = BochsVbeEngine::new() {
+            serial::put_bytes(b"[gpu::manager] using Bochs VBE engine\n");
+            store_engine(Box::new(bochs));
+            return;
+        }
     }
 
     // Priority 3: QEMU virtio-gpu via PCI

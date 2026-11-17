@@ -766,7 +766,9 @@ impl Dev for PipeDev {
             mtime: 0,
             length,
             name,
-        })
+            uid: 0,
+            gid: 0,
+})
     }
 
     fn wstat(&mut self, _ch: &mut Chan, _dir: &DirEntry) -> Result<(), DevError> {

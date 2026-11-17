@@ -108,6 +108,29 @@ impl FrameAllocator {
         }
     }
 
+    /// Mark every frame in `[start, end)` as allocated (reserved).
+    ///
+    /// Used at init to record frames that hold live data (kernel image,
+    /// boot heap, loader modules, ...).  Frames outside the managed pool
+    /// are ignored.
+    pub fn mark_range_reserved(&mut self, start: u64, end: u64) {
+        let frame_size = PAGESIZE as u64;
+        let base_u64 = self.base.as_u64();
+        let total = self.total_frames;
+        // Skip everything below the pool start; align to a frame boundary.
+        let mut cur = if start < base_u64 { base_u64 } else { start };
+        cur &= !(frame_size - 1);
+        while cur < end {
+            let frame_idx = ((cur - base_u64) / frame_size) as usize;
+            if frame_idx >= total {
+                break;
+            }
+            self.bitmap[frame_idx / 64]
+                .fetch_or(1u64 << (frame_idx % 64), core::sync::atomic::Ordering::Relaxed);
+            cur += frame_size;
+        }
+    }
+
     /// Allocate a single physical frame
     pub fn alloc_frame(&mut self) -> Option<PhysAddr> {
         let _guard = self.lock.lock();
@@ -1423,19 +1446,135 @@ impl UserPageTable {
     }
 }
 
-/// Map a physical address range into kernel virtual memory using 2MB huge pages.
+/// Phys-map windows served by the kernel's own page table (see
+/// `ensure_kernel_page_table`): each is a PML4 slot backed by a PDPT of
+/// 1 GiB huge pages, so `window | phys` translates directly to `phys`
+/// for any address below 512 GiB.
+const PHYS_MAP_9000: u64 = 0xFFFF_9000_0000_0000; // MMIO window (UC)
+const PHYS_MAP_8800: u64 = 0xFFFF_8800_0000_0000; // phys_to_virt window (UC)
+const PHYS_MAP_LIMIT: u64 = 512 << 30;            // PDPT covers 512 GiB
+
+/// Physical address of the kernel-owned PML4, installed on the first
+/// `map_phys_range` call.  0 until then.
+static KERNEL_PML4: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PML4 slot indices for the phys-map windows (bits 47:39 of the VA).
+const PML4_IDX_8800: usize = 272; // 0xFFFF_8800_0000_0000 >> 39 & 0x1FF
+const PML4_IDX_9000: usize = 288; // 0xFFFF_9000_0000_0000 >> 39 & 0x1FF
+
+/// Build a kernel-owned PML4 and switch to it.
 ///
-/// Walks the existing PML4 (set up by `early_paging_init`) and installs new
-/// PDPT and PD tables as needed. Returns the kernel virtual address where
-/// the range starts. Uses a fixed mapping window at `0xFFFF_C000_0000_0000`
-/// plus the physical address offset, so different physical bases get
-/// different virtual bases.
+/// The firmware (OVMF) hands us a page table whose pages are mapped
+/// READ-ONLY, so we cannot install MMIO mappings by appending entries to
+/// it — the write faults with a write-protection violation (QEMU: #PF
+/// e=3, CR2 inside the firmware page-table page).  Instead we create our
+/// own PML4:
 ///
-/// Uses PRESENT | WRITABLE | NX | GLOBAL | PS (2MB huge page) flags.
+///   * PML4[0]   -> own PDPT, PDPT[0] = 1 GiB identity huge page (RW, WB),
+///                  covering everything the kernel itself runs in.
+///   * PML4[272] -> own PDPT of 1 GiB huge pages (RW, WB) serving the
+///                  0xFFFF_8800 phys_to_virt window (normal RAM access).
+///   * PML4[288] -> own PDPT of 1 GiB huge pages (RW, PCD=UC) serving
+///                  the 0xFFFF_9000 MMIO window.
+///   * every other non-zero PML4 entry is copied verbatim from the
+///     firmware table (e.g. the GOP framebuffer window at PML4[511]),
+///     which we use but never modify.
+///
+/// The firmware's entries are only *read* (through the low 1 GiB identity
+/// mapping, still live until we switch CR3), so the read-only protection
+/// does not matter.
+unsafe fn ensure_kernel_page_table() -> u64 {
+    use core::sync::atomic::Ordering;
+
+    let cached = KERNEL_PML4.load(Ordering::Acquire);
+    if cached != 0 {
+        return cached;
+    }
+
+    let pml4 = match alloc_frame_zeroed() {
+        Some(p) => p.as_u64(),
+        None => return 0,
+    };
+    let pdpt_low = match alloc_frame_zeroed() {
+        Some(p) => p.as_u64(),
+        None => return 0,
+    };
+    let pdpt_ram = match alloc_frame_zeroed() {
+        Some(p) => p.as_u64(),
+        None => return 0,
+    };
+    let pdpt_mmio = match alloc_frame_zeroed() {
+        Some(p) => p.as_u64(),
+        None => return 0,
+    };
+
+    // PML4[0]: full 512 GiB identity map (huge pages, RW, WB) so that
+    // direct physical writes (alloc_frame_zeroed zeroing, module access,
+    // ...) work for any frame the allocator may hand out.
+    core::ptr::write_volatile(pml4 as *mut u64, pdpt_low | 0x3u64);
+    for i in 0..512usize {
+        core::ptr::write_volatile(
+            (pdpt_low as *mut u64).add(i),
+            ((i as u64) << 30) | 0x83u64, // 1 GiB huge page, P | RW | PS, WB
+        );
+    }
+
+    // PDPT for the phys_to_virt window: entry i maps [i*1GiB, (i+1)*1GiB)
+    // as a WB huge page — 0x83 = P | RW | PS with PWT/PCD clear (WB).
+    for i in 0..512usize {
+        core::ptr::write_volatile(
+            (pdpt_ram as *mut u64).add(i),
+            ((i as u64) << 30) | 0x83u64,
+        );
+    }
+    core::ptr::write_volatile((pml4 as *mut u64).add(PML4_IDX_8800), pdpt_ram | 0x3u64);
+
+    // PDPT for the MMIO window: same layout but with PCD (uncacheable)
+    // set — 0x93 = P | RW | PS | PCD.
+    for i in 0..512usize {
+        core::ptr::write_volatile(
+            (pdpt_mmio as *mut u64).add(i),
+            ((i as u64) << 30) | 0x93u64,
+        );
+    }
+    core::ptr::write_volatile((pml4 as *mut u64).add(PML4_IDX_9000), pdpt_mmio | 0x3u64);
+
+    // Copy the firmware's remaining PML4 entries (GOP framebuffer window,
+    // any firmware-reserved higher mappings).  Reading the firmware PML4
+    // is fine: it is identity-mapped in the low 1 GiB and we only read.
+    let old_cr3 = crate::plan9_arch::hal::mmu::cr3_read().as_u64() & 0x000F_FFFF_FFFF_F000;
+    for i in 0..512usize {
+        if i == 0 || i == PML4_IDX_8800 || i == PML4_IDX_9000 {
+            continue;
+        }
+        let v = core::ptr::read_volatile((old_cr3 as *const u64).add(i));
+        if v != 0 {
+            core::ptr::write_volatile((pml4 as *mut u64).add(i), v);
+        }
+    }
+
+    serial::put_bytes(b"[vm] kernel page table installed, pml4=");
+    serial::put_hex_u64(pml4);
+    serial::put_bytes(b" (was ");
+    serial::put_hex_u64(old_cr3);
+    serial::put_bytes(b")\n");
+
+    KERNEL_PML4.store(pml4, Ordering::Release);
+    // Switch CR3 (also flushes the whole TLB).
+    crate::plan9_arch::hal::mmu::cr3_write(PhysAddr::new(pml4));
+    pml4
+}
+
+/// Map a physical address range into kernel virtual memory.
+///
+/// With the kernel-owned page table (see `ensure_kernel_page_table`) the
+/// phys-map windows are direct 1 GiB huge-page translations, so this is a
+/// pure address computation for any physical address below 512 GiB.
+/// Returns the kernel virtual address of `phys`, or null on failure.
 ///
 /// # Safety
-/// Must be called after `early_paging_init`. The mapping window is fixed
-/// and must not collide with existing critical mappings.
+/// Must be called after the frame allocator is initialised.  The mapping
+/// is uncacheable (PCD), which is what MMIO and framebuffers want.
 pub unsafe fn map_phys_range(phys: u64, size: u64) -> *mut u8 {
     use crate::plan9_arch::hal::paging::PAGE_SHIFT;
 
@@ -1448,83 +1587,21 @@ pub unsafe fn map_phys_range(phys: u64, size: u64) -> *mut u8 {
     let page_size: u64 = 1u64 << PAGE_SHIFT;
     let phys_aligned = phys & !(page_size - 1);
     let end = (phys + size + page_size - 1) & !(page_size - 1);
-    let total = end - phys_aligned;
-    let pages = total / page_size;
 
-    let phys_offset = phys_aligned & 0x0FFF_FFFF; // 28 bits = 256 MiB window
-    let base_virt = 0xFFFF_9000_0000_0000u64 | phys_offset;
-
-    let old_cr3: u64 = crate::plan9_arch::hal::mmu::cr3_read().as_u64();
-    serial::put_bytes(b"[map_phys_range] CR3=0x");
-    serial::put_hex_u64(old_cr3);
-    serial::put_bytes(b"\n");
-
-    serial::put_bytes(b"[map_phys_range] pages=");
-    serial::put_hex_u64(pages as u64);
-    serial::put_bytes(b" base_virt=");
-    serial::put_hex_u64(base_virt);
-    serial::put_bytes(b"\n");
-
-    static mut SCRATCH_TOP: u64 = 0x380000;
-    let _scratch_ptr = SCRATCH_TOP as *mut u8;
-
-    let pml4_phys = old_cr3;
-    let mut page_idx: u64 = 0;
-    while page_idx < pages {
-        let cur_phys = phys_aligned + page_idx * page_size;
-        let cur_virt = base_virt + page_idx * page_size;
-        let indices = crate::plan9_arch::hal::paging::PageTableIndices::from_virt(
-            plan9_common::types::VirtAddr::new(cur_virt)
-        );
-
-        let pml4_entry_ptr = (pml4_phys as *mut u64).add(indices.pml4);
-        let pml4_entry = core::ptr::read_volatile(pml4_entry_ptr);
-        let pdpt_phys = if (pml4_entry & 1) == 0 {
-            let new_pdpt_phys = SCRATCH_TOP;
-            SCRATCH_TOP += page_size;
-            core::ptr::write_bytes(new_pdpt_phys as *mut u8, 0, page_size as usize);
-            let new_entry = new_pdpt_phys | 0x3u64;
-            core::ptr::write_volatile(pml4_entry_ptr, new_entry);
-            new_pdpt_phys
-        } else {
-            pml4_entry & 0x000_FFFF_FFFF_F000
-        };
-
-        let pdpt_entry_ptr = (pdpt_phys as *mut u64).add(indices.pdpt);
-        let pdpt_entry = core::ptr::read_volatile(pdpt_entry_ptr);
-        let pd_phys = if (pdpt_entry & 1) == 0 {
-            let new_pd_phys = SCRATCH_TOP;
-            SCRATCH_TOP += page_size;
-            core::ptr::write_bytes(new_pd_phys as *mut u8, 0, page_size as usize);
-            let new_entry = new_pd_phys | 0x3u64;
-            core::ptr::write_volatile(pdpt_entry_ptr, new_entry);
-            new_pd_phys
-        } else {
-            pdpt_entry & 0x000_FFFF_FFFF_F000
-        };
-
-        let pd_entry_ptr = (pd_phys as *mut u64).add(indices.pd);
-        // For huge pages (PS=1) the address bits 51:21 are honoured;
-        // bits 20:0 are reserved for flags. Drop the low bits of the
-        // physical address so the resulting PTE only carries an
-        // aligned base.
-        let cur_phys_aligned = cur_phys & !0x1F_FFFFu64;
-        let pd_flags: u64 = 1u64 | (1u64 << 1) | (1u64 << 7) | (1u64 << 8) | (1u64 << 63);
-        let new_pd_entry = cur_phys_aligned | pd_flags;
-        core::ptr::write_volatile(pd_entry_ptr, new_pd_entry);
-        // Invalidate any cached translation for this address, then
-        // globally flush the TLB by reloading the root table.
-        crate::plan9_arch::hal::mmu::invlpg(VirtAddr::new(cur_virt));
-        crate::plan9_arch::hal::mmu::cr3_write(PhysAddr::new(old_cr3));
-
-        page_idx += 1;
+    if phys_aligned >= PHYS_MAP_LIMIT || end > PHYS_MAP_LIMIT {
+        serial::put_bytes(b"[map_phys_range] FAILED: phys outside 512GiB window\n");
+        return core::ptr::null_mut();
     }
 
+    if ensure_kernel_page_table() == 0 {
+        serial::put_bytes(b"[map_phys_range] FAILED: page table alloc\n");
+        return core::ptr::null_mut();
+    }
+
+    let base_virt = PHYS_MAP_9000 + phys_aligned;
     let result_virt = base_virt + (phys - phys_aligned);
     serial::put_bytes(b"[map_phys_range] DONE, virt=");
     serial::put_hex_u64(result_virt);
-    serial::put_bytes(b" scratch_top=");
-    serial::put_hex_u64(SCRATCH_TOP);
     serial::put_bytes(b"\n");
     result_virt as *mut u8
 }

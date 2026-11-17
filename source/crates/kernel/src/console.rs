@@ -51,6 +51,22 @@ static mut UTF8_BUF: [u8; 4] = [0; 4];
 static mut UTF8_LEN: usize = 0;
 static mut UTF8_NEED: usize = 0;
 
+// ---------------------------------------------------------------------------
+// ANSI escape-sequence state
+// ---------------------------------------------------------------------------
+//
+// The shell writes VT100 sequences for cursor movement and screen clearing.
+// Only the handful of sequences the line editor actually emits are handled;
+// everything else is swallowed so stray bytes never litter the screen.
+
+const ESC_NONE: u8 = 0;
+const ESC_START: u8 = 1;
+const ESC_CSI: u8 = 2;
+
+static mut ESC_STATE: u8 = ESC_NONE;
+static mut ESC_PARAM: u32 = 0;
+static mut ESC_HAS_PARAM: bool = false;
+
 // ============================================================================
 // Initialisation
 // ============================================================================
@@ -188,6 +204,8 @@ fn decode_byte(c: u8) -> Event {
         }
         match c {
             b'\n' | b'\r' | b'\t' | b'\x08' => Event::Ctrl(c),
+            // DEL is what terminals send for Backspace.
+            0x7f => Event::Ctrl(b'\x08'),
             0x20..=0x7e => Event::Char(c as char),
             _ => Event::Skip,
         }
@@ -242,6 +260,142 @@ fn utf8_seq_len(lead: u8) -> Option<usize> {
 }
 
 // ============================================================================
+// ANSI escape handling
+// ============================================================================
+
+/// Feed one byte to the escape-sequence state machine.
+///
+/// Returns `true` when the byte was part of a sequence (and therefore must
+/// not be rendered).  Only the small VT100 subset that the shell's line
+/// editor emits is interpreted; other sequences are discarded.
+fn consume_escape(c: u8) -> bool {
+    let state = unsafe { ESC_STATE };
+    match state {
+        ESC_NONE => {
+            if c == 0x1b {
+                unsafe { ESC_STATE = ESC_START };
+                return true;
+            }
+            false
+        }
+        ESC_START => {
+            if c == b'[' {
+                unsafe {
+                    ESC_STATE = ESC_CSI;
+                    ESC_PARAM = 0;
+                    ESC_HAS_PARAM = false;
+                }
+                true
+            } else {
+                // Not a CSI sequence: drop both bytes.
+                unsafe { ESC_STATE = ESC_NONE };
+                true
+            }
+        }
+        _ => {
+            // Parameter bytes: digits accumulate, `;` is ignored.
+            if c.is_ascii_digit() {
+                unsafe {
+                    ESC_PARAM = ESC_PARAM
+                        .saturating_mul(10)
+                        .saturating_add((c - b'0') as u32);
+                    ESC_HAS_PARAM = true;
+                }
+                return true;
+            }
+            if c == b';' || c == b'?' {
+                return true;
+            }
+
+            let param = unsafe { ESC_PARAM };
+            let has_param = unsafe { ESC_HAS_PARAM };
+            unsafe { ESC_STATE = ESC_NONE };
+
+            match c {
+                b'A' => move_cursor(0, -(param.max(1) as i32)),
+                b'B' => move_cursor(0, param.max(1) as i32),
+                b'C' => move_cursor(param.max(1) as i32, 0),
+                b'D' => move_cursor(-(param.max(1) as i32), 0),
+                b'H' | b'f' => {
+                    // Cursor home (parameters are row;column, both 1-based).
+                    unsafe {
+                        CURSOR_X = 0;
+                        CURSOR_Y = 0;
+                        CURSOR_DRAWN = false;
+                    }
+                }
+                b'J' => {
+                    // 2 = clear the whole screen, otherwise clear to the end.
+                    if !has_param || param == 2 || param == 3 {
+                        clear_screen();
+                    } else {
+                        clear_to_end();
+                    }
+                }
+                b'K' => clear_to_end(),
+                _ => {}
+            }
+            true
+        }
+    }
+}
+
+/// Reposition the text cursor, clamping it to the visible grid.
+fn move_cursor(dx: i32, dy: i32) {
+    let (cols, rows) = unsafe { (COLS as i32, ROWS as i32) };
+    let cell_w = unsafe { CELL_W as i32 };
+    let line_h = unsafe { LINE_H as i32 };
+    let max_x = (cols - 1).max(0) * cell_w;
+    let max_y = (rows - 1).max(0) * line_h;
+    unsafe {
+        CURSOR_X = (CURSOR_X + dx * cell_w).clamp(0, max_x);
+        CURSOR_Y = (CURSOR_Y + dy * line_h).clamp(0, max_y);
+        CURSOR_DRAWN = false;
+    }
+}
+
+/// Fill the whole framebuffer with the background colour.
+fn clear_screen() {
+    gpu::manager::with_mut(|engine| {
+        let (w, h) = {
+            let i = engine.info();
+            (i.width, i.height)
+        };
+        let bg = unsafe { BG_COLOR };
+        engine.fill_rect(gpu::Rect::new(0, 0, w, h), bg);
+        engine.flush();
+    });
+    unsafe {
+        CURSOR_X = 0;
+        CURSOR_Y = 0;
+        CURSOR_DRAWN = false;
+    }
+}
+
+/// Erase from the cursor to the end of the screen.
+fn clear_to_end() {
+    gpu::manager::with_mut(|engine| {
+        let (w, h) = {
+            let i = engine.info();
+            (i.width, i.height)
+        };
+        let bg = unsafe { BG_COLOR };
+        let cx = unsafe { CURSOR_X }.max(0) as u32;
+        let cy = unsafe { CURSOR_Y }.max(0) as u32;
+        if cy < h {
+            engine.fill_rect(gpu::Rect::new(0, cy, w, h - cy), bg);
+            // Redraw the strip to the left of the cursor is unnecessary:
+            // the cursor cell is where typing continues.
+            let _ = cx;
+        }
+        engine.flush();
+    });
+    unsafe {
+        CURSOR_DRAWN = false;
+    }
+}
+
+// ============================================================================
 // Character output
 // ============================================================================
 
@@ -260,6 +414,10 @@ pub fn putchar(c: u8) {
         if COLS == 0 || ROWS == 0 {
             return;
         }
+    }
+
+    if consume_escape(c) {
+        return;
     }
 
     let event = decode_byte(c);

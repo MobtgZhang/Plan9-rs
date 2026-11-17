@@ -173,45 +173,12 @@ pub fn reserve_range_pub(start: u64, end: u64) {
 /// `start`/`end` must come from a reserved range recorded by
 /// `reserve_range` — i.e. they must lie inside the allocator's pool.
 unsafe fn mark_reserved(start: u64, end: u64) {
-    // Direct-bitset path: walk the bitmap ourselves. We rely on the
-    // allocator's layout (size_of::<Self>() bytes of struct, then the
-    // bitmap array of u64s starting right after).
-    let alloc_ptr = crate::vm::frame_allocator() as *mut _ as usize;
-    if alloc_ptr == 0 {
-        return;
-    }
-
-    // SAFETY: the allocator exposes its fields publicly; we reproduce the
-    // offset the `new()` constructor used.
-    #[repr(C)]
-    struct Layout {
-        base: PhysAddr,
-        total_frames: usize,
-        bitmap: *mut core::sync::atomic::AtomicU64,
-        _lock: crate::plan9_common::sync::Spinlock<()>,
-    }
-
-    let layout = alloc_ptr as *mut Layout;
-    let base_u64     = { (*layout).base.as_u64() };
-    let total_frames = { (*layout).total_frames };
-    let bitmap_ptr   = { (*layout).bitmap };
-
-    let frame_size = PAGESIZE as u64;
-    let mut cur = start;
-    let mut marked = 0u32;
-    while cur < end {
-        if cur < base_u64 { cur = base_u64; }
-        let frame_idx = ((cur - base_u64) / frame_size) as usize;
-        if frame_idx >= total_frames { break; }
-        let word = frame_idx / 64;
-        let bit  = frame_idx % 64;
-        let p = bitmap_ptr.add(word);
-        (*p).fetch_or(1u64 << bit, core::sync::atomic::Ordering::Relaxed);
-        marked += 1;
-        cur += frame_size;
-    }
-    // Suppress unused warning for marked counter in release builds
-    let _ = marked;
+    // Use the allocator's own method: hand-reinterpreting the struct with a
+    // mirrored `Layout` broke under release builds because the compiler
+    // reordered `FrameAllocator`'s fields (it has no `repr(C)`), so the
+    // mirrored offsets were wrong and the marker corrupted the allocator.
+    let alloc = crate::vm::frame_allocator();
+    alloc.mark_range_reserved(start, end);
 }
 
 /// Allocate a single physical frame, skipping over reserved regions.

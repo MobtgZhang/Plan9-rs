@@ -48,6 +48,8 @@ pub mod procfs;
 // Root filesystem and boot archive
 pub mod rootfs;
 pub mod cpio;
+pub mod upasswd;
+pub mod keymap;
 
 // Devices
 pub mod cons;
@@ -88,6 +90,7 @@ pub mod smp;
 pub mod sema;
 pub mod qlock;
 pub mod timer;
+pub mod rtc;
 pub mod quota;
 
 #[cfg(test)]

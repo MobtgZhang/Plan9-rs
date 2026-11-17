@@ -509,7 +509,9 @@ impl Dev for SyscallTraceDev {
             length: syscall_tracer().config().total_records()
                 * (core::mem::size_of::<SyscallRecord>() as u64),
             name: b"syscalltrace".to_vec(),
-        })
+            uid: 0,
+            gid: 0,
+})
     }
 
     fn dev_char(&self) -> char {

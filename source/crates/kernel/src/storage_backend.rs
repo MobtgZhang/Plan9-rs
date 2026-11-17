@@ -606,15 +606,24 @@ fn read_bar(base: u8, dev: u8, func: u8) -> Option<u64> {
 }
 
 pub fn probe_ata() -> Option<Arc<dyn StorageBackend>> {
-    let channel = plan9_drivers::storage::AtaChannel::get_primary();
-    for slave in [false, true] {
-        if let Ok(device) = channel.identify(slave) {
-            if device.present && device.sectors > 0 {
-                return Some(Arc::new(AtaBackend::new(slave, &device)));
+    // Legacy ATA lives behind the ISA port range 0x1F0/0x3F6, which only
+    // exists on port-I/O architectures; aarch64 virt boards have no
+    // IDE/ISA bridge, and the port access would fault.
+    #[cfg(not(target_arch = "x86_64"))]
+    return None;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let channel = plan9_drivers::storage::AtaChannel::get_primary();
+        for slave in [false, true] {
+            if let Ok(device) = channel.identify(slave) {
+                if device.present && device.sectors > 0 {
+                    return Some(Arc::new(AtaBackend::new(slave, &device)));
+                }
             }
         }
+        None
     }
-    None
 }
 
 pub fn probe_ahci(device: &PciDeviceInfo) -> Vec<Arc<dyn StorageBackend>> {

@@ -312,7 +312,9 @@ impl Dev for WatchdogDev {
             mtime: 0,
             length,
             name: b"watchdog".to_vec(),
-        })
+            uid: 0,
+            gid: 0,
+})
     }
 
     fn dev_char(&self) -> char {

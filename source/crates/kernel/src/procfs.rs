@@ -603,7 +603,9 @@ impl Dev for ProcFsDev {
                         mtime: 0,
                         length: 0,
                         name: alloc::format!("{}", pid).into_bytes(),
-                    });
+                        uid: 0,
+                        gid: 0,
+});
                 }
                 ProcQid::Status => "status",
                 ProcQid::Ctl => "ctl",
@@ -630,7 +632,9 @@ impl Dev for ProcFsDev {
             mtime: 0,
             length: 0,
             name: name.as_bytes().to_vec(),
-        })
+            uid: 0,
+            gid: 0,
+})
     }
     
     fn dev_char(&self) -> char { self.dev_char }

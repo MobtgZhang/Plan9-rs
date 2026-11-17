@@ -743,7 +743,9 @@ impl Dev for UsbDev {
             mtime: 0,
             length: 0,
             name,
-        })
+            uid: 0,
+            gid: 0,
+})
     }
 
     fn wstat(&mut self, _ch: &mut Chan, _dir: &DirEntry) -> Result<(), DevError> {

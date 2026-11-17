@@ -579,7 +579,9 @@ impl Dev for AcpiDev {
             mtime: 0,
             length: 0,
             name: b"acpi".to_vec(),
-        })
+            uid: 0,
+            gid: 0,
+})
     }
 
     fn dev_char(&self) -> char {

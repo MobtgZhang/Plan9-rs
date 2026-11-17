@@ -234,19 +234,20 @@ _start_low:
     /* Disable hardware interrupts until we have our own IDT set up. */
     cli
 
+    /* Save multiboot2 magic in %eax and info pointer in %ebx to .scratch
+     * FIRST — the serial-marker writes below clobber %al. */
+    movl    %eax, %esi
+    movl    %ebx, %edi
+    movl    $_scratch_start, %eax
+    movl    %esi, (%eax)
+    movl    %edi, 8(%eax)
+
     /* Serial marker: confirms we landed in 32-bit mode. */
     movw    $0x3F8, %dx
     movb    $'S', %al
     outb    %al, %dx
     movb    $'1', %al
     outb    %al, %dx
-
-    /* Save multiboot2 magic in %eax and info pointer in %ebx to .scratch */
-    movl    %eax, %esi
-    movl    %ebx, %edi
-    movl    $_scratch_start, %eax
-    movl    %esi, (%eax)
-    movl    %edi, 8(%eax)
 
     /* ------------------------------------------------------------------
      * Minimal page tables: PML4 + 1 PDPT. PML4[0] -> PDPT; PDPT[0]
@@ -343,6 +344,13 @@ _start:
     /* Disable hardware interrupts until we have our own IDT set up. */
     cli
 
+    /* Multiboot2 magic in RAX (from GRUB), info pointer in RBX.
+     * Save to .scratch FIRST — the serial-marker writes below clobber
+     * %al (the low byte of RAX!). */
+    leaq    _scratch_start(%rip), %rcx
+    movq    %rax, (%rcx)             /* scratch[0] = magic */
+    movq    %rbx, 8(%rcx)           /* scratch[8] = info pointer */
+
     /* Serial debug: confirms we reached _start */
     movw    $0x3F8, %dx
     movb    $'S', %al
@@ -352,19 +360,15 @@ _start:
     movb    $'\n', %al
     outb    %al, %dx
 
-    /* Multiboot2 magic in RAX (from GRUB), info pointer in RBX.
-     * Save to .scratch so kstart can read them safely (stack might not be ready). */
-    leaq    _scratch_start(%rip), %rcx
-    movq    %rax, (%rcx)             /* scratch[0] = magic */
-    movq    %rbx, 8(%rcx)           /* scratch[8] = info pointer */
-
     /* Load kernel stack */
     leaq    _bootstack_top(%rip), %rsp
     andq    $-16, %rsp
 
-    /* Call kstart(magic=RAX, info=RBX) */
-    movq    %rax, %rdi
-    movq    %rbx, %rsi
+    /* Call kstart(magic, info) — reload both from .scratch because the
+     * serial-marker writes above clobbered %al (low byte of RAX). */
+    leaq    _scratch_start(%rip), %rcx
+    movq    0(%rcx), %rdi              /* magic */
+    movq    8(%rcx), %rsi              /* info pointer */
     call    kstart
 
     /* Should never return */
