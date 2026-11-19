@@ -25,12 +25,12 @@ static EXTENDED: AtomicBool = AtomicBool::new(false);
 static IN_IRQ: AtomicBool = AtomicBool::new(false);
 
 /// Claim the keyboard controller from the IRQ handler.
-pub fn IN_IRQ_MARK() {
+pub fn in_irq_mark() {
     IN_IRQ.store(true, Ordering::Release);
 }
 
 /// Release the keyboard controller after the IRQ handler finished.
-pub fn IN_IRQ_CLEAR() {
+pub fn in_irq_clear() {
     IN_IRQ.store(false, Ordering::Release);
 }
 

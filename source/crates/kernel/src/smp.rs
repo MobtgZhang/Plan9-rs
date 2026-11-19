@@ -12,9 +12,8 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::frame_alloc;
-use crate::plan9_arch::hal::paging::{phys_to_virt, PAGESIZE};
-use plan9_common::types::PhysAddr;
+#[cfg(target_arch = "x86_64")]
+use crate::{frame_alloc, plan9_arch::hal::paging::PAGESIZE};
 
 /// Physical page the trampoline binary is linked at (SIPI vector 0x50).
 const AP_TRAMPOLINE: u64 = 0x50000;
@@ -52,7 +51,7 @@ static mut RSDP_COPY_LEN: usize = 0;
 pub fn store_rsdp_copy(bytes: &[u8]) {
     let n = bytes.len().min(36);
     unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), RSDP_COPY.as_mut_ptr(), n);
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), (&raw mut RSDP_COPY).cast::<u8>(), n);
         RSDP_COPY_LEN = n;
     }
 }
@@ -61,7 +60,7 @@ pub fn store_rsdp_copy(bytes: &[u8]) {
 /// the kernel image, which is identity-mapped, so the address can be used
 /// directly as an RSDP pointer (the bytes are identical to the original).
 #[cfg(target_arch = "x86_64")]
-fn rsdp_from_copy() -> Option<u64> {
+pub(crate) fn rsdp_from_copy() -> Option<u64> {
     unsafe {
         if RSDP_COPY_LEN < 20 {
             return None;
@@ -361,7 +360,7 @@ fn start_ap(apic_id: u8) -> bool {
         // +0x08 u64 ap_stack_top
         (mb.add(0x08) as *mut u64).write_volatile(stack_top_virt);
         // +0x10 u64 ap_entry
-        (mb.add(0x10) as *mut u64).write_volatile(ap_main as usize as u64);
+        (mb.add(0x10) as *mut u64).write_volatile(ap_main as *const () as usize as u64);
         // +0x18 u32 ap_cr3
         (mb.add(0x18) as *mut u32).write_volatile(ap_pml4.as_u64() as u32);
         // +0x28 lgdt operand: limit16, base32 (linear == physical for the
@@ -460,7 +459,7 @@ pub extern "C" fn ap_main(cpu_id: u32) -> ! {
 
         // Shared IDT: every CPU handles the same vectors.  The arch crate
         // owns the IDT (the kernel's trap::init_idt is unreferenced).
-        unsafe { crate::plan9_arch::hal::idt::idt_init() };
+        crate::plan9_arch::hal::idt::load_idt();
     }
 
     crate::serial::put_bytes(b"[smp] cpu ");

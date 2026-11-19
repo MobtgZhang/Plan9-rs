@@ -127,7 +127,6 @@ pub unsafe fn early_paging_init() {
     let pdpt_phys     = pool.pdpt.0.as_ptr() as u64;
     let pdpt_gop_phys = pool.pdpt_gop.0.as_ptr() as u64;
     let pd_low_phys   = pool.pd_low.0.as_ptr() as u64;
-    let pd_high_phys  = pool.pd_high.0.as_ptr() as u64;
 
     pool.pml4.0[0]     = pdpt_phys     | PTE_PRESENT | PTE_WRITABLE;
     // KERNEL_VIRT_BASE = 0xFFFF_8000_0000_0000 (PML4 index 256)
@@ -139,7 +138,6 @@ pub unsafe fn early_paging_init() {
 
     // PML4[511] -> pdpt_gop. This covers the full canonical upper-half
     // address range 0xFFFF_8000_0000_0000 to 0xFFFF_FFFF_FFFF_FFFF.
-    let pd_gop_phys = pool.pd_gop.0.as_ptr() as u64;
     pool.pml4.0[511]   = pdpt_gop_phys | PTE_PRESENT | PTE_WRITABLE;
     asm!("mov dx, 0x3F8; mov al, 'D'; out dx, al", options(nostack, preserves_flags));
 

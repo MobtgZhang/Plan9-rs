@@ -178,15 +178,13 @@ pub mod console {
             }
         }
         pub fn init() {
-            unsafe {
-                outb(COM1 + 1, 0x00); // no interrupts
-                outb(COM1 + 3, 0x80); // DLAB on
-                outb(COM1 + 0, 12);   // 9600 baud divisor low
-                outb(COM1 + 1, 0);    // divisor high
-                outb(COM1 + 3, 0x03); // 8N1
-                outb(COM1 + 2, 0xC7); // FIFO
-                outb(COM1 + 4, 0x0B); // modem
-            }
+            outb(COM1 + 1, 0x00); // no interrupts
+            outb(COM1 + 3, 0x80); // DLAB on
+            outb(COM1, 12);       // 9600 baud divisor low
+            outb(COM1 + 1, 0);    // divisor high
+            outb(COM1 + 3, 0x03); // 8N1
+            outb(COM1 + 2, 0xC7); // FIFO
+            outb(COM1 + 4, 0x0B); // modem
         }
         pub fn putc(b: u8) {
             unsafe {
@@ -203,12 +201,10 @@ pub mod console {
             }
         }
         pub fn getc() -> Option<u8> {
-            unsafe {
-                if inb(COM1 + 5) & 1 != 0 {
-                    Some(inb(COM1))
-                } else {
-                    None
-                }
+            if inb(COM1 + 5) & 1 != 0 {
+                Some(inb(COM1))
+            } else {
+                None
             }
         }
         pub fn flush() {}
@@ -261,6 +257,23 @@ pub mod switch_to_user {
 }
 
 // ============================================================================
+// timer — generic timer facade (each arch implements its own)
+// ============================================================================
+
+pub mod timer {
+    #[cfg(target_arch = "x86_64")]
+    pub use crate::x86_64::timer::*;
+    #[cfg(target_arch = "aarch64")]
+    pub use crate::aarch64::timer::*;
+    #[cfg(target_arch = "riscv64")]
+    pub use crate::riscv64::timer::*;
+    #[cfg(target_arch = "loongarch64")]
+    pub use crate::loongarch64::timer::*;
+    #[cfg(target_arch = "x86")]
+    pub use crate::i386::timer::*;
+}
+
+// ============================================================================
 // x86-only subsystems (gdt/idt/smp) — empty on other architectures
 // ============================================================================
 
@@ -276,7 +289,7 @@ pub mod idt {
 
 pub mod smp {
     /// AP trampoline code blob (x86_64 INIT-SIPI bring-up).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_os = "none"))]
     pub use crate::x86_64::smp::AP_TRAMPOLINE;
 }
 

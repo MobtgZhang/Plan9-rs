@@ -13,9 +13,12 @@
 
 extern crate plan9_common;
 
-/// Initial `sstatus` for user entry: SPP=0 (U-mode), SPIE=1, MPIE=0.
-/// Bits: SPP (8) = 0, SPIE (5) = 1 → 0x20.
-pub const USER_SSTATUS_INIT: u64 = 1 << 5;
+/// Initial `sstatus` for user entry: SPP=0 (U-mode), SPIE=0, i.e. 0.
+/// SPIE must be clear: `sret` copies SPIE into SIE, and with the trap
+/// handler reserved for exceptions we keep the S-mode interrupt enable
+/// off in user mode — `ecall` exceptions are not gated by SIE, so
+/// syscalls still reach the kernel.  (Bit 5 = SPIE.)
+pub const USER_SSTATUS_INIT: u64 = 0;
 
 /// Selectors kept for API parity with the x86_64 module.
 pub const USER_DS: u16 = 0;
@@ -62,6 +65,14 @@ pub unsafe fn switch_to_user_trampoline(pml4_phys: u64, frame_ptr: u64) -> ! {
     );
 }
 
+// boot.S keeps the supervisor trap frame here; `sscratch` must point at it
+// whenever user code runs, because the trap entry swaps sp <-> sscratch as
+// its very first instruction.  Every path that resumes user mode through
+// this function bypasses boot.S's exit restore, so it is redone here.
+extern "C" {
+    static _user_trap_area: u8;
+}
+
 /// Resume a user process after a kernel-mode syscall/trap.
 ///
 /// Trap-frame layout (written by the vector save code):
@@ -77,6 +88,16 @@ pub unsafe fn switch_to_user_trampoline(pml4_phys: u64, frame_ptr: u64) -> ! {
 /// # Safety
 /// Never returns.
 pub unsafe fn kernel_resume_user(frame_ptr: u64, pml4_phys: u64) -> ! {
+    // Re-point sscratch at the supervisor trap frame (see above); leaving
+    // it as the previous process's user sp would make the next trap save
+    // its frame onto a U-mode page — which faults (S-mode, SUM=0) and
+    // recurses into the trap entry forever, silently.  boot.S defines the
+    // frame as the top 34 slots (272 bytes) of the 8 KiB trap area.
+    core::arch::asm!(
+        "csrw sscratch, {ft}",
+        ft = in(reg) core::ptr::addr_of!(_user_trap_area) as usize + 8192 - 34 * 8,
+        options(nomem, nostack)
+    );
     super::mmu::cr3_write(plan9_common::types::PhysAddr::new(pml4_phys));
     core::arch::asm!(
         "mv t0, a0",

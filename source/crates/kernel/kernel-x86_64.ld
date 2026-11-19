@@ -110,23 +110,6 @@ SECTIONS
     } :data
 
     /* -----------------------------------------------------------------------
-     * 5b. Static page-table pool — placed in a separate 2 MiB-aligned,
-     *     4 MiB-sized region. Must be reachable via the identity map
-     *     (see MAPPED_BYTES in arch/src/x86_64/paging_init.rs). The pool
-     *     lives outside .bss so the boot-time BSS clear doesn't touch it
-     *     after our early page tables are built.
-     * ----------------------------------------------------------------------- */
-    .pagetable_pool : ALIGN(2M)
-    {
-        _pagetable_pool_start = .;
-        KEEP(*(.pagetable_pool .pagetable_pool.*))
-        . = _pagetable_pool_start + 4M;
-        _pagetable_pool_end = .;
-    } :data
-
-    . = ALIGN(4K);
-
-    /* -----------------------------------------------------------------------
      * 5a. Scratch area — NOT cleared by boot.S. Used by boot.S to stash
      *     GRUB-provided RAX/RBX values before the BSS clear so kstart()
      *     can verify what GRUB actually handed us.
@@ -140,6 +123,21 @@ SECTIONS
         _scratch_start = .;
         . += 16;
         _scratch_end = .;
+    } :data
+
+    /* -----------------------------------------------------------------------
+     * 5b. Static page-table pool — placed in a separate 2 MiB-aligned,
+     *     4 MiB-sized region. Must be reachable via the identity map
+     *     (see MAPPED_BYTES in arch/src/x86_64/paging_init.rs). The pool
+     *     lives outside .bss so the boot-time BSS clear doesn't touch it
+     *     after our early page tables are built.
+     * ----------------------------------------------------------------------- */
+    .pagetable_pool : ALIGN(2M)
+    {
+        _pagetable_pool_start = .;
+        KEEP(*(.pagetable_pool .pagetable_pool.*))
+        . = _pagetable_pool_start + 4M;
+        _pagetable_pool_end = .;
     } :data
 
     /* -----------------------------------------------------------------------

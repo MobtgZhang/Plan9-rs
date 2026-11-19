@@ -7,14 +7,14 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::string::{String, ToString};
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use alloc::format;
 use alloc::vec;
 
 use crate::proc::{ Proc, Pid, State, curproc, curproc_mut, Label, ProcSegment, SegType, AlarmReq };use crate::timer;
 use crate::USER_BASE;
-use crate::sched::{scheduler, yield_ as sched_yield};
+use crate::sched::scheduler;
 use crate::plan9_common::sync::Spinlock;
 use crate::segment::{PAGE_SIZE, page_align_up};
 use crate::vfs::namec;
@@ -526,7 +526,12 @@ pub fn dev_to_proc_chan(chan: crate::dev::Chan) -> crate::vfs::DevChanAdapter {
 
 /// Dispatch a system call from trap handler
 /// This is called from trap.rs with the syscall number and arguments
+/// Last syscall number dispatched (diagnostics for trap dumps).
+pub static LAST_SYSCALL: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 pub fn dispatch(num: usize, frame: &crate::trap::SyscallFrame) -> i64 {
+    LAST_SYSCALL.store(num, core::sync::atomic::Ordering::Relaxed);
     let syscall_frame = SyscallFrame {
         nr: num,
         args: [
@@ -634,6 +639,7 @@ fn sys_internalwait(frame: &SyscallFrame) -> Result<usize> {
     parent.waiting_child = Some(pid);
 
     let frame_ptr = child_frame as *const crate::proc::SavedUserFrame as u64;
+
     // The child is the process whose user frame is being resumed.  Update
     // the global current-process pointer before entering ring 3 so a later
     // EXITS syscall from the child identifies the correct parent.
@@ -767,13 +773,30 @@ pub fn exec_syscall(path: *const u8, argv: *const *const u8, envp: *const *const
     }
 }
 
-/// DEBUG: translate a user virtual address through a process PML4 to a
-/// physical address (0 if unmapped).  Used only by exec diagnostics.
+/// Translate a user virtual address through a process PML4 to a
+/// physical address (0 if unmapped).  Used by exec to validate that the
+/// new image and stack are really mapped before returning to user mode.
+///
+/// aarch64 note: block descriptors are detected by `bit0=1 && bit1=0`
+/// (table descriptors have bits[1:0]=0b11), not by the x86 PS bit.
+#[cfg(not(target_arch = "riscv64"))]
 unsafe fn translate_user_paddr(pml4_phys: u64, vaddr: u64) -> u64 {
-    use crate::init_loader::{read_pte, write_pte};
-    let _ = write_pte;
+    use crate::init_loader::read_pte;
     const PRESENT: u64 = 1;
+    #[cfg(target_arch = "aarch64")]
+    const PS: u64 = 0; // unused on aarch64; block test below
+    #[cfg(not(target_arch = "aarch64"))]
     const PS: u64 = 1 << 7;
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    fn is_block(e: u64) -> bool {
+        e & 1 != 0 && e & 2 == 0
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    #[inline]
+    fn is_block(e: u64) -> bool {
+        e & (1 << 7) != 0
+    }
     let mask = 0x000F_FFFF_FFFF_F000;
     let i4 = ((vaddr >> 39) & 0x1FF) as usize;
     let i3 = ((vaddr >> 30) & 0x1FF) as usize;
@@ -782,16 +805,21 @@ unsafe fn translate_user_paddr(pml4_phys: u64, vaddr: u64) -> u64 {
 
     let pml4e = read_pte(pml4_phys, i4);
     if pml4e & PRESENT == 0 { return 0; }
+    #[cfg(target_arch = "aarch64")]
+    if is_block(pml4e) {
+        // L0-level 512 GiB block (never created, but be consistent).
+        return (pml4e & mask) + (vaddr & 0x7F_FFFF_FFFF);
+    }
     let pdpt = pml4e & mask;
     let pdpte = read_pte(pdpt, i3);
     if pdpte & PRESENT == 0 { return 0; }
-    if pdpte & PS != 0 {
+    if is_block(pdpte) {
         return (pdpte & mask) + (vaddr & 0x3FFF_FFFF);
     }
     let pd = pdpte & mask;
     let pde = read_pte(pd, i2);
     if pde & PRESENT == 0 { return 0; }
-    if pde & PS != 0 {
+    if is_block(pde) {
         return (pde & mask) + (vaddr & 0x1F_FFFF);
     }
     let pt = pde & mask;
@@ -800,10 +828,44 @@ unsafe fn translate_user_paddr(pml4_phys: u64, vaddr: u64) -> u64 {
     (pte & mask) + (vaddr & 0xFFF)
 }
 
+/// Sv39 variant: root → mid → leaf table.  A block descriptor (R/W/X set)
+/// at any level is a huge mapping; the loader never creates those for the
+/// user image, but 1 GiB blocks inherited in the kernel half are possible —
+/// those addresses are never translated here (user VA only).
+#[cfg(target_arch = "riscv64")]
+unsafe fn translate_user_paddr(pml4_phys: u64, vaddr: u64) -> u64 {
+    use crate::init_loader::read_pte;
+    const PRESENT: u64 = 1;
+    // R|W|X — a leaf (block) descriptor has any of these set.
+    const R_WX: u64 = (1 << 1) | (1 << 2) | (1 << 3);
+    let root_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let mid_idx  = ((vaddr >> 21) & 0x1FF) as usize;
+    let leaf_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+    let root_e = read_pte(pml4_phys, root_idx);
+    if root_e & PRESENT == 0 { return 0; }
+    if root_e & R_WX != 0 {
+        // 1 GiB block.
+        return (((root_e >> 10) << 12) & 0x000F_FFFF_FFFF_F000) + (vaddr & 0x3FFF_FFFF);
+    }
+    let mid_table = ((root_e >> 10) << 12) & 0x000F_FFFF_FFFF_F000;
+    let mid_e = read_pte(mid_table, mid_idx);
+    if mid_e & PRESENT == 0 { return 0; }
+    if mid_e & R_WX != 0 {
+        // 2 MiB block.
+        return (((mid_e >> 10) << 12) & 0x000F_FFFF_FFFF_F000) + (vaddr & 0x1F_FFFF);
+    }
+    let leaf_table = ((mid_e >> 10) << 12) & 0x000F_FFFF_FFFF_F000;
+    let pte = read_pte(leaf_table, leaf_idx);
+    if pte & PRESENT == 0 { return 0; }
+    (((pte >> 10) << 12) & 0x000F_FFFF_FFFF_F000) + (vaddr & 0xFFF)
+}
+
 /// EXEC - execute program
 ///
 /// Loads and executes a new program, replacing the current process.
 /// This implements the Plan 9 exec syscall semantics.
+
 fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
     let path_ptr = frame.arg(0);
     let arg_ptr = frame.arg(1);
@@ -813,13 +875,22 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
         return Err(Error::Ebadf);
     }
 
-    let path = copy_cstring_from_user(path_ptr)?;
-    let args = copy_argv_from_user(arg_ptr)?;
-    let envp = copy_envp_from_user(env_ptr)?;
+    let path = match copy_cstring_from_user(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return Err(e),
+    };
+    let args = match copy_argv_from_user(arg_ptr) {
+        Ok(a) => a,
+        Err(e) => return Err(e),
+    };
+    let envp = match copy_envp_from_user(env_ptr) {
+        Ok(a) => a,
+        Err(e) => return Err(e),
+    };
     let amode = crate::vfs::NamecMode::Open(0);
     let mut chan = match namec(&path, amode, 0, 0) {
         Ok(c) => c,
-        Err(_) => return Err(Error::Enoent),
+        Err(e) => return Err(e.into()),
     };
 
     // Read the entire executable into a heap buffer.  This makes section
@@ -828,7 +899,10 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
     let mut offset: u64 = 0;
     loop {
         let mut buf = [0u8; 4096];
-        let n = crate::dev::dev_read(&mut chan, &mut buf, offset)?;
+        let n = match crate::dev::dev_read(&mut chan, &mut buf, offset) {
+            Ok(n) => n,
+            Err(e) => return Err(e.into()),
+        };
         if n == 0 {
             break;
         }
@@ -841,7 +915,17 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
         return Err(Error::Ebadexec);
     }
     let machine = u16::from_le_bytes([data[18], data[19]]);
-    if machine != 62 {
+    // The user image must match the host ISA: EM_X86_64 (62) or
+    // EM_AARCH64 (183).
+    #[cfg(target_arch = "aarch64")]
+    let want_machine: u16 = 183;
+    #[cfg(target_arch = "riscv64")]
+    let want_machine: u16 = 243; // EM_RISCV
+    #[cfg(target_arch = "loongarch64")]
+    let want_machine: u16 = 258; // EM_LOONGARCH
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64")))]
+    let want_machine: u16 = 62;
+    if machine != want_machine {
         return Err(Error::Ebadexec);
     }
 
@@ -849,7 +933,7 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
         data[24], data[25], data[26], data[27],
         data[28], data[29], data[30], data[31],
     ]);
-    let entry = entry_file + crate::USER_BASE;
+    let entry = entry_file + USER_BASE;
 
     let phoff = u64::from_le_bytes([
         data[32], data[33], data[34], data[35],
@@ -863,7 +947,9 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
 
     let proc = match curproc_mut() {
         Some(p) => p,
-        None => return Err(Error::Eperm),
+        None => {
+            return Err(Error::Eperm)
+        }
     };
     let pml4 = proc.mmupdb;
     if pml4.as_u64() == 0 {
@@ -877,6 +963,18 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
 
     cleanup_process_segments(proc);
 
+    // From here on the old address space is destroyed: returning an error
+    // would resume the dead user image (unmapped stack, no segments), so any
+    // failure must terminate the process instead — exactly like `exits` does.
+    #[inline]
+    fn exec_die(status: i32) -> Result<usize> {
+        scheduler().exit(status);
+        // Unreachable in practice: exit() marks this context moribund and
+        // schedule() never switches back to it.  The error is a defensive
+        // fallback only.
+        Err(Error::Ebadexec)
+    }
+
     const PAGE_SIZE: usize = 4096;
 
     // Segment metadata for /proc: (SegType tag, base, top) per PT_LOAD.
@@ -885,7 +983,7 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
     for i in 0..phnum {
         let ph_pos = phoff + i * phentsize;
         if ph_pos + 56 > data.len() {
-            return Err(Error::Ebadexec);
+            return exec_die(1);
         }
         let ph = &data[ph_pos..ph_pos + 56];
         let p_type = u32::from_le_bytes([ph[0], ph[1], ph[2], ph[3]]);
@@ -910,7 +1008,7 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
             ph[44], ph[45], ph[46], ph[47],
         ]);
 
-        let seg_start = p_vaddr + crate::USER_BASE;
+        let seg_start = p_vaddr + USER_BASE;
         let seg_end = seg_start + p_memsz;
         let data_end = seg_start + p_filesz as u64;
 
@@ -924,7 +1022,12 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
 
         let mut cur_vaddr = seg_start & !(PAGE_SIZE as u64 - 1);
         while cur_vaddr < seg_end {
-            let frame = crate::vm::alloc_frame().ok_or(Error::Enomem)?;
+            let frame = match crate::vm::alloc_frame() {
+                Some(f) => f,
+                None => {
+                    return exec_die(1);
+                }
+            };
             // The kernel boot identity map covers low physical memory; write
             // through the physical address rather than the high-half mirror,
             // which is not guaranteed to exist in the process PML4.
@@ -965,7 +1068,7 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
                 if crate::init_loader::map_user_page(
                     pml4, cur_vaddr, frame.as_u64(), flags,
                 ).is_none() {
-                    return Err(Error::Enomem);
+                    return exec_die(1);
                 }
             }
             cur_vaddr += PAGE_SIZE as u64;
@@ -973,7 +1076,12 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
     }
 
     // Build and map the user stack for the new image.
-    let sp = build_exec_stack(&args, &envp, entry, proc)?;
+    let sp = match build_exec_stack(&args, &envp, entry, proc) {
+        Ok(s) => s,
+        Err(_) => {
+            return exec_die(1);
+        }
+    };
 
     // Safety: never resume user mode at an unmapped entry point — the
     // resulting page fault in ring 3 would otherwise hand control to
@@ -981,16 +1089,26 @@ fn sys_internalexec(frame: &SyscallFrame) -> Result<usize> {
     let ent_pa = unsafe { translate_user_paddr(pml4.as_u64(), entry) };
     let sp_pa = unsafe { translate_user_paddr(pml4.as_u64(), sp) };
     if ent_pa == 0 || sp_pa == 0 {
-        crate::serial::put_bytes(b"[exec] image not mapped: ");
-        crate::serial::put_bytes(&path);
-        crate::serial::put_bytes(b"\n");
-        return Err(Error::Ebadexec);
+        return exec_die(1);
     }
+
+    // The new image replaced this process's own page-table entries while
+    // TTBR0 still points at that table.  Stale TLB entries from the old
+    // mapping (e.g. the previous stack frames) would keep serving the old
+    // translations after the eret, so the freshly exec'd program would read
+    // freed memory instead of its argv.  Flush before returning to user
+    // mode (x86_64 gets the same effect from the CR3 reload in the
+    // scheduler).
+    #[cfg(target_arch = "aarch64")]
+    crate::plan9_arch::hal::mmu::flush_tlb();
 
     // Publish the new image's segment table for /proc/N/mem and status:
     // the PT_LOAD segments plus the freshly mapped user stack.
+    #[cfg(not(target_arch = "riscv64"))]
     const STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
-    const STACK_PAGES: u64 = 4;
+    #[cfg(target_arch = "riscv64")]
+    const STACK_TOP: u64 = 0x0000_003F_FFFF_F000;
+    const STACK_PAGES: u64 = 32;
     const STACK_SIZE: u64 = STACK_PAGES * PAGE_SIZE as u64;
     exec_segs.push((
         crate::proc::SegType::Stack as u8,
@@ -1020,6 +1138,50 @@ fn patch_got(data: &mut [u8]) {
     if data.len() < 64 {
         return;
     }
+    let e_phoff = u64::from_le_bytes([
+        data[32], data[33], data[34], data[35],
+        data[36], data[37], data[38], data[39],
+    ]) as usize;
+    let e_phentsize = u16::from_le_bytes([data[54], data[55]]) as usize;
+    let e_phnum = u16::from_le_bytes([data[56], data[57]]) as usize;
+    if e_phoff == 0 || e_phentsize < 56 || e_phnum == 0 {
+        return;
+    }
+
+    // Derive the link-time image range from the PT_LOAD segments.  The
+    // default link base differs per target (aarch64 links at 0x20_0000,
+    // riscv64 at 0x1_0000), so a fixed window cannot cover both.
+    let mut lo = u64::MAX;
+    let mut hi = 0u64;
+    for i in 0..e_phnum {
+        let pos = e_phoff + i * e_phentsize;
+        if pos + 56 > data.len() {
+            break;
+        }
+        let ph = &data[pos..pos + 56];
+        let p_type = u32::from_le_bytes([ph[0], ph[1], ph[2], ph[3]]);
+        if p_type != 1 {
+            // PT_LOAD
+            continue;
+        }
+        let p_vaddr = u64::from_le_bytes([
+            ph[16], ph[17], ph[18], ph[19],
+            ph[20], ph[21], ph[22], ph[23],
+        ]);
+        let p_memsz = u64::from_le_bytes([
+            ph[40], ph[41], ph[42], ph[43],
+            ph[44], ph[45], ph[46], ph[47],
+        ]);
+        if p_memsz == 0 {
+            continue;
+        }
+        lo = lo.min(p_vaddr);
+        hi = hi.max(p_vaddr + p_memsz);
+    }
+    if lo == u64::MAX || hi <= lo {
+        return;
+    }
+
     let e_shoff = u64::from_le_bytes([
         data[40], data[41], data[42], data[43],
         data[44], data[45], data[46], data[47],
@@ -1083,13 +1245,12 @@ fn patch_got(data: &mut [u8]) {
                     data[p], data[p + 1], data[p + 2], data[p + 3],
                     data[p + 4], data[p + 5], data[p + 6], data[p + 7],
                 ]);
-                // Only relocate values that are valid low-image virtual
-                // addresses.  .data.rel.ro also contains small integers,
+                // Only relocate values that are valid link-time image
+                // virtual addresses (derived from the PT_LOAD segments
+                // above).  .data.rel.ro also contains small integers,
                 // lengths, and packed table fields that must not be touched.
-                if val >= crate::segment::USER_IMAGE_BASE
-                    && val < crate::segment::USER_IMAGE_LIMIT
-                {
-                    let relocated = val + crate::USER_BASE;
+                if val >= lo && val < hi {
+                    let relocated = val + USER_BASE;
                     data[p..p + 8].copy_from_slice(&relocated.to_le_bytes());
                 }
             }
@@ -1221,10 +1382,20 @@ fn build_exec_stack(
     proc: &mut Proc,
 ) -> Result<u64> {
     const PAGE_SIZE: usize = 4096;
+    // Sv39: user VAs must stay in the lower canonical half below the
+    // kernel's high-half root entries (root index >= 256).
+    // loongarch64: user VAs live in DMW-free canonical-upper VSEG 0xF so
+    // that PLV0 kernel dereferences of user pointers go through the user
+    // page tables.
+    #[cfg(target_arch = "loongarch64")]
+    const TOP: u64 = 0xFFFF_8000_7FFF_F000;
+    #[cfg(target_arch = "riscv64")]
+    const TOP: u64 = 0x0000_003F_FFFF_F000;
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
     const TOP: u64 = 0x0000_7FFF_FFFF_F000;
-    // 16 pages = 64 KiB of user stack: comfortable for command programs
-    // that keep line arenas on the stack.
-    const PAGES: usize = 16;
+    // 32 pages = 128 KiB of user stack: comfortable for command programs
+    // that keep line arenas on the stack (rc can have deep recursion).
+    const PAGES: usize = 32;
     const SIZE: usize = PAGES * PAGE_SIZE;
 
     let pml4 = proc.mmupdb;
@@ -1438,11 +1609,24 @@ impl Elf64Phdr {
 /// Memory layout constants for user programs
 const USER_TEXT_BASE: u64 = 0x400000;
 const USER_DATA_BASE: u64 = 0x600000;
+// loongarch64: user VAs live in DMW-free VSEG 0xF (see init_loader's
+// USER_LOAD_BASE); the stack tops out at that segment's high end.
+#[cfg(target_arch = "loongarch64")]
+const USER_STACK_BASE: u64 = 0xFFFF_8000_7FFF_F000;
+#[cfg(target_arch = "aarch64")]
+const USER_STACK_BASE: u64 = 0x0000_7FFF_FFFF_F000;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "loongarch64")))]
 const USER_STACK_BASE: u64 = 0x7fff_f000;
 const USER_STACK_SIZE: u64 = 0x10000;
 
 /// Maximum virtual address for user space
+#[cfg(target_arch = "loongarch64")]
+const MAX_VADDR: u64 = 0xFFFF_8000_7FFF_FFFF;
+#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
 const MAX_VADDR: u64 = 0x0000_7FFF_FFFF_FFFF;
+// Sv39 lower canonical half, below the kernel's high-half root entries.
+#[cfg(target_arch = "riscv64")]
+const MAX_VADDR: u64 = 0x0000_00FF_FFFF_FFFF;
 
 /// Segment type constants (matching Plan 9)
 const SG_NONE: u32 = 0;
@@ -1467,6 +1651,7 @@ fn sys_internalexits(frame: &SyscallFrame) -> Result<usize> {
         None => return Err(Error::Eperm),
     };
     let child_pid = child.pid;
+
     child.state = State::Dead;
 
     if let Some(parent_pid) = child.parent {
@@ -2621,7 +2806,16 @@ fn sys_internalchdir(frame: &SyscallFrame) -> Result<usize> {
     }
 
     // Set new current directory
-    proc.dot = Some(Box::new(dev_to_proc_chan(chan)));
+    proc.dot = Some(Box::new(dev_to_proc_chan(chan.clone())));
+
+    // Keep the process-group namespace `dot` in sync: some VFS paths
+    // (and every child process before its first CHDIR) resolve relative
+    // paths through the namespace rather than `Proc.dot`.
+    if let Some(pgrp) = proc.pgrp.as_mut() {
+        if let Some(ns) = pgrp.namespace_mut() {
+            ns.dot = Some(chan.clone());
+        }
+    }
 
     // Track the canonical textual path for `pwd`/`getcwd`.  Paths are
     // resolved lexically against the previous directory, matching what a
@@ -2900,7 +3094,7 @@ fn sys_internalacl(frame: &SyscallFrame) -> Result<usize> {
         .ok_or(Error::Enoent)?;
     let rf = dev
         .as_any_mut()
-        .downcast_mut::<crate::rootfs::RootFsDev>()
+        .and_then(|device| device.downcast_mut::<crate::rootfs::RootFsDev>())
         .ok_or(Error::Enoent)?;
 
     let node_id = de.qid.path;
@@ -3005,7 +3199,7 @@ fn sys_internallogin(frame: &SyscallFrame) -> Result<usize> {
     // Move to the new home directory when it exists; a failed chdir is
     // harmless and leaves the caller where it was.
     if !home.is_empty() {
-        if let Ok(mut chan) = namec(&home.as_bytes().to_vec(), crate::vfs::NamecMode::Walk, 0, 0) {
+        if let Ok(chan) = namec(&home.as_bytes().to_vec(), crate::vfs::NamecMode::Walk, 0, 0) {
             if let Some(p) = curproc_mut() {
                 if let Some(mut old) = p.dot.take() {
                     old.close();
@@ -3956,8 +4150,17 @@ fn copy_to_user(dest: *mut u8, src: &[u8]) {
 
 /// Check if an address is in user space
 fn is_user_addr(addr: u64) -> bool {
+    // loongarch64: user space is VSEG 0xF (bits [63:60] == 0xF) — see
+    // init_loader's USER_LOAD_BASE.
+    #[cfg(target_arch = "loongarch64")]
+    {
+        (addr >> 60) == 0xF
+    }
     // User space is 0x0 to 0x7FFFFFFFFFFF
-    addr < 0x8000_0000_0000
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        addr < 0x8000_0000_0000
+    }
 }
 
 // ============================================================================

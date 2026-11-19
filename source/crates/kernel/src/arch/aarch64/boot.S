@@ -125,9 +125,26 @@ _vectors_end:
 .endm
 
 /* Restore a full trap frame; x0 holds the frame pointer on entry.
- * The base register (x28) is reloaded last. */
+ * The base register (x28) is reloaded last.
+ *
+ * PC/PSTATE/user-SP are staged in x9/x10/x11 *before* the GPR restore
+ * sequence so the msr's can run after every user register has been
+ * loaded.  Using x22/x23/x24 as the staging registers (an earlier
+ * version) destroyed the user's own x22/x23/x24: on every return from
+ * an exception the user saw its SP/PC/PSTATE state copied into those
+ * registers, corrupting e.g. a callee-saved length in init and making
+ * memcpy run off the stack. */
 .macro RESTORE_AND_ERET
     mov     x28, x0
+    ldr     x9,  [x28, #264]        /* stage user SP                      */
+    ldr     x10, [x28, #248]        /* stage PC                           */
+    ldr     x11, [x28, #256]        /* stage PSTATE                       */
+    /* Install the system-register state now: these msr's only take
+     * effect at the final eret, and x9-x11 are reloaded with the user's
+     * own values by the ldp sequence below. */
+    msr     sp_el0, x9
+    msr     elr_el1, x10
+    msr     spsr_el1, x11
     ldp     x0, x1, [x28]
     ldp     x2, x3, [x28, #16]
     ldp     x4, x5, [x28, #32]
@@ -144,13 +161,14 @@ _vectors_end:
     ldp     x26, x27, [x28, #208]
     ldr     x29, [x28, #232]
     ldr     x30, [x28, #240]
-    ldr     x22, [x28, #264]        /* user SP                            */
-    ldr     x23, [x28, #248]        /* PC                                 */
-    ldr     x24, [x28, #256]        /* PSTATE                             */
     ldr     x28, [x28, #224]
-    msr     sp_el0, x22
-    msr     elr_el1, x23
-    msr     spsr_el1, x24
+    /* Restore SP_EL1 to its value at exception entry: the stub reserved
+     * 272 bytes below it, so adding them back makes each EL0 excursion
+     * stack-neutral.  Without this, SP_EL1 decays 272 bytes per exception
+     * and eventually runs off the bottom of the kernel boot stack,
+     * corrupting the .bss objects that live below it (e.g. the syscall
+     * table's function pointers). */
+    add     sp, sp, #272
     eret
 .endm
 

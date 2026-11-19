@@ -14,8 +14,9 @@
 #![no_std]
 #![no_main]
 
-mod syscall;
+use plan9_init::syscall;
 
+#[cfg(target_arch = "x86_64")]
 use core::arch::global_asm;
 
 // The kernel starts a user program at the ELF entry point with the
@@ -37,21 +38,12 @@ _start:
     .size _start, . - _start
 "#);
 
-// aarch64 build of the ssh binary is a placeholder — the SSH port is
-// x86_64-only; provide a valid entry point that exits immediately.
-#[cfg(target_arch = "aarch64")]
-global_asm!(r#"
-    .section .text.start, "ax", @progbits
-    .global _start
-    .type _start, @function
-_start:
-    mov     x8, #2                      /* SYS_EXITS */
-    svc     #0
-hang_ssh:
-    wfi
-    b       hang_ssh
-    .size _start, . - _start
-"#);
+#[cfg(not(target_arch = "x86_64"))]
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    println("ssh: not supported on this architecture");
+    syscall::exit(1);
+}
 
 const O_RDWR: u32 = 2;
 const DEFAULT_SSH_PORT: u16 = 22;
@@ -275,10 +267,5 @@ pub extern "C" fn ssh_main(argc: u64, argv: u64, initial_rsp: u64) -> ! {
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {
-        #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("hlt", options(nostack, preserves_flags)) }
-        #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("wfi", options(nostack, preserves_flags)) }
-    }
+    syscall::exit(1);
 }

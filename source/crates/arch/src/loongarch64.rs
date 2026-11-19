@@ -161,9 +161,10 @@ pub fn paging_init() {
     mmu::cr3_write(plan9_common::types::PhysAddr::new(boot_root_phys));
 
     // Exception configuration: timer interrupt line on (LIE bit 11),
-    // everything else left as-is.
+    // FP usable (FPE bit 5 — the kernel's font/console code contains
+    // float math), everything else left as-is.
     let ecfg = cpu::csr_read::<{ cpu::csr::ECFG }>();
-    let ecfg = (ecfg & !(0x7FFFu64)) | (1 << 11);
+    let ecfg = (ecfg & !(0x7FFFu64)) | (1 << 11) | (1 << 5);
     cpu::csr_write::<{ cpu::csr::ECFG }>(ecfg);
 
     // Flush the TLB now that the root is live.

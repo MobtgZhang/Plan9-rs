@@ -8,12 +8,9 @@
 #![no_std]
 #![no_main]
 
-mod syscall;
-
-use core::arch::asm;
-use syscall::{
-    chdir, close, create3, dup2, exec, exit, fork, getpid, list, open, pipe, read, remove, wait,
-    write, yield_cpu, DMDIR,
+use plan9_init::syscall::{
+    self, chdir, close, create3, dup2, exec, exit, fork, getpid, list, open, pipe, read, remove,
+    wait, write, yield_cpu, DMDIR,
 };
 
 const O_RDONLY: u32 = 0;
@@ -791,7 +788,6 @@ fn apply_redirs(line: &[u8], st: &Stage) {
     }
     if st.out_ok {
         let f = range_cstr(line, st.out_file.0, st.out_file.1);
-        let mode = if st.append { O_RDONLY } else { OWRITE };
         let fd = if st.append {
             // Append: open (or create) then seek to end.
             let mut fd = create3(f.as_ptr(), O_RDONLY, 0o644);

@@ -642,10 +642,22 @@ impl Scheduler {
                         r13: ctx.r13,
                         r14: ctx.r14,
                         r15: ctx.r15,
+                        #[cfg(target_arch = "aarch64")]
                         r25: ctx.r25,
+                        #[cfg(target_arch = "aarch64")]
                         r26: ctx.r26,
+                        #[cfg(target_arch = "aarch64")]
                         r27: ctx.r27,
+                        #[cfg(target_arch = "aarch64")]
                         r28: ctx.r28,
+                        #[cfg(not(target_arch = "aarch64"))]
+                        r25: 0,
+                        #[cfg(not(target_arch = "aarch64"))]
+                        r26: 0,
+                        #[cfg(not(target_arch = "aarch64"))]
+                        r27: 0,
+                        #[cfg(not(target_arch = "aarch64"))]
+                        r28: 0,
                     };
                 }
             }
@@ -679,10 +691,15 @@ impl Scheduler {
                     r13: proc_label.r13,
                     r14: proc_label.r14,
                     r15: proc_label.r15,
+                    #[cfg(target_arch = "aarch64")]
                     r25: proc_label.r25,
+                    #[cfg(target_arch = "aarch64")]
                     r26: proc_label.r26,
+                    #[cfg(target_arch = "aarch64")]
                     r27: proc_label.r27,
+                    #[cfg(target_arch = "aarch64")]
                     r28: proc_label.r28,
+                    ..Default::default()
                 };
                 let ctx = Context::from_label(&arch_label);
                 // Restore the saved context: jump to the saved PC with the

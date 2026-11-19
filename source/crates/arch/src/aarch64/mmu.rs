@@ -45,8 +45,15 @@ pub fn cr3_write(pml4_phys: PhysAddr) {
 
 /// Alias kept for `sched.rs` compatibility: switch to the address space
 /// whose root table is at `pml4_phys`.
+///
+/// The kernel does not tag translations with ASIDs, so reusing a VA range
+/// for a new process would still hit stale entries installed while the
+/// previous mapping was resident — the new process's stores then land in
+/// freed physical frames and the old data comes back on later reads.
+/// Every switch therefore must flush the TLB, not just load TTBR0.
 #[inline]
 pub fn switch_page_table(pml4_phys: PhysAddr) {
+    flush_tlb();
     cr3_write(pml4_phys);
 }
 

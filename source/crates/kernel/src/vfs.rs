@@ -12,7 +12,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::chan::Qid;
-use crate::dev::{self, Chan, DirEntry, Error as DevError, devs_mut, devtype, qidtype};
+use crate::dev::{self, Chan, DirEntry, Error as DevError, devs_mut};
 use crate::plan9_common::sync::{Mutex, Spinlock};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -193,7 +193,7 @@ impl MountTable {
     }
 
     pub fn remove(&mut self, path: &[u8]) -> Option<MountPoint> {
-        for (i, slot) in self.entries.iter_mut().enumerate() {
+        for slot in &mut self.entries {
             if let Some(mp) = slot {
                 if mp.path == path {
                     self.count -= 1;
@@ -364,8 +364,20 @@ fn root_device_index() -> Option<usize> {
 }
 
 /// Current working directory, taken from the process namespace.
+///
+/// The authoritative working directory is `Proc.dot`, which CHDIR
+/// maintains (and which fork inherits).  The namespace `dot` on the
+/// process group is kept in sync as a fallback for code paths that only
+/// populate the namespace.  Without bridging the two representations,
+/// relative paths in `namec` kept resolving against the root — the
+/// classic "ls always lists /" bug.
 fn proc_namespace_dot() -> Option<Chan> {
     let proc = crate::proc::curproc()?;
+    if let Some(dot) = proc.dot.as_ref() {
+        if let Some(c) = dot.dev_chan() {
+            return Some(c);
+        }
+    }
     let pgrp = proc.pgrp.as_ref()?;
     let ns = pgrp.namespace()?;
     ns.dot.as_ref().map(|c| c.dup())
@@ -379,7 +391,7 @@ pub fn namec(
     path: &[u8],
     amode: NamecMode,
     _omode: u32,
-    perm: u32,
+    _perm: u32,
 ) -> Result<Chan, VfsError> {
     if path.is_empty() {
         return Err(VfsError::Einval);
@@ -393,16 +405,16 @@ pub fn namec(
     let mut chan = match start {
         PathStart::Root => {
             // Root mount if one exists; otherwise the root device.
-            let mut mounts = MOUNTS.lock();
+            let mounts = MOUNTS.lock();
             if let Some(mp) = mounts.find_exact(b"") {
                 if let Some(root) = mp.root.as_ref() {
-                    return walk_from_root(root, rest, amode, perm);
+                    return walk_from_root(root, rest, amode);
                 }
             }
             drop(mounts);
 
             if let Some(root) = ROOT_CHAN.lock().as_ref() {
-                return walk_from_root(root, rest, amode, perm);
+                return walk_from_root(root, rest, amode);
             }
 
             let idx = root_device_index().ok_or(VfsError::Enoent)?;
@@ -507,7 +519,6 @@ fn walk_from_root(
     root: &Chan,
     rest: Option<&[u8]>,
     amode: NamecMode,
-    perm: u32,
 ) -> Result<Chan, VfsError> {
     let mut chan = root.dup();
     let components = rest.map(parse_path).unwrap_or_default();
@@ -683,6 +694,10 @@ impl DevChanAdapter {
 }
 
 impl crate::proc::Chan for DevChanAdapter {
+    fn dev_chan(&self) -> Option<Chan> {
+        Some(self.chan.clone())
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> crate::proc::Result<usize> {
         let dev = match devs_mut().get_mut(self.chan.dev) {
             Some(d) => d,
@@ -777,10 +792,14 @@ pub fn sys_create(path: &[u8], mode: u32, perm: u32) -> Result<i32, VfsError> {
     let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
     dev.open(&mut chan, mode as u8)
         .map_err(VfsError::from_dev_error)?;
-    // Plan 9 `create` truncates an existing file.  Opening an existing
+    // Plan 9 `create` truncates an existing *file*.  Opening an existing
     // file goes through the walk path, so the truncation has to happen
-    // here rather than in the device's create hook.
-    crate::dev::dev_truncate(&mut chan).map_err(VfsError::from_dev_error)?;
+    // here rather than in the device's create hook.  Directories are
+    // never truncated — a DMDIR create would otherwise fail here after
+    // the directory had already been created.
+    if perm & 0x8000_0000 == 0 { // DMDIR: directories are never truncated
+        crate::dev::dev_truncate(&mut chan).map_err(VfsError::from_dev_error)?;
+    }
     alloc_fd(chan)
 }
 

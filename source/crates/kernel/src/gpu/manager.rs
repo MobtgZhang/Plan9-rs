@@ -7,18 +7,15 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use plan9_common::sync::Spinlock;
 use crate::serial;
 use super::{DisplayEngine, EngineKind, NullEngine};
 
-/// The single live engine instance. Using `Option<Box<dyn DisplayEngine>>` in a
-/// static avoids the DST fat-pointer `null_mut` problem.
-static mut ENGINE: Option<Box<dyn DisplayEngine>> = None;
+static ENGINE: Spinlock<Option<Box<dyn DisplayEngine>>> = Spinlock::new(None);
 
 /// Whether the GPU subsystem has been successfully initialised.
 pub fn is_initialised() -> bool {
-    // SAFETY: read of static mut is safe because init runs once before any
-    // concurrent access and we never drop the engine.
-    unsafe { ENGINE.is_some() }
+    ENGINE.lock().is_some()
 }
 
 /// Initialise the GPU subsystem.
@@ -84,10 +81,7 @@ fn store_engine(boxed: Box<dyn DisplayEngine>) {
     serial::put_hex_u64(info.virt_addr);
     serial::put_bytes(b"\n");
 
-    // SAFETY: write to static mut is safe because:
-    //  - This runs exactly once at boot, before any concurrent access.
-    //  - The engine is never dropped (kernel lifetime).
-    unsafe { ENGINE = Some(boxed); }
+    *ENGINE.lock() = Some(boxed);
 }
 
 /// Borrow the engine immutably. Panics if not initialised.
@@ -95,10 +89,8 @@ pub fn with<F, R>(f: F) -> R
 where
     F: FnOnce(&dyn DisplayEngine) -> R,
 {
-    // SAFETY: Same as above — the Option is only written once at boot.
-    let engine = unsafe { ENGINE.as_ref().expect("gpu::manager: not initialised") };
-    let inner: &dyn DisplayEngine = &**engine;
-    f(inner)
+    let engine = ENGINE.lock();
+    f(engine.as_deref().expect("gpu::manager: not initialised"))
 }
 
 /// Borrow the engine mutably. Panics if not initialised.
@@ -106,9 +98,8 @@ pub fn with_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut dyn DisplayEngine) -> R,
 {
-    // SAFETY: Same as above.
-    let engine = unsafe { ENGINE.as_mut().expect("gpu::manager: not initialised") };
-    f(&mut **engine)
+    let mut engine = ENGINE.lock();
+    f(engine.as_deref_mut().expect("gpu::manager: not initialised"))
 }
 
 /// Quick diagnostic: name and kind of the current engine.

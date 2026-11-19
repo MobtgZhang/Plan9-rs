@@ -16,11 +16,10 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::string::String;
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use crate::gpu::{Color, Rect, DisplayEngine};
+use crate::gpu::{Color, DisplayEngine};
 
 // ============================================================================
 // Geometry primitives

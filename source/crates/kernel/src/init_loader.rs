@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 
 use crate::entry::BootInfo;
 use crate::plan9_arch::hal::paging::PAGESIZE;
-use plan9_common::types::{PhysAddr, VirtAddr};
+use plan9_common::types::PhysAddr;
 use crate::plan9_common::sync::Spinlock;
 
 use crate::frame_alloc;
@@ -42,25 +42,21 @@ fn record_user_seg(tag: u8, base: u64, top: u64) {
     USER_SEGS.lock().push((tag, base, top));
 }
 
-/// Where the user-mode ELF gets mapped.  Plan 9-style non-PIE userspace.
-/// User programs are linked at 0x200000 (the kernel's linker base), so we
-/// relocate the whole image uniformly to 1 GiB (USER_BASE).  This keeps the
-/// kernel's low identity mapping (0..64 MiB) intact in the user PML4 and
-/// prevents user program pages from overwriting kernel code/IDT/GDT pages.
-/// Base of the relocated user program image.
-///
-/// x86_64: 1 GiB — just above the preserved low identity map.
-/// aarch64: 512 GiB — the boot root's L0[0] covers the whole first 512 GiB
-/// (its L1 table holds the Device/RAM/ECAM identity blocks), so the user
-/// image must live in L0[1] to avoid colliding with those entries.
-#[cfg(target_arch = "aarch64")]
-const USER_LOAD_BASE: u64 = 0x0000_0080_0000_0000; // 512 GiB
-#[cfg(not(target_arch = "aarch64"))]
-const USER_LOAD_BASE: u64 = 0x0000_0000_4000_0000;
+use crate::USER_BASE as USER_LOAD_BASE;
 
 /// Where the user stack lives.
+// loongarch64: top of the VSEG 0xF user region (canonical: bit 47 is
+// set); ~1 GiB below the region ceiling, far above USER_LOAD_BASE.
+#[cfg(target_arch = "loongarch64")]
+const USER_STACK_TOP:  u64 = 0xFFFF_8000_7FFF_F000;
+// Sv39: user VAs must lie in the lower canonical half (bits 63:38 all
+// zero) and below the kernel's high-half root entries (root index >= 256),
+// so the stack tops out just under 256 GiB.
+#[cfg(target_arch = "riscv64")]
+const USER_STACK_TOP:  u64 = 0x0000_003F_FFFF_F000;
+#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
 const USER_STACK_TOP:  u64 = 0x0000_7FFF_FFFF_F000;
-const USER_STACK_PAGES: u64 = 4;
+const USER_STACK_PAGES: u64 = 32;
 const USER_STACK_SIZE:  u64 = USER_STACK_PAGES * PAGESIZE as u64;
 
 /// PTE flag bits used here.
@@ -95,7 +91,14 @@ const PTE_NX:       u64 = 1 << 63;
 /// Intermediate (L0–L2) table descriptor flags.
 #[cfg(target_arch = "aarch64")]
 const PTE_MID_FLAGS: u64 = PTE_PRESENT | (1 << 1); // Valid + Table
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "riscv64")]
+const PTE_MID_FLAGS: u64 = PTE_PRESENT; // Sv39: V=1, R/W/X=0 (non-leaf)
+/// loongarch64: intermediate page-table entries must have PLV=3 (user)
+/// so that a PLV3 page-table walk can traverse them; otherwise the walk
+/// faults with ADEM at the first non-user intermediate entry.
+#[cfg(target_arch = "loongarch64")]
+const PTE_MID_FLAGS: u64 = PTE_PRESENT | PTE_WRITABLE | (0b11 << 2);
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64")))]
 const PTE_MID_FLAGS: u64 = PTE_PRESENT | PTE_WRITABLE | PTE_USER;
 
 /// aarch64 access flag (required on leaf descriptors).
@@ -153,9 +156,40 @@ fn leaf_flags(flags: u64) -> u64 {
         }
         f
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "riscv64")]
     {
-        flags
+        // Sv39 leaf: V | R | W | X | U | A | D.  R is set for every user
+        // page (user code is at least readable); W/X follow the caller's
+        // WRITABLE/RDONLY/NX vocabulary.  A and D are set up front so the
+        // first access never faults.
+        let mut f = PTE_PRESENT          // V
+            | (1 << 1)                   // R
+            | (1 << 6)                   // A
+            | (1 << 7);                  // D
+        if flags & PTE_WRITABLE != 0 && flags & PTE_RDONLY == 0 {
+            f |= 1 << 2;                 // W
+        }
+        if flags & PTE_NX == 0 {
+            f |= 1 << 3;                 // X
+        }
+        if flags & PTE_USER != 0 {
+            f |= 1 << 4;                 // U
+        }
+        f
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    {
+        // loongarch64 PTE leaf descriptor (TLBLO format):
+        //   bit 0: V  (valid)
+        //   bit 1: WE (writable)
+        //   bits 2-3: PLV — PTE_USER (bit 2) means PLV=3 (user), i.e. 0b11<<2
+        //   bit 4: MAT
+        //   bit 6: G  (global)
+        let mut f = flags & 0x3;            // V | WE
+        if flags & PTE_USER != 0 {
+            f |= 0b11 << 2;                 // PLV = 3 (user)
+        }
+        f
     }
 }
 
@@ -168,7 +202,13 @@ fn is_block_desc(desc: u64) -> bool {
     {
         desc & (1 << 1) == 0
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "riscv64")]
+    {
+        // Sv39: a leaf (block) descriptor has any of R/W/X set; a valid
+        // non-leaf descriptor has only V.
+        desc & ((1 << 1) | (1 << 2) | (1 << 3)) != 0
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     {
         desc & PTE_PS != 0
     }
@@ -285,34 +325,6 @@ pub fn load_init(boot: &BootInfo) -> Option<InitImage> {
     crate::serial::put_hex_u64(entry);
     crate::serial::put_bytes(b"\n");
 
-    // DEBUG: walk the user root table to the entry page and dump its
-    // first 32 bytes via the TTBR1 direct-map window, so the loaded
-    // contents can be compared with the ELF file bytes.
-    unsafe {
-        let (i4, i3, i2, i1) = virt_indices(entry);
-        let l1 = read_pte(new_pml4.as_u64(), i4) & 0x000F_FFFF_FFFF_F000;
-        let pd = read_pte(l1, i3) & 0x000F_FFFF_FFFF_F000;
-        let pt = read_pte(pd, i2) & 0x000F_FFFF_FFFF_F000;
-        let pte = read_pte(pt, i1);
-        crate::serial::put_bytes(b"[dbg] l1=");
-        crate::serial::put_hex_u64(l1);
-        crate::serial::put_bytes(b" pte=");
-        crate::serial::put_hex_u64(pte);
-        crate::serial::put_bytes(b"\n");
-        let page_phys = pte & 0x000F_FFFF_FFFF_F000;
-        // Read via the boot root's RAM identity map (VA = PA) — the
-        // TTBR1 direct-map window only covers the first identity blocks.
-        let win = page_phys + (entry & 0xFFF);
-        crate::serial::put_bytes(b"[dbg] entry bytes:");
-        let p = win as *const u8;
-        const HEX: [u8; 16] = *b"0123456789abcdef";
-        for k in 0..32 {
-            let b = p.add(k).read_volatile();
-            crate::serial::put_bytes(&[HEX[(b >> 4) as usize], HEX[(b & 0xF) as usize], b' ']);
-        }
-        crate::serial::put_bytes(b"\n");
-    }
-
     Some(InitImage {
         pml4:    new_pml4,
         entry,
@@ -346,6 +358,7 @@ fn virt_indices(vaddr: u64) -> (usize, usize, usize, usize) {
 /// Intermediate entries may already contain huge (2 MiB or 1 GiB) mappings
 /// inherited from GRUB.  A huge PDE cannot be used as a table pointer, so
 /// replace it with a fresh, dedicated page table before writing the 4 KiB PTE.
+#[cfg(not(target_arch = "riscv64"))]
 pub unsafe fn map_user_page(
     pml4: PhysAddr,
     vaddr: u64,
@@ -353,7 +366,15 @@ pub unsafe fn map_user_page(
     flags: u64,
 ) -> Option<()> {
     let (i4, i3, i2, i1) = virt_indices(vaddr);
-    if i4 >= 256 { return None; }
+    // x86_64: user space lives in the lower root half (entries 0..256),
+    // 256.. is the kernel mirror.  loongarch64: the per-process root is
+    // entirely user-controlled — the kernel runs inside the global DMW
+    // direct-map windows and is never mapped here — so VSEG 0xF user
+    // VAs legitimately land in root entries 256..512.
+    #[cfg(target_arch = "loongarch64")]
+    { if i4 >= 512 { return None; } }
+    #[cfg(not(target_arch = "loongarch64"))]
+    { if i4 >= 256 { return None; } }
 
     let pml4_base = pml4.as_u64();
     let pml4e = read_pte(pml4_base, i4);
@@ -387,9 +408,56 @@ pub unsafe fn map_user_page(
         new
     };
 
-    write_pte(pt_phys, i1, paddr | leaf_flags(flags));
+    let leaf_val = paddr | leaf_flags(flags);
+    write_pte(pt_phys, i1, leaf_val);
     let mut cache = TABLE_CACHE.lock();
     cache.push(pt_phys);
+    Some(())
+}
+
+/// Sv39 variant: three table levels (root VA[38:30] → mid VA[29:21] →
+/// leaf table VA[20:12]).  The root may hold kernel entries copied by
+/// `copy_kernel_pml4_into` — a user page that lands in a root slot
+/// holding a kernel *block* descriptor (R/W/X set) replaces it, which
+/// never happens because user VA (≥ USER_LOAD_BASE = 1 GiB) always maps
+/// to root indices the kernel half leaves empty.
+#[cfg(target_arch = "riscv64")]
+pub unsafe fn map_user_page(
+    pml4: PhysAddr,
+    vaddr: u64,
+    paddr: u64,
+    flags: u64,
+) -> Option<()> {
+    let root_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let mid_idx  = ((vaddr >> 21) & 0x1FF) as usize;
+    let leaf_idx = ((vaddr >> 12) & 0x1FF) as usize;
+    // Root indices 256.. hold the kernel's high-half direct map; user
+    // mappings must stay below that.
+    if root_idx >= 256 { return None; }
+
+    let root_base = pml4.as_u64();
+    let root_e = read_pte(root_base, root_idx);
+    let mid_phys = if root_e & PTE_PRESENT != 0 && !is_block_desc(root_e) {
+        // Sv39 PTE: PPN = PA >> 12, stored at bits [53:10].
+        ((root_e >> 10) << 12) & 0x000F_FFFF_FFFF_F000
+    } else {
+        let new = alloc_pte_page(pml4)?;
+        write_pte(root_base, root_idx, ((new >> 12) << 10) | PTE_MID_FLAGS);
+        new
+    };
+
+    let mid_e = read_pte(mid_phys, mid_idx);
+    let leaf_phys = if mid_e & PTE_PRESENT != 0 && !is_block_desc(mid_e) {
+        ((mid_e >> 10) << 12) & 0x000F_FFFF_FFFF_F000
+    } else {
+        let new = alloc_pte_page(pml4)?;
+        write_pte(mid_phys, mid_idx, ((new >> 12) << 10) | PTE_MID_FLAGS);
+        new
+    };
+
+    write_pte(leaf_phys, leaf_idx, ((paddr >> 12) << 10) | leaf_flags(flags));
+    let mut cache = TABLE_CACHE.lock();
+    cache.push(leaf_phys);
     Some(())
 }
 
@@ -412,12 +480,45 @@ pub unsafe fn write_pte(table: u64, index: usize, val: u64) {
 /// (USER_BASE = 1 GiB).  This avoids reusing GRUB's huge 2 MiB PDEs, which
 /// would otherwise make `map_user_page` treat a huge mapping as a PT pointer.
 /// The high canonical kernel mirror (PML4[256..511]) is copied verbatim.
+#[cfg(not(target_arch = "loongarch64"))]
 pub unsafe fn copy_kernel_pml4_into(new_pml4: PhysAddr) -> Option<()> {
     // Read the boot PML4 from the current root table.
     let boot_pml4: u64 = crate::plan9_arch::hal::mmu::cr3_read().as_u64();
     let boot = boot_pml4 & 0x000F_FFFF_FFFF_F000;
     let dst = new_pml4.as_u64();
 
+    #[cfg(target_arch = "riscv64")]
+    {
+        // Sv39 root table.  The boot root carries every kernel mapping as
+        // 1 GiB block descriptors:
+        //   * root index 0        — low-GiB device blocks (16550A UART at
+        //                           0x1000_0000, PCIe ECAM at 0x3000_0000)
+        //   * root indices 2..=5  — RAM identity blocks
+        //   * root indices 256..  — the high-half direct-map window
+        // Root indices 1..=255 cover the *user* region (exec images from
+        // 1 GiB up, user stacks at the top of the lower canonical half).
+        // Inherit only block descriptors there — the kernel's own RAM and
+        // device identity maps — never a table pointer: inheriting the
+        // parent's user mid-table would make the child share the parent's
+        // mid/leaf tables, so the fork deep copy would land in the
+        // parent's mappings, and a later exec in the child would remap
+        // pages the parent is still running on.  Skipped slots stay empty,
+        // so `map_user_page` builds the child fresh tables of its own.
+        for i in 0..512usize {
+            let v = read_pte(boot, i);
+            if v & PTE_PRESENT == 0 {
+                continue;
+            }
+            if i >= 1 && i < 256 && !is_block_desc(v) {
+                continue;
+            }
+            write_pte(dst, i, v);
+        }
+        Some(())
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
     let boot_low = read_pte(boot, 0);
     if (boot_low & PTE_PRESENT) == 0 {
         return None;
@@ -441,7 +542,7 @@ pub unsafe fn copy_kernel_pml4_into(new_pml4: PhysAddr) -> Option<()> {
             write_pte(new_l1, i, v);
         }
         write_pte(dst, 0, new_l1 | PTE_MID_FLAGS);
-        return Some(());
+        Some(())
     }
 
     // ------------------------------------------------------------------
@@ -480,8 +581,15 @@ pub unsafe fn copy_kernel_pml4_into(new_pml4: PhysAddr) -> Option<()> {
             let v = read_pte(boot, i);
             write_pte(dst, i, v);
         }
+        Some(())
     }
+    }
+}
 
+/// On LoongArch the kernel runs in global DMW windows; per-process page
+/// tables contain only user mappings, installed on demand by `map_user_page`.
+#[cfg(target_arch = "loongarch64")]
+pub unsafe fn copy_kernel_pml4_into(_new_pml4: PhysAddr) -> Option<()> {
     Some(())
 }
 
@@ -489,10 +597,20 @@ pub unsafe fn copy_kernel_pml4_into(new_pml4: PhysAddr) -> Option<()> {
 /// into a new child PML4.  Every mapped data page is copied to a fresh
 /// physical frame, and new page-table pages are allocated for the child, so
 /// exec/write in the child cannot modify the parent's image or stack.
+#[cfg(not(target_arch = "riscv64"))]
 pub unsafe fn copy_user_mappings(parent_pml4: u64, child_pml4: PhysAddr) -> Option<()> {
     let page_size = PAGESIZE as usize;
 
-    for i4 in 0..256usize {
+    // x86_64/aarch64: root entries 256.. are the kernel mirror, user
+    // space is the lower half.  loongarch64: the per-process root holds
+    // ONLY user mappings (the kernel lives in the global DMW windows)
+    // and VSEG 0xF user VAs occupy root entries 256..512, so the whole
+    // root must be scanned.
+    #[cfg(target_arch = "loongarch64")]
+    let root_range = 0..512usize;
+    #[cfg(not(target_arch = "loongarch64"))]
+    let root_range = 0..256usize;
+    for i4 in root_range {
         let pml4e = read_pte(parent_pml4, i4);
         if pml4e & PTE_PRESENT == 0 || is_block_desc(pml4e) {
             continue;
@@ -523,10 +641,45 @@ pub unsafe fn copy_user_mappings(parent_pml4: u64, child_pml4: PhysAddr) -> Opti
                         | ((i3 as u64) << 30)
                         | ((i2 as u64) << 21)
                         | ((i1 as u64) << 12);
+                    // loongarch64: the per-process root holds only user
+                    // mappings (the kernel half lives in the global DMW
+                    // windows), and the VSEG 0xF segment bits are implicit
+                    // in the root slot index — so every entry found here
+                    // is a user page and nothing is skipped.
+                    #[cfg(not(target_arch = "loongarch64"))]
                     if vaddr < USER_LOAD_BASE {
                         continue;
                     }
 
+                    // Rebuild the x86-vocabulary caller flags from the
+                    // *semantic* attributes of the parent descriptor.  On
+                    // aarch64 the low 12 bits of a leaf PTE are Valid, leaf,
+                    // AF, AP[2:1], SH and AttrIndx — NOT the x86 flag
+                    // vocabulary that `map_user_page` expects.  Passing them
+                    // through verbatim misreads AttrIndx bit 2 as "user" and
+                    // drops the EL0 access bit, so forked children got
+                    // supervisor-only stack pages and faulted on their first
+                    // stack access.
+                    #[cfg(target_arch = "aarch64")]
+                    let flags = {
+                        const AP_EL0: u64 = 1 << 6;
+                        const AP_RDONLY: u64 = 1 << 7;
+                        const UXN: u64 = 1 << 54;
+                        let mut f: u64 = 1; // PRESENT
+                        if pte & AP_EL0 != 0 {
+                            f |= 1 << 2; // USER
+                        }
+                        if pte & AP_RDONLY != 0 {
+                            f |= 1 << 7; // RDONLY
+                        } else {
+                            f |= 1 << 1; // WRITABLE
+                        }
+                        if pte & UXN != 0 {
+                            f |= 1 << 63; // NX
+                        }
+                        f
+                    };
+                    #[cfg(not(target_arch = "aarch64"))]
                     let flags = pte & 0xFFF;
                     let parent_frame = pte & 0x000F_FFFF_FFFF_F000;
 
@@ -547,6 +700,81 @@ pub unsafe fn copy_user_mappings(parent_pml4: u64, child_pml4: PhysAddr) -> Opti
         }
     }
 
+    Some(())
+}
+
+/// Sv39 variant of `copy_user_mappings`: three table levels (root → mid →
+/// leaf table), and the caller-flag vocabulary is rebuilt from the Sv39
+/// leaf bits (V|R|W|X|U|A|D) so `map_user_page` → `leaf_flags` can
+/// reconstruct an equivalent child descriptor.
+#[cfg(target_arch = "riscv64")]
+pub unsafe fn copy_user_mappings(parent_pml4: u64, child_pml4: PhysAddr) -> Option<()> {
+    let page_size = PAGESIZE as usize;
+
+    for root_idx in 0..512usize {
+        let root_e = read_pte(parent_pml4, root_idx);
+        if root_e & PTE_PRESENT == 0 || is_block_desc(root_e) {
+            continue;
+        }
+        // Sv39: a table entry's physical address is (PTE >> 10) << 12,
+                // not a direct mask like the x86-64 vocabulary.
+                let mid_table = ((root_e >> 10) << 12) & 0x000F_FFFF_FFFF_F000;
+
+        for mid_idx in 0..512usize {
+            let mid_e = read_pte(mid_table, mid_idx);
+            if mid_e & PTE_PRESENT == 0 || is_block_desc(mid_e) {
+                continue;
+            }
+            let leaf_table = ((mid_e >> 10) << 12) & 0x000F_FFFF_FFFF_F000;
+
+            for leaf_idx in 0..512usize {
+                let pte = read_pte(leaf_table, leaf_idx);
+                if pte & PTE_PRESENT == 0 {
+                    continue;
+                }
+
+                let vaddr = ((root_idx as u64) << 30)
+                    | ((mid_idx as u64) << 21)
+                    | ((leaf_idx as u64) << 12);
+                if vaddr < USER_LOAD_BASE {
+                    continue;
+                }
+
+                // Rebuild the x86-vocabulary caller flags from the Sv39
+                // leaf descriptor: V|R|W|X|U|A|D (bits 0-4, 6, 7).
+                const RSV_W: u64 = 1 << 2;
+                const RSV_X: u64 = 1 << 3;
+                const RSV_U: u64 = 1 << 4;
+                let mut flags: u64 = 1; // PRESENT
+                if pte & RSV_U != 0 {
+                    flags |= 1 << 2; // USER
+                }
+                if pte & RSV_W != 0 {
+                    flags |= 1 << 1; // WRITABLE
+                } else {
+                    flags |= 1 << 7; // RDONLY
+                }
+                if pte & RSV_X == 0 {
+                    flags |= 1 << 63; // NX
+                }
+                // Sv39 leaf PTE: frame PA = (PTE >> 10) << 12.
+                let parent_frame = (pte >> 10) << 12;
+
+                let new_frame = match frame_alloc::frame_alloc_zeroed() {
+                    Some(f) => f,
+                    None => return None,
+                };
+
+                let src = parent_frame as *const u8;
+                let dst = new_frame.as_u64() as *mut u8;
+                core::ptr::copy_nonoverlapping(src, dst, page_size);
+
+                if map_user_page(child_pml4, vaddr, new_frame.as_u64(), flags).is_none() {
+                    return None;
+                }
+            }
+        }
+    }
     Some(())
 }
 
@@ -581,10 +809,43 @@ unsafe fn map_elf_segments(pml4: PhysAddr, module: &crate::entry::RawModuleInfo)
     let phsize = ehdr.e_phentsize as usize;
     let entry = ehdr.e_entry + USER_LOAD_BASE;
 
+    // Derive the link-time image range from the PT_LOAD segments.  The
+    // default link base differs per target (aarch64 links at 0x20_0000,
+    // riscv64 at 0x1_0000), so a fixed window cannot cover both.
+    let mut img_lo = u64::MAX;
+    let mut img_hi = 0u64;
+    unsafe {
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        struct Phdr64R {
+            p_type:  u32,
+            p_flags: u32,
+            p_offset: u64,
+            p_vaddr: u64,
+            p_paddr: u64,
+            p_filesz: u64,
+            p_memsz: u64,
+        }
+        for i in 0..phnum {
+            let ph = *((base as usize + phoff + i * phsize) as *const Phdr64R);
+            if ph.p_type != 1 || ph.p_memsz == 0 {
+                // PT_LOAD
+                continue;
+            }
+            img_lo = img_lo.min(ph.p_vaddr);
+            img_hi = img_hi.max(ph.p_vaddr + ph.p_memsz);
+        }
+    }
+    if img_lo == u64::MAX {
+        img_lo = crate::segment::USER_IMAGE_BASE;
+        img_hi = crate::segment::USER_IMAGE_LIMIT;
+    }
+
     // Relocate absolute pointers stored in `.got`.  The ELF is linked at
-    // 0x200000 (the kernel's linker base) but mapped at USER_LOAD_BASE.
-    // RIP-relative displacements naturally relocate with the code, but GOT
-    // entries contain absolute target addresses and must be shifted manually.
+    // its target's default base (see the img_lo/img_hi derivation below)
+    // but mapped at USER_LOAD_BASE.  PC-relative displacements naturally
+    // relocate with the code, but GOT entries contain absolute target
+    // addresses and must be shifted manually.
     unsafe {
         #[derive(Copy, Clone)]
         #[repr(C)]
@@ -631,12 +892,10 @@ unsafe fn map_elf_segments(pml4: PhysAddr, module: &crate::entry::RawModuleInfo)
                     for w in 0..nwords {
                         let p = (base as usize + off + w * 8) as *mut u64;
                         let val = *p;
-                        // Relocate only absolute low-image pointers.  The
+                        // Relocate only absolute link-image pointers.  The
                         // .data.rel.ro section also contains small integers
                         // and packed table fields that must stay unchanged.
-                        if val >= crate::segment::USER_IMAGE_BASE
-                            && val < crate::segment::USER_IMAGE_LIMIT
-                        {
+                        if val >= img_lo && val < img_hi {
                             *p = val + USER_LOAD_BASE;
                         }
                     }

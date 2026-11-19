@@ -283,11 +283,21 @@ impl DisplayEngine for VirtioGpuEngine {
     }
 }
 
+#[cfg(target_arch = "loongarch64")]
+fn find_virtio_gpu_device() -> Option<u64> {
+    // loongarch64 virt: the ECAM config window is not wired up (a config
+    // read through it faults on unmapped physical memory), so skip PCI
+    // scanning entirely on that architecture — the boot path does not
+    // depend on virtio-gpu there.
+    None
+}
+
 /// Scan PCI buses for the virtio-gpu device and return its BAR0.
+#[cfg(not(target_arch = "loongarch64"))]
 fn find_virtio_gpu_device() -> Option<u64> {
     // Route all config-space reads through the drivers-crate PCI access
     // functions: they use the 0xCF8/CFC port pair on x86_64 and the MMIO
-    // ECAM window on aarch64.
+    // ECAM window on aarch64/riscv64.
     use plan9_drivers::pci::{pci_config_read, PciConfigAddr};
 
     for bus in 0..=255u8 {

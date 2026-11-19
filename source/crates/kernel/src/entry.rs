@@ -24,17 +24,13 @@ extern crate plan9_arch;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::arch::asm;
 use core::panic::PanicInfo;
 
-use crate::console;
 use crate::frame_alloc;
 use crate::heap;
 use crate::init_loader;
 use crate::serial;
 
-use plan9_common::types::VirtAddr;
-use plan9_arch::paging_init;
 
 // ============================================================================
 // Multiboot2 Constants
@@ -294,11 +290,34 @@ pub struct FramebufferConfig {
     pub pitch:   u32,
     pub width:   u32,
     pub height:  u32,
-    pub bpp:     u8,
-    pub fb_type: FramebufferType,
+    pub format: crate::gpu::PixelFormat,
 }
-#[derive(Debug, Clone)]
-pub enum FramebufferType { Linear, Indexed }
+
+impl FramebufferConfig {
+    unsafe fn from_tag(tag: *const TagHeader, size: usize) -> Option<Self> {
+        use crate::gpu::PixelFormat;
+        if size < 38 {
+            return None;
+        }
+        let fb = &*tag.byte_add(8).cast::<FramebufferInfo>();
+        if fb.fb_type != 1 || fb.bpp != 32 {
+            return None;
+        }
+        let color_fields = tag.byte_add(32).cast::<[u8; 6]>().read();
+        let format = match color_fields {
+            [16, 8, 8, 8, 0, 8] => PixelFormat::BGRA8888,
+            [0, 8, 8, 8, 16, 8] => PixelFormat::RGBA8888,
+            _ => return None,
+        };
+        Some(Self {
+            address: fb.addr,
+            pitch: fb.pitch,
+            width: fb.width,
+            height: fb.height,
+            format,
+        })
+    }
+}
 
 // ============================================================================
 // Multiboot2 parser
@@ -321,7 +340,6 @@ pub fn parse_boot_info(info_addr: u64) -> Option<BootInfo> {
     serial::put_bytes(b"[parse_boot_info] STEP5: BootInfo created\n");
 
     let mut offset = 8usize;
-    let info_end = info_addr + total_size as u64;
 
     serial::put_bytes(b"[parse_boot_info] STEP6: entering while loop\n");
     serial::put_bytes(b"[parse_boot_info] STEP6b: offset=8, total_size set\n");
@@ -446,20 +464,7 @@ pub fn parse_boot_info(info_addr: u64) -> Option<BootInfo> {
                 serial::put_bytes(b"\n");
             }
             tag_type::FRAMEBUFFER => {
-                let fb = unsafe { &*(tag_ptr.byte_add(8) as *const FramebufferInfo) };
-                boot.framebuffer = Some(FramebufferConfig {
-                    address: fb.addr,
-                    pitch:   fb.pitch,
-                    width:   fb.width,
-                    height:  fb.height,
-                    bpp:     fb.bpp,
-                    fb_type: if fb.fb_type == 0 {
-                        FramebufferType::Linear
-                    } else {
-                        FramebufferType::Indexed
-                    },
-                });
-                serial::put_bytes(b"[kernel] parse_boot_info: FRAMEBUFFER parsed\n");
+                boot.framebuffer = unsafe { FramebufferConfig::from_tag(tag_ptr, tag_size) };
             }
             tag_type::ACPI_OLD | tag_type::ACPI_NEW => {
                 // Payload is a copy of the RSDP structure itself (20 bytes
@@ -468,10 +473,12 @@ pub fn parse_boot_info(info_addr: u64) -> Option<BootInfo> {
                 // where the legacy BIOS scan regions hold nothing.
                 let len = if tag_size > 8 { tag_size - 8 } else { 0 };
                 if len >= 20 {
-                    let src = unsafe { tag_ptr.byte_add(8) } as *const u8;
-                    let bytes = unsafe { core::slice::from_raw_parts(src, len) };
                     #[cfg(target_arch = "x86_64")]
-                    crate::smp::store_rsdp_copy(bytes);
+                    {
+                        let src = unsafe { tag_ptr.byte_add(8) }.cast::<u8>();
+                        let bytes = unsafe { core::slice::from_raw_parts(src, len) };
+                        crate::smp::store_rsdp_copy(bytes);
+                    }
                     serial::put_bytes(b"[kernel] parse_boot_info: ACPI RSDP tag len=");
                     serial::put_hex_u32(len as u32);
                     serial::put_bytes(b"\n");
@@ -562,6 +569,19 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     serial::init();
     serial::put_bytes(b"[kernel] after_init\n");
 
+    // LoongArch64 direct boot (QEMU `-bios none -kernel`, no firmware
+    // loader): synthesize a real Multiboot2 info blob from the modules
+    // planted in RAM with `-device loader`, then fall through to the
+    // common bootinfo path below as if a bootloader had handed it to us.
+    // The fallback branch underneath never runs on this architecture.
+    #[cfg(target_arch = "loongarch64")]
+    let (magic, info) = if magic != MB2_MAGIC && magic != 0x36D7620A {
+        serial::put_bytes(b"[kernel] loongarch64: synthesizing Multiboot2 blob\n");
+        unsafe { crate::directboot::synthesize() }
+    } else {
+        (magic, info)
+    };
+
     // Non-x86_64 fallback bring-up: without a valid Multiboot2 info
     // pointer (e.g. a plain `-kernel` boot, where x0 holds the DTB
     // pointer) there is no memory map and no modules, so run the
@@ -637,12 +657,6 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
             let mut fb_cfg: Option<crate::entry::FramebufferConfig> = None;
             if info != 0 {
                 let total_size = unsafe { core::ptr::read_volatile(info as *const u32) } as u64;
-                let mut fb_addr: u64 = 0;
-                let mut fb_pitch: u32 = 0;
-                let mut fb_width: u32 = 0;
-                let mut fb_height: u32 = 0;
-                let mut fb_bpp: u8 = 0;
-                let mut found = false;
                 let mut offset: u64 = 8;
                 let mut safety = 0u32;
                 while offset + 8 <= total_size && safety < 64 {
@@ -651,27 +665,12 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
                     let ttype = unsafe { core::ptr::read_volatile(tag_ptr) };
                     let tsize = unsafe { core::ptr::read_volatile(tag_ptr.add(1)) } as u64;
                     if ttype == 0 { break; }
-                    if tsize == 0 { offset += 8; continue; }
-                    if ttype == 8 {
-                        fb_addr   = (unsafe { core::ptr::read_volatile(tag_ptr.add(2)) } as u64)
-                                  | ((unsafe { core::ptr::read_volatile(tag_ptr.add(3)) } as u64) << 32);
-                        fb_pitch  = unsafe { core::ptr::read_volatile(tag_ptr.add(4)) };
-                        fb_width  = unsafe { core::ptr::read_volatile(tag_ptr.add(5)) };
-                        fb_height = unsafe { core::ptr::read_volatile(tag_ptr.add(6)) };
-                        fb_bpp    = unsafe { core::ptr::read_volatile((tag_ptr.add(7)) as *const u8) };
-                        found = fb_width > 0 && fb_height > 0 && fb_bpp >= 16;
+                    if tsize < 8 || tsize > total_size - offset { break; }
+                    if ttype == tag_type::FRAMEBUFFER {
+                        fb_cfg = unsafe { FramebufferConfig::from_tag(tag_ptr.cast(), tsize as usize) };
+                        break;
                     }
                     offset += (tsize + 7) & !7;
-                }
-                if found {
-                    fb_cfg = Some(crate::entry::FramebufferConfig {
-                        address: fb_addr,
-                        pitch: fb_pitch,
-                        width: fb_width,
-                        height: fb_height,
-                        bpp: fb_bpp,
-                        fb_type: crate::entry::FramebufferType::Linear,
-                    });
                 }
             }
             BootInfo {
@@ -787,6 +786,11 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     install_rootfs(&boot_info);
     mount_standard_devices();
 
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
+    if fb_cfg.is_some() && !crate::vkey::init() {
+        serial::put_bytes(b"[vkey] no virtio-keyboard found\n");
+    }
+
     // Bring up the graphical text console that /dev/console uses for the
     // Ring3 terminal page.  Fall back to the serial/VGA text path when no
     // GPU framebuffer is available (e.g. QEMU -display none).
@@ -795,6 +799,8 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     serial::put_bytes(b"[kstart] console::init_console\n");
     crate::console::init_console();
 
+    // Only PC machines expose the legacy VGA text aperture at 0xB8000.
+    #[cfg(target_arch = "x86_64")]
     if !crate::console::is_initialised() {
         serial::put_bytes(b"[kstart] vga_init fallback\n");
         crate::vga::vga_init();
@@ -806,16 +812,20 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
             }
         }
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    if !crate::console::is_initialised() {
+        serial::put_bytes(b"[kstart] no framebuffer; console stays serial-only\n");
+    }
 
     // Step 4 — ACPI + timer. We do this after the heap because the
     // tables are allocated from it.
-    serial::put_bytes(b"[kstart] acpi::init_acpi\n");
-    // Find RSDP in the Multiboot2 boot info (tag type 15) or fall
-    // back to the well-known ACPI 1.0 scan address.
     #[cfg(target_arch = "x86_64")]
-    {
-        let rsdp = boot_info.bootloader_name.as_ref().map(|_| 0u64).unwrap_or(0);
-        crate::acpi::init_acpi(rsdp);
+    if let Some(rsdp) = crate::smp::rsdp_from_copy() {
+        if let Err(reason) = crate::acpi::init_acpi(rsdp) {
+            serial::put_bytes(b"[kstart] ACPI unavailable: ");
+            serial::put_bytes(reason.as_bytes());
+            serial::put_bytes(b"\n");
+        }
     }
     serial::put_bytes(b"[kstart] timer::init_timer\n");
     crate::timer::init_timer();
@@ -1061,11 +1071,10 @@ fn switch_to_user(image: crate::init_loader::InitImage) -> ! {
         Some(p) => p.as_u64(),
         None => 0x0020_0000u64, // fallback: known-good identity-mapped low address
     };
-    let frame_ptr = frame_page as *mut u64;
-
     unsafe {
         #[cfg(target_arch = "x86_64")]
         {
+            let frame_ptr = frame_page as *mut u64;
             // scratch (consumed by the trampoline's `add rsp, 8`).
             core::ptr::write_volatile(frame_ptr.add(0), 0);
             // RIP
@@ -1092,13 +1101,26 @@ fn switch_to_user(image: crate::init_loader::InitImage) -> ! {
                 0, // root table installed separately by the trampoline
             );
         }
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+        {
+            // riscv64/loongarch64 trampoline frame layout (see
+            // `build_user_frame`): [0] scratch, [1] entry (sepc/ERA),
+            // [2] sstatus/PRMD, [3] user SP, [4] user root table.
+            // Without this the trampoline reads a zeroed frame and
+            // `sret`/`ertn`s into U-mode at PC=0 with SP=0.
+            switch_to_user::build_user_frame(
+                frame_page,
+                image.entry,
+                image.user_sp,
+                0, // root table installed separately by the trampoline
+            );
+        }
     }
 
     let pml4_phys = image.pml4.as_u64();
     unsafe {
-        switch_to_user::switch_to_user_trampoline(pml4_phys, frame_page);
+        switch_to_user::switch_to_user_trampoline(pml4_phys, frame_page)
     }
-    unreachable!("switch_to_user trampoline returned")
 }
 
 fn round_up(v: u64, align: u64) -> u64 { (v + align - 1) & !(align - 1) }

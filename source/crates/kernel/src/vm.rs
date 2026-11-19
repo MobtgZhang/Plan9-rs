@@ -305,7 +305,9 @@ impl FrameAllocator {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    return Ok(());
+                }
                 Err(_) => continue, // Retry on contention
             }
         }
@@ -695,7 +697,7 @@ impl KernelHeap {
         // Merge adjacent blocks
         let mut i = 0;
         while i < blocks.len() {
-            let (mut ptr, mut size) = blocks[i];
+            let (ptr, mut size) = blocks[i];
             let mut j = i + 1;
 
             while j < blocks.len() {
@@ -1456,10 +1458,13 @@ const PHYS_MAP_LIMIT: u64 = 512 << 30;            // PDPT covers 512 GiB
 
 /// Physical address of the kernel-owned PML4, installed on the first
 /// `map_phys_range` call.  0 until then.
+#[cfg(target_arch = "x86_64")]
 static KERNEL_PML4: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// PML4 slot indices for the phys-map windows (bits 47:39 of the VA).
+#[cfg(target_arch = "x86_64")]
 const PML4_IDX_8800: usize = 272; // 0xFFFF_8800_0000_0000 >> 39 & 0x1FF
+#[cfg(target_arch = "x86_64")]
 const PML4_IDX_9000: usize = 288; // 0xFFFF_9000_0000_0000 >> 39 & 0x1FF
 
 /// Build a kernel-owned PML4 and switch to it.
@@ -1483,6 +1488,7 @@ const PML4_IDX_9000: usize = 288; // 0xFFFF_9000_0000_0000 >> 39 & 0x1FF
 /// The firmware's entries are only *read* (through the low 1 GiB identity
 /// mapping, still live until we switch CR3), so the read-only protection
 /// does not matter.
+#[cfg(target_arch = "x86_64")]
 unsafe fn ensure_kernel_page_table() -> u64 {
     use core::sync::atomic::Ordering;
 
@@ -1567,9 +1573,14 @@ unsafe fn ensure_kernel_page_table() -> u64 {
 
 /// Map a physical address range into kernel virtual memory.
 ///
-/// With the kernel-owned page table (see `ensure_kernel_page_table`) the
-/// phys-map windows are direct 1 GiB huge-page translations, so this is a
+/// x86_64: with the kernel-owned page table (see `ensure_kernel_page_table`)
+/// the phys-map windows are direct 1 GiB huge-page translations, so this is a
 /// pure address computation for any physical address below 512 GiB.
+///
+/// aarch64/riscv64/loongarch64: the kernel's TTBR1/PGD direct-map window
+/// (`PHYS_MEMORY_VIRT`) covers physical RAM, and the firmware hands us the
+/// framebuffer inside RAM, so this is likewise a pure address computation.
+///
 /// Returns the kernel virtual address of `phys`, or null on failure.
 ///
 /// # Safety
@@ -1588,22 +1599,46 @@ pub unsafe fn map_phys_range(phys: u64, size: u64) -> *mut u8 {
     let phys_aligned = phys & !(page_size - 1);
     let end = (phys + size + page_size - 1) & !(page_size - 1);
 
-    if phys_aligned >= PHYS_MAP_LIMIT || end > PHYS_MAP_LIMIT {
-        serial::put_bytes(b"[map_phys_range] FAILED: phys outside 512GiB window\n");
-        return core::ptr::null_mut();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if phys_aligned >= PHYS_MAP_LIMIT || end > PHYS_MAP_LIMIT {
+            serial::put_bytes(b"[map_phys_range] FAILED: phys outside 512GiB window\n");
+            return core::ptr::null_mut();
+        }
+
+        if ensure_kernel_page_table() == 0 {
+            serial::put_bytes(b"[map_phys_range] FAILED: page table alloc\n");
+            return core::ptr::null_mut();
+        }
+
+        let base_virt = PHYS_MAP_9000 + phys_aligned;
+        let result_virt = base_virt + (phys - phys_aligned);
+        serial::put_bytes(b"[map_phys_range] DONE, virt=");
+        serial::put_hex_u64(result_virt);
+        serial::put_bytes(b"\n");
+        return result_virt as *mut u8;
     }
 
-    if ensure_kernel_page_table() == 0 {
-        serial::put_bytes(b"[map_phys_range] FAILED: page table alloc\n");
-        return core::ptr::null_mut();
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // The direct-map windows on the non-x86_64 targets cover the first
+       // 4 GiB of physical memory (aarch64 IDENTITY_GIB = 4 one-GiB blocks;
+        // riscv64/loongarch64 map their RAM similarly).  Firmware
+        // framebuffers and PCI MMIO below that bound are reachable.
+        if end > (4u64 << 30) {
+            serial::put_bytes(b"[map_phys_range] FAILED: phys outside direct map\n");
+            return core::ptr::null_mut();
+        }
+        #[cfg(target_arch = "loongarch64")]
+        let base_virt = crate::plan9_arch::loongarch64::mmu::mmio_phys_to_virt(phys_aligned);
+        #[cfg(not(target_arch = "loongarch64"))]
+        let base_virt = phys_to_virt(PhysAddr::new(phys_aligned)).as_u64();
+        let result_virt = base_virt + (phys - phys_aligned);
+        serial::put_bytes(b"[map_phys_range] DONE, virt=");
+        serial::put_hex_u64(result_virt);
+        serial::put_bytes(b"\n");
+        return result_virt as *mut u8;
     }
-
-    let base_virt = PHYS_MAP_9000 + phys_aligned;
-    let result_virt = base_virt + (phys - phys_aligned);
-    serial::put_bytes(b"[map_phys_range] DONE, virt=");
-    serial::put_hex_u64(result_virt);
-    serial::put_bytes(b"\n");
-    result_virt as *mut u8
 }
 
 /// Invalidate TLB entry for a specific virtual address

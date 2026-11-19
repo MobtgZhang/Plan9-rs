@@ -12,6 +12,7 @@ pub mod cpu;
 pub mod mmu;
 pub mod paging;
 pub mod switch_to_user;
+pub mod timer;
 pub mod uart;
 
 use crate::arch_trait::{Arch, ContextArch, InterruptControl, TimerArch};

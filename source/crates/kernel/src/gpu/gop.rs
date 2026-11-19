@@ -1,12 +1,7 @@
 //! UEFI GOP / Multiboot2 framebuffer engine.
 //!
-//! The UEFI firmware exposes the linear framebuffer via the Multiboot2
-//! FRAMEBUFFER tag (type 8), which is populated by GRUB when the `efi_gop`
-//! module is loaded. GRUB translates the GOP mode information into the
-//! multiboot2 format.
-//!
-//! We map the physical framebuffer into kernel virtual memory and expose
-//! it through the `DisplayEngine` trait.
+//! The bootloader passes the firmware's linear framebuffer in the Multiboot2
+//! FRAMEBUFFER tag. The kernel takes over drawing without calling EFI again.
 
 use super::{Color, DisplayEngine, EngineKind, FramebufferInfo, PixelFormat, Rect};
 use crate::plan9_common::types::PhysAddr;
@@ -29,28 +24,18 @@ impl GopEngine {
         serial::put_hex_u32(fb_config.width);
         serial::put_bytes(b"x");
         serial::put_hex_u32(fb_config.height);
-        serial::put_bytes(b" bpp=");
-        serial::put_hex_u32(fb_config.bpp as u32);
         serial::put_bytes(b"\n");
 
-        if fb_config.width == 0 || fb_config.height == 0 {
-            serial::put_bytes(b"[gop] new: zero dimensions, skipping\n");
+        if fb_config.width == 0 || fb_config.height == 0 || fb_config.address == 0
+            || fb_config.address % 4 != 0 || fb_config.pitch % 4 != 0
+            || fb_config.width.checked_mul(4)? > fb_config.pitch
+            || !matches!(fb_config.format, PixelFormat::BGRA8888 | PixelFormat::RGBA8888)
+        {
             return None;
         }
 
-        let format = match fb_config.bpp {
-            32 => PixelFormat::BGRA8888, // GOP default is BGRA
-            24 => PixelFormat::RGB888,
-            16 => PixelFormat::RGB565,
-            _ => PixelFormat::Unknown,
-        };
-
-        if matches!(format, PixelFormat::Unknown) {
-            serial::put_bytes(b"[gop] new: unsupported bpp\n");
-            return None;
-        }
-
-        let size_bytes = fb_config.pitch as u64 * fb_config.height as u64;
+        let size_bytes = u64::from(fb_config.pitch.checked_mul(fb_config.height)?);
+        fb_config.address.checked_add(size_bytes)?.checked_add(4095)?;
 
         // Map the physical framebuffer into kernel virtual memory.
         // SAFETY: we trust the firmware gave us a valid framebuffer range.
@@ -73,11 +58,19 @@ impl GopEngine {
             width: fb_config.width,
             height: fb_config.height,
             pitch: fb_config.pitch,
-            format,
+            format: fb_config.format,
             size_bytes,
         };
 
         Some(Self { info })
+    }
+
+    fn pixel(&self, bgra: u32) -> u32 {
+        if self.info.format == PixelFormat::RGBA8888 {
+            (bgra & 0xff00_ff00) | ((bgra & 0xff) << 16) | ((bgra >> 16) & 0xff)
+        } else {
+            bgra
+        }
     }
 }
 
@@ -92,12 +85,12 @@ impl DisplayEngine for GopEngine {
         }
         let offset = y * self.info.pitch + x * 4;
         let ptr = (self.info.virt_addr + offset as u64) as *mut u32;
-        let pixel = color_to_bgra(color);
+        let pixel = self.pixel(color_to_bgra(color));
         unsafe { core::ptr::write_volatile(ptr, pixel); }
     }
 
     fn fill_rect(&mut self, rect: Rect, color: Color) {
-        let pixel = color_to_bgra(color);
+        let pixel = self.pixel(color_to_bgra(color));
         for dy in 0..rect.height {
             for dx in 0..rect.width {
                 let px = rect.x.saturating_add(dx);
@@ -124,14 +117,17 @@ impl DisplayEngine for GopEngine {
                 let ptr = (self.info.virt_addr + offset as u64) as *mut u32;
                 let src_idx = row * src_w + col;
                 if (src_idx as usize) < src.len() {
-                    unsafe { core::ptr::write_volatile(ptr, src[src_idx as usize]); }
+                    unsafe { core::ptr::write_volatile(ptr, self.pixel(src[src_idx as usize])); }
                 }
             }
         }
     }
 
     fn scroll_up(&mut self, rows: u32, fill: Color) {
-        if rows == 0 || rows >= self.info.height {
+        if rows == 0 {
+            return;
+        }
+        if rows >= self.info.height {
             return self.fill_rect(
                 Rect::new(0, 0, self.info.width, self.info.height),
                 fill,
@@ -139,24 +135,20 @@ impl DisplayEngine for GopEngine {
         }
 
         let copy_height = self.info.height - rows;
-        let row_bytes = self.info.pitch as usize;
-        let virt = self.info.virt_addr as *mut u8;
+        let stride = (self.info.pitch / 4) as usize;
+        let virt = self.info.virt_addr as *mut u32;
 
-        // Copy rows up
         for y in 0..copy_height {
-            let src_row = (y + rows) as usize * row_bytes;
-            let dst_row = y as usize * row_bytes;
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    virt.add(src_row),
-                    virt.add(dst_row),
-                    row_bytes,
-                );
+            for x in 0..self.info.width as usize {
+                unsafe {
+                    let pixel = virt.add((y + rows) as usize * stride + x).read_volatile();
+                    virt.add(y as usize * stride + x).write_volatile(pixel);
+                }
             }
         }
 
         // Clear bottom rows
-        let fill_pixel = color_to_bgra(fill);
+        let fill_pixel = self.pixel(color_to_bgra(fill));
         for y in copy_height..self.info.height {
             for x in 0..self.info.width {
                 let offset = y * self.info.pitch + x * 4;

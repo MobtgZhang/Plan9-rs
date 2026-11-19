@@ -21,8 +21,16 @@ use super::cpu::{csr, csr_write};
 use super::mmu::{cr3_write, flush_tlb};
 use plan9_common::types::PhysAddr;
 
-/// Initial PRMD for user entry: PPLV = 0b11 (PLV3), PIE = 1.
-pub const USER_PRMD_INIT: u64 = 0b111;
+extern "C" {
+    /// The user trap frame area defined by boot.S (8 KiB in .bss; the top
+    /// 272 bytes are the frame, the rest is the handler's scratch stack).
+    static _user_trap_area: u8;
+}
+
+/// Initial PRMD for user entry: PPLV = 0b11 (PLV3), PIE = 0.  The
+/// kernel is interrupt-free, so user code runs with CRMD.IE clear too —
+/// the trap entry re-clears PIE on the way back out regardless.
+pub const USER_PRMD_INIT: u64 = 0b11;
 
 /// Selectors kept for API parity with the x86_64 module (LoongArch has
 /// no segment selectors; these are informational only).
@@ -69,15 +77,18 @@ pub unsafe fn switch_to_user_trampoline(pml4_phys: u64, frame_ptr: u64) -> ! {
     let prmd = fp.add(2).read_volatile();
     let user_sp = fp.add(3).read_volatile();
 
-    // 3. Ert into PLV3: set $sp, ERA, PRMD, then `ertn`.
+    // 3. Ert into PLV3: set $sp, ERA, PRMD, then `ertn`.  The registers
+    // are pinned ($a0-$a2 = $r4-$r6, dead in this never-returning
+    // context) so the allocator cannot hand out $r3 (the user sp) for
+    // an operand.
     core::arch::asm!(
-        "or $r3, {usp}, $r0",
-        "csrwr {era}, 0x6",
-        "csrwr {prmd}, 0x1",
+        "or $r3, $r4, $r0",
+        "csrwr $r5, 0x6",
+        "csrwr $r6, 0x1",
         "ertn",
-        usp = in(reg) user_sp,
-        era = in(reg) entry,
-        prmd = in(reg) prmd,
+        in("$r4") user_sp,
+        in("$r5") entry,
+        in("$r6") prmd,
         options(noreturn, nostack)
     );
 }
@@ -96,11 +107,21 @@ pub unsafe fn switch_to_user_trampoline(pml4_phys: u64, frame_ptr: u64) -> ! {
 /// # Safety
 /// Never returns.
 pub unsafe fn kernel_resume_user(frame_ptr: u64, pml4_phys: u64) -> ! {
-    cr3_write(PhysAddr::new(pml4_phys));
+    // Boot.S's trap frame: _user_trap_area + 8192 - 272 (the top 34 u64
+    // slots of the 8 KiB area, 16-byte aligned).
+    let trap_frame_base = core::ptr::addr_of!(_user_trap_area) as u64 + 7920;
     core::arch::asm!(
-        // Frame base → $t0 ($r12).
-        "or $r12, {fb}, $r0",
-        // General registers $r1–$r11 and $r13–$r31 (skip $r12 = base).
+        // Switch the page-table root: PGDL := child PML4 physical address.
+        "csrwr $a0, 0x19",
+        // Make the new PGDL and TLB flush visible before touching any
+        // memory through the new page tables.
+        "dbar 0",
+        "invtlb 0, $zero, $zero",
+        // KS0 := user trap frame base — the next trap from user mode
+        // swaps it with the user $sp (mirrors riscv64's sscratch).
+        "csrwr $r13, 0x30",
+        // $r12 = SavedUserFrame pointer.  General registers $r1–$r11 and
+        // $r13–$r31 (skip $r12 = base; $r3 = user sp comes last).
         "ld.d $r1,  $r12, 0",
         "ld.d $r2,  $r12, 8",
         "ld.d $r3,  $r12, 16",   // user stack pointer
@@ -139,7 +160,9 @@ pub unsafe fn kernel_resume_user(frame_ptr: u64, pml4_phys: u64) -> ! {
         // Finally the frame base register itself, then return.
         "ld.d $r12, $r12, 88",
         "ertn",
-        fb = in(reg) frame_ptr,
+        in("$a0") pml4_phys,
+        in("$r12") frame_ptr,
+        in("$r13") trap_frame_base,
         options(noreturn, nostack)
     );
 }

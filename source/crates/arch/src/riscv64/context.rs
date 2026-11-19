@@ -223,6 +223,7 @@ impl Default for FpuState {
 /// # Safety
 /// Buffer must be aligned and at least FPU_STATE_SIZE bytes; FPU must
 /// be enabled in `sstatus.FS`.
+#[cfg(target_feature = "d")]
 #[inline]
 pub unsafe fn fpsave(state: &mut FpuState) {
     let ptr = state.data.as_mut_ptr() as u64;
@@ -271,6 +272,7 @@ pub unsafe fn fpsave(state: &mut FpuState) {
 ///
 /// # Safety
 /// Buffer must contain a previously saved FPU state.
+#[cfg(target_feature = "d")]
 #[inline]
 pub unsafe fn fprestore(state: &FpuState) {
     let ptr = state.data.as_ptr() as u64;
@@ -319,12 +321,14 @@ pub unsafe fn fprestore(state: &FpuState) {
 ///
 /// # Safety
 /// Only call in kernel mode.
+#[cfg(target_feature = "d")]
 pub unsafe fn save_fpu_state(state: &mut FpuState) { fpsave(state) }
 
 /// Restore FPU state for the current process.
 ///
 /// # Safety
 /// Only call in kernel mode.
+#[cfg(target_feature = "d")]
 pub unsafe fn restore_fpu_state(state: &FpuState) { fprestore(state) }
 
 /// Initialize FPU for a new process: set `sstatus.FS` = Dirty (0b11) so
@@ -332,6 +336,7 @@ pub unsafe fn restore_fpu_state(state: &FpuState) { fprestore(state) }
 ///
 /// # Safety
 /// Only call in kernel mode.
+#[cfg(target_feature = "d")]
 pub unsafe fn init_fpu() {
     core::arch::asm!(
         "li t0, (3 << 13)",     // FS = 0b11 (Dirty → enable)
@@ -348,6 +353,7 @@ pub fn fpu_used_since_switch() -> bool {
 }
 
 /// Clear the FPU trap state (enable FP).
+#[cfg(target_feature = "d")]
 pub fn clear_fpu_task_switched() {
     unsafe { init_fpu() };
 }

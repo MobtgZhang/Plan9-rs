@@ -352,12 +352,12 @@ fn check_and_deliver_alarms() {
 fn keyboard_interrupt() {
     // Claim the keyboard controller so the polling read path stands down
     // while this interrupt is being processed.
-    crate::keymap::IN_IRQ_MARK();
+    crate::keymap::in_irq_mark();
     let delivered = keyboard_interrupt_inner();
     if delivered {
         crate::keymap::mark_irq_delivered();
     }
-    crate::keymap::IN_IRQ_CLEAR();
+    crate::keymap::in_irq_clear();
     // Acknowledge the keyboard interrupt on the PIC (IRQ1).
     pic_eoi(1);
 }
@@ -374,8 +374,9 @@ fn keyboard_interrupt_inner() -> bool {
     if !bytes.is_empty() {
         if let Some(idx) = crate::dev::devs().find_by_char('c') {
             if let Some(dev) = crate::dev::devs_mut().get_mut(idx) {
-                if let Some(cons) =
-                    dev.as_any_mut().downcast_mut::<crate::dev::ConsDev>()
+                if let Some(cons) = dev
+                    .as_any_mut()
+                    .and_then(|device| device.downcast_mut::<crate::dev::ConsDev>())
                 {
                     cons.add_input(bytes);
                     return true;
@@ -595,9 +596,18 @@ pub unsafe extern "C" fn aarch64_el0_sync_handler(fp: *mut u64) -> u64 {
     // syscall/restore path clobbered the user callee-saved registers.
     if let Some(p) = crate::proc::curproc() {
         if let Some(f) = p.user_frame.as_ref() {
-            crate::cons::puts(b"  uframe x28=");
-            crate::serial::put_hex_u64(f.x[28]);
-            crate::cons::puts(b" pc=");
+            crate::cons::puts(b"  uframe:");
+            for i in 0..31usize {
+                if i % 4 == 0 {
+                    crate::cons::puts(b"\n    ");
+                }
+                crate::cons::puts(b" x");
+                let hi = (i / 10) as u8;
+                let lo = (i % 10) as u8;
+                crate::serial::put_bytes(&[b'0' + hi, b'0' + lo, b'=']);
+                crate::serial::put_hex_u64(f.x[i]);
+            }
+            crate::cons::puts(b"\n    pc=");
             crate::serial::put_hex_u64(f.pc);
             crate::cons::puts(b" sp=");
             crate::serial::put_hex_u64(f.sp);
@@ -649,11 +659,6 @@ pub unsafe extern "C" fn aarch64_svc_handler(fp: *mut u64) -> u64 {
     let a3 = *fp.add(3);
     let a4 = *fp.add(4);
     let a5 = *fp.add(5);
-    crate::cons::puts(b"[svc] num=");
-    crate::serial::put_hex_u64(num as u64);
-    crate::cons::puts(b" a0=");
-    crate::serial::put_hex_u64(a0);
-    crate::cons::puts(b"\n");
 
     let mut x = [0u64; 31];
     for i in 0..31 {
@@ -697,8 +702,6 @@ pub unsafe extern "C" fn aarch64_svc_handler(fp: *mut u64) -> u64 {
 
     let result = crate::syscall::dispatch(num, &frame);
 
-    // exec: resume at the new program image instead of returning into
-    // the old user frame (mirrors the x86_64 sysret-exec path).
     if num == crate::syscall::nr::EXEC {
         if let Some(proc) = curproc() {
             let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
@@ -1268,4 +1271,378 @@ pub fn syscall(num: u64, arg0: u64, arg1: u64, arg2: u64,
 #[cfg(target_arch = "x86_64")]
 pub fn setup_idt_handlers() {
     init_idt();
+}
+
+// ===========================================================================
+// RISC-V user trap (stvec target; entered from boot.S `_user_trap` with the
+// frame pointer in a0, and returned through the same frame).
+//
+// Frame layout (u64 slots, mirrors the aarch64 trap frame):
+//   [0..32]  x0..x31  (a0..a5 = [10..15]; syscall number in a7 = [17];
+//                      x2 = [2] holds the user sp)
+//   [32]     sepc
+//   [33]     sstatus  (as trapped: SPP=1, SIE=0)
+//
+// Interrupts are kept off (USER_SSTATUS_INIT clears SPIE), so only
+// exceptions arrive here: an `ecall` from U-mode is the Plan 9 syscall
+// gate; everything else is fatal.
+// ===========================================================================
+#[cfg(target_arch = "riscv64")]
+#[inline]
+fn read_scause() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("csrr {}, scause", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+fn read_stval() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("csrr {}, stval", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+fn wfi_forever() -> ! {
+    loop {
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+    }
+}
+
+// LoongArch64: interrupts are off, so `idle` would never wake — spin on
+// a barrier instead.
+#[cfg(target_arch = "loongarch64")]
+#[inline]
+fn wfi_forever() -> ! {
+    loop {
+        unsafe { core::arch::asm!("dbar 0", options(nomem, nostack)) };
+    }
+}
+
+/// User trap from U-mode (ecall = syscall gate, anything else fatal).
+///
+/// # Safety
+/// `fp` must point at the live 34-slot trap frame built by boot.S.
+#[cfg(target_arch = "riscv64")]
+#[no_mangle]
+pub unsafe extern "C" fn riscv64_user_trap_handler(fp: *mut u64) -> u64 {
+    let scause = read_scause();
+    let code = scause & !(1u64 << 63);
+    let interrupt = scause & (1u64 << 63) != 0;
+
+    if interrupt || code != 8 {
+        // Anything but an ecall from U-mode is fatal.
+        let stval = read_stval();
+        crate::cons::puts(b"\nPANIC: riscv64 user trap (not an ecall)\n");
+        if let Some(p) = crate::proc::curproc() {
+            crate::cons::puts(b"  pid=");
+            crate::serial::put_hex_u64(p.pid as u64);
+            crate::cons::puts(b" text=");
+            crate::serial::put_bytes(&p.text[0..16.min(p.text.len())]);
+            crate::cons::puts(b"\n");
+        }
+        crate::cons::puts(b"  scause=");
+        crate::serial::put_hex_u64(scause);
+        crate::cons::puts(b" stval=");
+        crate::serial::put_hex_u64(stval);
+        crate::cons::puts(b" pc=");
+        crate::serial::put_hex_u64(*fp.add(32));
+        crate::cons::puts(b" sp=");
+        crate::serial::put_hex_u64(*fp.add(2));
+        crate::cons::puts(b"\n");
+        let mut st: u64;
+        let mut ie: u64;
+        let mut ip: u64;
+        let mut epc: u64;
+        core::arch::asm!("csrr {}, sstatus", "csrr {}, sie", "csrr {}, sip",
+                         "csrr {}, sepc",
+                         out(reg) st, out(reg) ie, out(reg) ip, out(reg) epc,
+                         options(nomem, nostack));
+        crate::cons::puts(b"  sstatus=");
+        crate::serial::put_hex_u64(st);
+        crate::cons::puts(b" sie=");
+        crate::serial::put_hex_u64(ie);
+        crate::cons::puts(b" sip=");
+        crate::serial::put_hex_u64(ip);
+        crate::cons::puts(b" sepc=");
+        crate::serial::put_hex_u64(epc);
+        crate::cons::puts(b"\n  a0=");
+        crate::serial::put_hex_u64(*fp.add(10));
+        crate::cons::puts(b" a7=");
+        crate::serial::put_hex_u64(*fp.add(17));
+        crate::cons::puts(b" ra=");
+        crate::serial::put_hex_u64(*fp.add(1));
+        crate::cons::puts(b"\n  lastsys=");
+        crate::serial::put_hex_u64(
+            crate::syscall::LAST_SYSCALL.load(core::sync::atomic::Ordering::Relaxed) as u64,
+        );
+        if let Some(p) = crate::proc::curproc() {
+            let pptr = core::ptr::addr_of!(*p) as *const Proc as u64;
+            crate::cons::puts(b" curproc=");
+            crate::serial::put_hex_u64(pptr);
+            let fgrp_raw =
+                core::ptr::read_volatile(core::ptr::addr_of!(p.fgrp) as *const u64);
+            crate::cons::puts(b" fgrpptr=");
+            crate::serial::put_hex_u64(fgrp_raw);
+        }
+        crate::cons::puts(b"\n  regs:");
+        let mut i = 0usize;
+        while i < 32 {
+            crate::serial::put_hex_u64(*fp.add(i));
+            crate::cons::puts(b" ");
+            i += 1;
+        }
+        crate::cons::puts(b"\n");
+        wfi_forever();
+    }
+
+    // ---- ecall: the Plan 9 syscall gate (number in a7, args a0..a5) ----
+    let num = *fp.add(17) as usize;
+    let a0 = *fp.add(10);
+    let a1 = *fp.add(11);
+    let a2 = *fp.add(12);
+    let a3 = *fp.add(13);
+    let a4 = *fp.add(14);
+    let a5 = *fp.add(15);
+
+    // Unlike AArch64's SVC (whose hardware return address is already the
+    // following instruction), RISC-V's `ecall` leaves sepc pointing at the
+    // ecall itself.  Advance the saved pc so the eret resumes *after* the
+    // gate; otherwise every syscall would re-execute its own ecall with
+    // x10 holding the previous return value.  The exec path overrides the
+    // pc anyway, so this is unconditionally safe on the ecall path.
+    *fp.add(32) = (*fp.add(32)).wrapping_add(4);
+
+    let mut x = [0u64; 32];
+    for i in 0..32 {
+        x[i] = *fp.add(i);
+    }
+    let saved = SavedUserFrame {
+        x,
+        pc: *fp.add(32),
+        sstatus: *fp.add(33),
+        sp: *fp.add(2),
+    };
+
+    // Process context, mirroring the x86_64 syscall path.
+    if let Some(proc) = curproc() {
+        let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
+        p.insyscall = true;
+        p.nsyscall += 1;
+        p.user_frame = Some(saved);
+        SYSCALL_USE_EXEC_CONTEXT = false;
+        SYSCALL_EXEC_ENTRY = 0;
+    }
+
+    let frame = SyscallFrame {
+        exc: crate::trap::ExceptionFrame {
+            error_code: 0,
+            rip: saved.pc,
+            cs: 0,
+            rflags: saved.sstatus,
+            rsp: saved.sp,
+            ss: 0,
+        },
+        syscall_num: num as u64,
+        arg0: a0,
+        arg1: a1,
+        arg2: a2,
+        arg3: a3,
+        arg4: a4,
+        arg5: a5,
+        ret: 0,
+    };
+
+    let result = crate::syscall::dispatch(num, &frame);
+
+    if num == crate::syscall::nr::EXEC {
+        if let Some(proc) = curproc() {
+            let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
+            if p.has_exec_context() && result >= 0 {
+                let mut f = p.user_frame.unwrap_or_default();
+                f.set_entry(p.get_exec_entry());
+                f.set_stack(p.get_exec_stack());
+                f.set_ret(0);
+                f.sstatus = plan9_arch::hal::switch_to_user::USER_SSTATUS_INIT;
+                p.user_frame = Some(f);
+                p.clear_exec_context();
+                p.insyscall = false;
+
+                let frame_ptr = p
+                    .user_frame
+                    .as_ref()
+                    .map(|fr| fr as *const SavedUserFrame as u64)
+                    .unwrap_or(0);
+                let root = p.mmupdb.as_u64();
+                plan9_arch::hal::switch_to_user::kernel_resume_user(frame_ptr, root);
+            }
+        }
+    }
+
+    if let Some(proc) = curproc() {
+        let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
+        p.insyscall = false;
+    }
+
+    *fp.add(10) = result as u64;
+    fp as u64
+}
+
+// ============================================================================
+// LoongArch64 user trap handler
+// ============================================================================
+
+#[cfg(target_arch = "loongarch64")]
+#[no_mangle]
+pub extern "C" fn loongarch64_kernel_fault() -> ! {
+    use plan9_arch::loongarch64::cpu::{csr, csr_read};
+
+    panic!(
+        "LoongArch kernel fault: ESTAT={:#x} ERA={:#x} BADV={:#x}",
+        csr_read::<{ csr::ESTAT }>(),
+        csr_read::<{ csr::ERA }>(),
+        csr_read::<{ csr::BADV }>(),
+    );
+}
+
+/// LoongArch64 user trap entry, called from boot.S's `_user_trap`
+/// with $a0 = the trap frame pointer.
+///
+/// Trap frame layout (u64 slots — see boot.S): `[i]` = $r(i+1) for
+/// i = 0..30 (so a0..a5 = $r4..$r9 are slots 3..8, a7 = $r11 is slot 10
+/// and the user sp = $r3 is slot 2), ERA in slot 31 and the trapped
+/// PRMD in slot 32.
+#[cfg(target_arch = "loongarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn loongarch64_user_trap_handler(fp: *mut u64) -> u64 {
+    use plan9_arch::loongarch64::cpu::{csr, csr_read};
+
+    let estat = csr_read::<{ csr::ESTAT }>();
+    let code = (estat >> 16) & 0x3F;
+
+    // ---- Anything but a `syscall` (ECODE 11) from U-mode is fatal ----
+    if code != 11 {
+        let badv = csr_read::<{ csr::BADV }>();
+        crate::cons::puts(b"\nPANIC: loongarch64 user trap (not a syscall)\n");
+        if let Some(p) = crate::proc::curproc() {
+            crate::cons::puts(b"  pid=");
+            crate::serial::put_hex_u64(p.pid as u64);
+            crate::cons::puts(b"\n");
+        }
+        crate::cons::puts(b"  ecode=");
+        crate::serial::put_hex_u64(code);
+        crate::cons::puts(b" estat=");
+        crate::serial::put_hex_u64(estat);
+        crate::cons::puts(b" badv=");
+        crate::serial::put_hex_u64(badv);
+        crate::cons::puts(b" pc=");
+        crate::serial::put_hex_u64(*fp.add(31));
+        crate::cons::puts(b" sp=");
+        crate::serial::put_hex_u64(*fp.add(2));
+        crate::cons::puts(b" ra=");
+        crate::serial::put_hex_u64(*fp.add(0));
+        crate::cons::puts(b"\n  lastsys=");
+        crate::serial::put_hex_u64(
+            crate::syscall::LAST_SYSCALL.load(core::sync::atomic::Ordering::Relaxed) as u64,
+        );
+        crate::cons::puts(b"\n  regs ($r1..$r31):\n");
+        let mut i = 0usize;
+        while i < 31 {
+            crate::serial::put_hex_u64(*fp.add(i));
+            crate::cons::puts(b" ");
+            i += 1;
+        }
+        crate::cons::puts(b"\n");
+        wfi_forever();
+    }
+
+    // ---- syscall: the Plan 9 syscall gate (number in a7, args a0..a5) ----
+    let num = *fp.add(10) as usize;
+    let a0 = *fp.add(3);
+    let a1 = *fp.add(4);
+    let a2 = *fp.add(5);
+    let a3 = *fp.add(6);
+    let a4 = *fp.add(7);
+    let a5 = *fp.add(8);
+
+    // The `syscall` instruction leaves ERA pointing at the gate itself;
+    // advance the saved PC so the ertn resumes *after* it.  The exec
+    // path overrides the pc anyway, so this is unconditionally safe.
+    *fp.add(31) = (*fp.add(31)).wrapping_add(4);
+
+    let mut x = [0u64; 31];
+    for i in 0..31 {
+        x[i] = *fp.add(i);
+    }
+    let saved = SavedUserFrame {
+        x,
+        pc: *fp.add(31),
+        prmd: *fp.add(32),
+        sp: *fp.add(2),
+    };
+
+    // Process context, mirroring the x86_64 syscall path.
+    if let Some(proc) = curproc() {
+        let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
+        p.insyscall = true;
+        p.nsyscall += 1;
+        p.user_frame = Some(saved);
+        SYSCALL_USE_EXEC_CONTEXT = false;
+        SYSCALL_EXEC_ENTRY = 0;
+    }
+
+    let frame = SyscallFrame {
+        exc: crate::trap::ExceptionFrame {
+            error_code: 0,
+            rip: saved.pc,
+            cs: 0,
+            rflags: saved.prmd,
+            rsp: saved.sp,
+            ss: 0,
+        },
+        syscall_num: num as u64,
+        arg0: a0,
+        arg1: a1,
+        arg2: a2,
+        arg3: a3,
+        arg4: a4,
+        arg5: a5,
+        ret: 0,
+    };
+
+    let result = crate::syscall::dispatch(num, &frame);
+
+    if num == crate::syscall::nr::EXEC {
+        if let Some(proc) = curproc() {
+            let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
+            if p.has_exec_context() && result >= 0 {
+                let mut f = p.user_frame.unwrap_or_default();
+                f.set_entry(p.get_exec_entry());
+                f.set_stack(p.get_exec_stack());
+                f.set_ret(0);
+                f.prmd = plan9_arch::hal::switch_to_user::USER_PRMD_INIT;
+                p.user_frame = Some(f);
+                p.clear_exec_context();
+                p.insyscall = false;
+
+                let frame_ptr = p
+                    .user_frame
+                    .as_ref()
+                    .map(|fr| fr as *const SavedUserFrame as u64)
+                    .unwrap_or(0);
+                let root = p.mmupdb.as_u64();
+                plan9_arch::hal::switch_to_user::kernel_resume_user(frame_ptr, root);
+            }
+        }
+    }
+
+    if let Some(proc) = curproc() {
+        let p = &mut *(core::ptr::addr_of!(*proc) as *mut Proc);
+        p.insyscall = false;
+    }
+
+    *fp.add(3) = result as u64;
+    fp as u64
 }

@@ -74,6 +74,7 @@ pub fn init_smp_bsp() {
 
 /// The 16-bit real-mode trampoline page the APs boot from. Assembled by
 /// `build.rs` into a flat binary linked at `AP_TRAMPOLINE` (0x50000).
+#[cfg(target_os = "none")]
 pub const AP_TRAMPOLINE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ap_trampoline.bin"));
 
 /// Physical address the trampoline is linked at (SIPI vector 0x50).

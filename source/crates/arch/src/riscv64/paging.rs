@@ -54,8 +54,8 @@ pub const USER_VIRT_BASE: u64 = 0x0000_0000_0000_0000;
 pub const USER_VIRT_END: u64 = 0x0000_3FFF_FFFF_FFFF;
 
 /// Kernel image virtual base (identity — the kernel is linked at
-/// 0x8020_0000, the address OpenSBI hands control to).
-pub const KERNEL_IMAGE_VIRT: u64 = 0x0000_0000_8020_0000;
+/// 0x8100_0000, the address OpenSBI hands control to).
+pub const KERNEL_IMAGE_VIRT: u64 = 0x0000_0000_8100_0000;
 
 /// Physical memory virtual base (direct-map window).
 pub const PHYS_MEMORY_VIRT: u64 = 0xFFFF_FFC0_0000_0000;

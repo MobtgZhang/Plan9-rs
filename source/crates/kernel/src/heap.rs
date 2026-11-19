@@ -118,10 +118,15 @@ pub static mut STATIC_HEAP: StaticHeap = StaticHeap {
 /// On x86_64 QEMU RAM starts at physical 0, so 16 MiB is ordinary RAM.
 /// On aarch64 virt the RAM base is 0x4000_0000 — the low 1 GiB is the
 /// MMIO window and holds no usable memory — so the boot heap lives at
-/// RAM+32 MiB. `frame_alloc` reserves this range either way.
+/// RAM+32 MiB.  On riscv64 virt the RAM base is 0x8000_0000 (everything
+/// below it is MMIO), so the heap is at RAM+32 MiB as well.  The
+/// loongarch64 virt kernel is linked at 0x20_0000 with RAM from address
+/// 0, so 16 MiB is ordinary RAM there.
 #[cfg(target_arch = "aarch64")]
 pub const BOOT_HEAP_START: u64 = 0x4200_0000; // RAM base + 32 MiB
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "riscv64")]
+pub const BOOT_HEAP_START: u64 = 0x8200_0000; // RAM base + 32 MiB
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
 pub const BOOT_HEAP_START: u64 = 0x0100_0000; // 16 MiB
 pub const BOOT_HEAP_SIZE:  u64 = 0x0200_0000; // 32 MiB
 pub const BOOT_HEAP_END:   u64 = BOOT_HEAP_START + BOOT_HEAP_SIZE;

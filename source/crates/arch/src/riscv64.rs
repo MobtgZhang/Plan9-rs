@@ -43,9 +43,11 @@ pub use timer::{current_tick, init_timer as init_generic_timer};
 pub use mmu::paging_phys_to_virt;
 
 /// Physical RAM base on the reference (QEMU virt) platform. OpenSBI
-/// reserves the first 2 MiB; the kernel is linked at 0x8020_0000.
+/// reserves the first 2 MiB; the uefiboot loader sits at 0x8030_0000 and
+/// the kernel is linked at 0x8100_0000 (16 MiB above the RAM base, clear
+/// of the loader image and its low allocations).
 pub const RAM_PHYS_BASE: u64 = 0x8000_0000;
-pub const KERNEL_PHYS_BASE: u64 = 0x8020_0000;
+pub const KERNEL_PHYS_BASE: u64 = 0x8100_0000;
 
 /// GiB of RAM identity-mapped at boot (supervisor only).
 pub const IDENTITY_GIB: u64 = 4;
@@ -239,9 +241,16 @@ pub fn paging_init() {
 pub fn copy_kernel_half(dst_root: u64, src_root: u64) {
     let dst = mmu::paging_phys_to_virt(dst_root) as *mut u64;
     let src = mmu::paging_phys_to_virt(src_root) as *const u64;
-    // Identity region: 0x8000_0000..+4 GiB → PGD indices 2..=5.
-    let first = (RAM_PHYS_BASE >> 30) as usize; // 2
-    for i in first..(first + IDENTITY_GIB as usize) {
+    // The user root must carry every kernel mapping so supervisor code
+    // keeps working while a user root table is installed in satp:
+    //   * PGD index 0        — low-GiB device blocks (16550A UART at
+    //                          0x1000_0000, PCIe ECAM at 0x3000_0000)
+    //   * PGD indices 2..=5  — RAM identity blocks
+    //   * PGD indices 256..  — the high-half direct-map window
+    // The boot root never holds user mappings, so cloning every non-zero
+    // entry covers all of the above and stays correct if more kernel
+    // windows are added.
+    for i in 0..paging::PT_ENTRIES {
         let e = unsafe { core::ptr::read(src.add(i)) };
         if e != 0 {
             unsafe { core::ptr::write(dst.add(i), e) };

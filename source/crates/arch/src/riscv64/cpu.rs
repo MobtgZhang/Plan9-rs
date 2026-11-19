@@ -150,12 +150,11 @@ fn sbi_get_spec_version() -> u64 {
 /// Shut down via SBI (system reset extension, fallback to legacy shutdown).
 pub fn sbi_shutdown() -> ! {
     unsafe {
-        let mut a0: u64 = 0;
         core::arch::asm!(
             "ecall",
             in("a7") 0x08usize,       // SBI_EXT_SRST (0x53525354 actually; 0x08 = system shutdown legacy)
             in("a6") 0usize,
-            inout("a0") a0,
+            inout("a0") 0u64 => _,
             out("a1") _,
         );
     }

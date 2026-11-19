@@ -339,7 +339,7 @@ pub fn tcp_read(id: u32, buf: &mut [u8]) -> usize {
         if let Some(bytes) = poll_frame() {
             handle_frame(&bytes);
         }
-        let mut conn = match find_conn(id) {
+        let conn = match find_conn(id) {
             Some(c) => c,
             None => return 0,
         };

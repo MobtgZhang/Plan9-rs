@@ -34,15 +34,10 @@ unsafe fn wait_tx_ready() {
         if inb(COM1 + 5) & 0x20 != 0 { return; }
     }
 }
-
 /// Initialise COM1 at 115200 8N1, no flow control.
 #[cfg(target_arch = "x86_64")]
 pub fn init() {
-    unsafe {
-        // Simple outb directly to test serial is working
-        // This writes 'A' to COM1 data port
-        crate::plan9_arch::hal::io::outb(0x3F8, b'A');
-    }
+    crate::plan9_arch::hal::io::outb(COM1, b'A');
     unsafe {
         // Disable all interrupts.
         outb(COM1 + 1, 0x00);
@@ -129,7 +124,6 @@ pub fn put_hex_u64(v: u64) {
         shift -= 4;
     }
 }
-
 /// Print a u32 in 8 lowercase hex digits.
 pub fn put_hex_u32(v: u32) {
     let mut shift: u32 = 28;
@@ -146,22 +140,4 @@ pub fn put_hex_u32(v: u32) {
         if shift == 0 { break; }
         shift -= 4;
     }
-}
-
-/// Type alias matching what `arch::x86_64::idt::set_serial_output` expects.
-type SerialOut = unsafe fn(&[u8]);
-
-/// Adapter that lets the IDT exception handler emit messages via this
-/// driver. Installed by `register_idt_output` below.
-unsafe fn idt_output(buf: &[u8]) {
-    for &b in buf {
-        putc(b);
-    }
-}
-
-/// Install the IDT serial-output sink. Call this after `init()` and after
-/// the IDT is loaded.
-#[cfg(target_arch = "x86_64")]
-pub fn register_idt_output() {
-    crate::plan9_arch::hal::idt::set_serial_output(idt_output);
 }

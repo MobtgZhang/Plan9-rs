@@ -641,3 +641,5 @@ pub mod smp;
 pub mod bootstrap;
 #[cfg(target_arch = "x86_64")]
 pub mod switch_to_user;
+#[cfg(target_arch = "x86_64")]
+pub mod timer;

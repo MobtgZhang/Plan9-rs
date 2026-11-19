@@ -264,8 +264,8 @@ fn find_bochs_device() -> Option<(u64, u64)> {
                         | (offset & 0xFC)
                 };
                 let addr = make_addr(0);
-                unsafe { outl(config_addr, addr); }
-                let vendor_raw = unsafe { inl(config_data) };
+                outl(config_addr, addr);
+                let vendor_raw = inl(config_data);
                 let vendor = vendor_raw as u16;
                 if found_count == 0 {
                     serial::put_bytes(b"[bochs] first inl from 0xCFC = ");
@@ -280,8 +280,8 @@ fn find_bochs_device() -> Option<(u64, u64)> {
 
                 // Read device ID at offset 2
                 let addr2 = make_addr(2);
-                unsafe { outl(config_addr, addr2); }
-                let device = unsafe { inl(config_data) } as u16;
+                outl(config_addr, addr2);
+                let device = inl(config_data) as u16;
                 found_count += 1;
 
                 serial::put_bytes(b"[bochs] PCI bus=");
@@ -345,8 +345,8 @@ fn read_bar_at(make_addr: &dyn Fn(u32) -> u32, offset: u32) -> u64 {
     use crate::plan9_arch::hal::inl;
 
     let addr = make_addr(offset);
-    unsafe { outl(0xCF8, addr); }
-    let val = unsafe { inl(0xCFC) };
+    outl(0xCF8, addr);
+    let val = inl(0xCFC);
     val as u64
 }
 

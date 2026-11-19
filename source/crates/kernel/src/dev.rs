@@ -343,12 +343,11 @@ pub trait Dev: Send + Sync {
 
     /// Downcast self to `&mut dyn Any` for runtime type inspection.
     ///
-    /// Default implementation returns a no-op `&mut dyn Any`. Concrete device
+    /// Default implementation returns `None`. Concrete device
     /// types that want to participate in downcasting should override this
-    /// (typically by returning `self`).
-    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
-        static mut DUMMY: () = ();
-        unsafe { &mut DUMMY }
+    /// (typically by returning `Some(self)`).
+    fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {
+        None
     }
 
     // === Block I/O Operations ===
@@ -670,6 +669,14 @@ impl ConsDev {
     /// the same key can arrive twice.  We therefore sample both transports
     /// and, when they carry the same byte, consume both and deliver it once.
     fn get_char(&self) -> Option<u8> {
+        // virtio keyboard (e.g. aarch64's graphical-window input): the
+        // polling driver translates Linux keycodes into the same byte
+        // stream the PS/2 and serial transports deliver.
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
+        if let Some(b) = crate::vkey::get_byte() {
+            return Some(b);
+        }
+
         {
             let mut buf = self.input_buffer.lock();
             if !buf.is_empty() {
@@ -857,8 +864,8 @@ impl Dev for ConsDev {
         self
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
-        self
+    fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {
+        Some(self)
     }
 }
 

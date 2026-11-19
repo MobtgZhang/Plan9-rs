@@ -17,7 +17,6 @@ use alloc::vec::Vec;
 
 use crate::devsd::{SdError, SdResult, StorageBackend};
 use crate::dev::{PciDeviceInfo};
-use crate::serial;
 
 // ============================================================================
 // ATA / IDE backend
@@ -642,7 +641,7 @@ pub fn probe_ahci(device: &PciDeviceInfo) -> Vec<Arc<dyn StorageBackend>> {
         Some(c) => c,
         None => return out,
     };
-    let mut controller_ptr: *mut plan9_drivers::ahci::AhciController = controller;
+    let controller_ptr: *mut plan9_drivers::ahci::AhciController = controller;
 
     let mask = controller_ptr_ports(controller_ptr);
     crate::serial::put_bytes(b"[sd] ahci pi=");
@@ -741,7 +740,7 @@ pub fn probe_ahci(device: &PciDeviceInfo) -> Vec<Arc<dyn StorageBackend>> {
                     }
                 }
                 let sectors = port.identify.as_ref().map(|i| i.lba_capacity()).unwrap_or(0);
-                let mut backend = AhciBackend {
+                let backend = AhciBackend {
                     controller: controller_ptr,
                     port_index,
                     sectors,

@@ -16,11 +16,10 @@ pub const SYS_CREATE: usize = 4;
 pub const SYS_READ: usize = 5;
 pub const SYS_WRITE: usize = 6;
 pub const SYS_CLOSE: usize = 7;
-pub const SYS_SEEK: usize = 8;
+const SYS_SEEK: usize = 8;
 pub const SYS_DUP: usize = 9;
-pub const SYS_STAT: usize = 18;
+const SYS_STAT: usize = 18;
 pub const SYS_CHDIR: usize = 37;
-pub const SYS_BRK: usize = 38;
 pub const SYS_FORK: usize = 40;
 pub const SYS_EXEC: usize = 1;
 pub const SYS_YIELD: usize = 33;
@@ -31,8 +30,6 @@ pub const SYS_GETPID: usize = 50;
 pub const SYS_WAIT: usize = 51;
 
 pub const SYS_PIPE: usize = 10;
-pub const SYS_PREAD: usize = 11;
-pub const SYS_PWRITE: usize = 12;
 pub const SYS_REMOVE: usize = 13;
 
 /// Plan 9 create-permission bit: create a directory instead of a file.
@@ -63,6 +60,28 @@ pub unsafe fn syscall0(n: usize) -> i64 {
             "svc #0",
             in("x8") n,
             inout("x0") 0u64 => r,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let r: u64;
+        asm!(
+            "ecall",
+            in("a7") n,
+            inout("a0") 0u64 => r,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let r: u64;
+        asm!(
+            "syscall 0x0",
+            in("$a7") n,
+            inout("$a0") 0u64 => r,
             options(nostack, preserves_flags),
         );
         r as i64
@@ -99,6 +118,28 @@ pub unsafe fn syscall1(n: usize, a0: u64) -> i64 {
         );
         r as i64
     }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let r: u64;
+        asm!(
+            "ecall",
+            in("a7") n,
+            inout("a0") a0 => r,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let r: u64;
+        asm!(
+            "syscall 0x0",
+            in("$a7") n,
+            inout("$a0") a0 => r,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
 }
 
 #[inline(always)]
@@ -129,6 +170,30 @@ pub unsafe fn syscall2(n: usize, a0: u64, a1: u64) -> i64 {
             in("x8") n,
             inout("x0") a0 => r,
             in("x1") a1,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let r: u64;
+        asm!(
+            "ecall",
+            in("a7") n,
+            inout("a0") a0 => r,
+            in("a1") a1,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let r: u64;
+        asm!(
+            "syscall 0x0",
+            in("$a7") n,
+            inout("$a0") a0 => r,
+            in("$a1") a1,
             options(nostack, preserves_flags),
         );
         r as i64
@@ -169,6 +234,32 @@ pub unsafe fn syscall3(n: usize, a0: u64, a1: u64, a2: u64) -> i64 {
         );
         r as i64
     }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let r: u64;
+        asm!(
+            "ecall",
+            in("a7") n,
+            inout("a0") a0 => r,
+            in("a1") a1,
+            in("a2") a2,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let r: u64;
+        asm!(
+            "syscall 0x0",
+            in("$a7") n,
+            inout("$a0") a0 => r,
+            in("$a1") a1,
+            in("$a2") a2,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
 }
 
 pub fn exit(code: i32) -> ! {
@@ -179,6 +270,8 @@ pub fn exit(code: i32) -> ! {
         #[cfg(target_arch = "x86_64")]
         unsafe { asm!("hlt", options(nostack, preserves_flags)) }
         #[cfg(target_arch = "aarch64")]
+        unsafe { asm!("wfi", options(nostack, preserves_flags)) }
+        #[cfg(target_arch = "riscv64")]
         unsafe { asm!("wfi", options(nostack, preserves_flags)) }
     }
 }
@@ -247,16 +340,8 @@ pub fn stat(path: *const u8, buf: *mut u8, cap: usize) -> i64 {
     unsafe { syscall3(SYS_STAT, path as u64, buf as u64, cap as u64) }
 }
 
-pub fn brk(addr: usize) -> i64 {
-    unsafe { syscall1(SYS_BRK, addr as u64) }
-}
-
 pub fn exec(path: *const u8, argv: *const *const u8, _argc: usize) -> i64 {
     unsafe { syscall3(SYS_EXEC, path as u64, argv as u64, 0) }
-}
-
-pub fn dup(fd: i64) -> i64 {
-    unsafe { syscall1(SYS_DUP, fd as u64) }
 }
 
 pub fn chdir(path: *const u8) -> i64 {

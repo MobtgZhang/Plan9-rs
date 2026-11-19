@@ -135,7 +135,7 @@ impl RootFsDev {
             data: Vec::new(),
         });
 
-        let mut dev = Self {
+        let dev = Self {
             nodes: Spinlock::new(nodes),
             next_id: Mutex::new(1),
         };
@@ -295,16 +295,23 @@ impl RootFsDev {
             return false;
         }
         let mut nodes = self.nodes.lock();
-        let mut stack = Vec::new();
-        stack.push(id);
-        while let Some(cur) = stack.pop() {
+        // Collect the subtree rooted at `id`.  `work` is the traversal
+        // queue; `to_remove` accumulates the ids that must be deleted
+        // (the work queue itself is drained by the loop, so using it as
+        // the result set would leave every node in place).
+        let mut work = Vec::new();
+        let mut to_remove = Vec::new();
+        work.push(id);
+        to_remove.push(id);
+        while let Some(cur) = work.pop() {
             for n in nodes.iter() {
                 if n.parent == Some(cur) {
-                    stack.push(n.id);
+                    work.push(n.id);
+                    to_remove.push(n.id);
                 }
             }
         }
-        nodes.retain(|n| !stack.contains(&n.id));
+        nodes.retain(|n| !to_remove.contains(&n.id));
         true
     }
 
@@ -642,5 +649,9 @@ impl Dev for RootFsDev {
 
     fn as_any(&self) -> &dyn core::any::Any {
         self
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {
+        Some(self)
     }
 }

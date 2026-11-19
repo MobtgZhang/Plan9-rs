@@ -9,6 +9,9 @@
 //! already-mapped MMIO/framebuffer physical memory).
 
 pub mod gop;
+/// Bochs VBE uses x86 PCI configuration ports (0xCF8/0xCFC); only x86_64
+/// has port I/O.  The other architectures use GOP or virtio-gpu instead.
+#[cfg(target_arch = "x86_64")]
 pub mod bochs_vbe;
 pub mod virtio_gpu;
 pub mod manager;
@@ -124,7 +127,7 @@ pub enum EngineKind {
 ///
 /// All methods are safe to call only after `init()` has succeeded for the
 /// instance. Drawing into an uninitialized engine is undefined.
-pub trait DisplayEngine {
+pub trait DisplayEngine: Send + Sync {
     /// Human-readable name for logs.
     fn name(&self) -> &'static str;
 
@@ -163,21 +166,16 @@ impl DisplayEngine for NullEngine {
     fn name(&self) -> &'static str { "null" }
     fn kind(&self) -> EngineKind { EngineKind::None }
     fn info(&self) -> &FramebufferInfo {
-        static mut FB: Option<FramebufferInfo> = None;
-        unsafe {
-            if FB.is_none() {
-                FB = Some(FramebufferInfo {
-                    phys_addr: PhysAddr::new(0),
-                    virt_addr: 0,
-                    width: 0,
-                    height: 0,
-                    pitch: 0,
-                    format: PixelFormat::Unknown,
-                    size_bytes: 0,
-                });
-            }
-            FB.as_ref().unwrap()
-        }
+        static FB: FramebufferInfo = FramebufferInfo {
+            phys_addr: PhysAddr::new(0),
+            virt_addr: 0,
+            width: 0,
+            height: 0,
+            pitch: 0,
+            format: PixelFormat::Unknown,
+            size_bytes: 0,
+        };
+        &FB
     }
     fn put_pixel(&mut self, _x: u32, _y: u32, _c: Color) {}
     fn fill_rect(&mut self, _rect: Rect, _color: Color) {}

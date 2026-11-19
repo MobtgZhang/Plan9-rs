@@ -230,7 +230,8 @@ static mut TSS: Tss = Tss::new();
 
 /// Kernel stack used by interrupts that enter from ring 3. The CPU loads
 /// RSP0 from the TSS whenever it switches from user mode to kernel mode.
-static mut INTERRUPT_STACK: [u8; 16384] = [0; 16384];
+const INTERRUPT_STACK_SIZE: usize = 16384;
+static mut INTERRUPT_STACK: [u8; INTERRUPT_STACK_SIZE] = [0; INTERRUPT_STACK_SIZE];
 
 /// Write the 16-byte TSS descriptor at GDT slots 6 and 7.
 unsafe fn set_tss_descriptor(base: u64) {
@@ -263,7 +264,7 @@ unsafe fn set_tss_descriptor(base: u64) {
 /// entering ring 3. Without a TSS, the first `int 0x80` from user mode
 /// causes an invalid-TSS fault because the CPU cannot switch stacks.
 pub unsafe fn tss_init() {
-    let stack_top = (&raw mut INTERRUPT_STACK) as u64 + INTERRUPT_STACK.len() as u64 - 16;
+    let stack_top = (&raw mut INTERRUPT_STACK) as u64 + INTERRUPT_STACK_SIZE as u64 - 16;
     TSS.rsp0 = stack_top;
     TSS.rsp1 = stack_top;
     TSS.rsp2 = stack_top;

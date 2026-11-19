@@ -134,8 +134,8 @@ static mut IDT: IdtTable = IdtTable::new();
 /// through our stubs.
 ///
 /// # Safety
-/// Must be called *after* the GDT is loaded and segment registers are
-/// reloaded to the kernel selectors.
+/// Call only on the boot CPU, before secondary CPUs or interrupts can use
+/// the table, and after loading the GDT and reloading segment registers.
 pub unsafe fn idt_init() {
     // Direct serial byte output without macros.
     unsafe fn dbg(b: u8) {
@@ -198,16 +198,14 @@ pub unsafe fn idt_init() {
 
     unsafe { dbg(b'2'); }
     // Default all entries to the "no handler installed" state.
-    for i in 0..256 {
-        let entry = &mut *IDT.entries.get_unchecked_mut(i);
-        *entry = IdtEntry::null();
-    }
+    let table = &mut *(&raw mut IDT);
+    *table = IdtTable::new();
     unsafe { dbg(b'3'); }
 
     unsafe { dbg(b'4'); }
     // Install our handlers. 0x8E = present, DPL 0, 64-bit interrupt gate.
     for (vector, handler) in vector_stubs.iter().copied() {
-        let entry = &mut *IDT.entries.get_unchecked_mut(vector as usize);
+        let entry = &mut table.entries[vector as usize];
         entry.set_handler(handler, SEL_KERNEL_CS, 0, 0x8E);
     }
     unsafe { dbg(b'5'); }
@@ -216,14 +214,10 @@ pub unsafe fn idt_init() {
     // 0xEF = present, DPL 3, 64-bit trap gate.  DPL 3 is required because
     // `int 0x80` is issued from ring 3; 0x8F would set DPL 0 and cause #GP.
     let syscall_handler = &syscall_stub_entry as *const u8 as u64;
-    let syscall_entry = &mut *IDT.entries.get_unchecked_mut(0x80);
+    let syscall_entry = &mut table.entries[0x80];
     syscall_entry.set_handler(syscall_handler, SEL_KERNEL_CS, 0, 0xEF);
 
     unsafe { dbg(b'6'); }
-    let ptr = IdtPointer {
-        limit: ((size_of::<IdtEntry>() * 256) - 1) as u16,
-        base: &IDT as *const _ as u64,
-    };
     unsafe { dbg(b'7'); }
     // MARKER: 'X' right before lidt
     core::arch::asm!(
@@ -235,7 +229,7 @@ pub unsafe fn idt_init() {
         out("r10") _,
         options(nostack, preserves_flags),
     );
-    lidt(&ptr as *const _ as u64);
+    load_idt();
     // MARKER: 'Y' right after lidt (if we reach here, lidt succeeded)
     core::arch::asm!(
         "mov r10w, dx",
@@ -255,6 +249,19 @@ pub unsafe fn idt_init() {
     // ready yet; `start_interrupts` unmasks them once those are initialised.
     pic_init();
     // Leave IF=0: the caller enables interrupts after kernel init.
+}
+
+/// Load the IDT installed by the boot CPU without modifying it or the PIC.
+///
+/// # Safety
+/// The boot CPU must have finished building the IDT and the local GDT must
+/// already contain the kernel code selector.
+pub unsafe fn load_idt() {
+    let ptr = IdtPointer {
+        limit: (size_of::<IdtTable>() - 1) as u16,
+        base: (&raw const IDT) as u64,
+    };
+    lidt(&ptr as *const _ as u64);
 }
 
 /// Initialise the two 8259 PIC chips (master + slave).
@@ -399,86 +406,7 @@ fn arch_log_dec(mut v: u64) {
     }
 }
 
-/// Hex print of a u64 (no leading zeros except for one nibble if zero).
-fn arch_log_hex_simple(mut v: u64) {
-    let hex = b"0123456789abcdef";
-    if v == 0 {
-        arch_log(b"0");
-        return;
-    }
-    let mut started = false;
-    for shift in (0..16).rev().map(|i| i * 4) {
-        let nibble = ((v >> shift) & 0xf) as usize;
-        if started || nibble != 0 {
-            arch_log(&[hex[nibble]]);
-            started = true;
-        }
-    }
-}
-
-/// Type of the optional serial-output callback installed by the kernel's
-/// console/serial driver.
-type SerialOut = unsafe fn(&[u8]);
-
-/// Global serial-output sink. Set by the console driver (or left as `None`).
-static mut SERIAL_OUT: Option<SerialOut> = None;
-
-/// Register a callback that receives bytes to emit on the serial port.
-/// The kernel's serial driver calls this once during boot so exception
-/// faults are visible to the user even when the VGA console is not yet
-/// initialised (e.g. early page-fault before VGA map is set up).
-pub fn set_serial_output(cb: SerialOut) {
-    unsafe { SERIAL_OUT = Some(cb) };
-}
-
-fn emit_serial(buf: &[u8]) {
-    // SAFETY: SERIAL_OUT is only ever written by `set_serial_output`,
-    // which runs after the IDT is installed but before interrupts are
-    // enabled, so we never race here.
-    unsafe {
-        if let Some(cb) = SERIAL_OUT {
-            cb(buf);
-        }
-    }
-}
-
-// ============================================================================
-// Syscall Handler (Minimal boot-time implementation)
-// ============================================================================
-
-/// Syscall number constants (must match init's syscall.rs)
-const SYS_WRITE: usize = 1;
-const SYS_READ: usize = 0;
-const SYS_EXIT: usize = 6;
-const SYS_GETPID: usize = 10;
-const SYS_YIELD: usize = 11;
-const SYS_OPEN: usize = 2;
-const SYS_CLOSE: usize = 3;
-const SYS_STAT: usize = 4;
-const SYS_BRK: usize = 5;
-const SYS_FORK: usize = 7;
-const SYS_EXEC: usize = 8;
-const SYS_WAIT: usize = 9;
-const SYS_DUP: usize = 12;
-const SYS_CHDIR: usize = 14;
-const SYS_LIST: usize = 15;
-const SYS_PUTS: usize = 16;
-
-/// Emit a string to serial port
-fn emit_str(s: &[u8]) {
-    emit_serial(s);
-}
-
 extern "C" {
-    /// Provided by the kernel crate (`trap.rs`).  The architecture crate
-    /// cannot depend on the kernel crate directly, so the symbol is declared
-    /// externally and resolved when the kernel binary is linked.
-    fn kernel_syscall_from_user(num: u64, a0: u64, a1: u64, a2: u64, frame_ptr: u64) -> i64;
-
-    /// Kernel hardware-interrupt dispatcher.  Declared extern so the
-    /// architecture crate does not need to depend on the kernel crate.
-    fn kernel_interrupt_from_user(vector: u64);
-
     /// Assembly syscall entry stub defined in `idt_asm.S`.
     static syscall_stub_entry: u8;
 }

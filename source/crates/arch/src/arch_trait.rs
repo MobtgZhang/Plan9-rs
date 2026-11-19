@@ -27,10 +27,13 @@ pub trait Arch: InterruptControl + TimerArch + ContextArch {
 
 static ACTIVE_ARCH: AtomicUsize = AtomicUsize::new(0);
 
-static mut ARCH_TABLE: [Option<Box<dyn Arch>>; 4] = [None, None, None, None];
+const ARCH_SLOTS: usize = 4;
+static mut ARCH_TABLE: [Option<Box<dyn Arch>>; ARCH_SLOTS] = [None, None, None, None];
 
+/// # Safety
+/// Each slot may only be written once, during single-threaded boot.
 pub unsafe fn set_arch(idx: usize, arch: Box<dyn Arch>) {
-    if idx >= ARCH_TABLE.len() {
+    if idx >= ARCH_SLOTS {
         panic!("Arch::set_arch: idx out of range");
     }
     ARCH_TABLE[idx] = Some(arch);

@@ -184,7 +184,7 @@ pub unsafe fn save_context(ctx: &mut Context) -> i32 {
         // Save LR (return address analog of x86 `[rsp]`).
         "str x30, [{ctx}, #56]",
         // Return 0.
-        "mov {res}, #0",
+        "mov {res:w}, #0",
         res = out(reg) result,
         ctx = in(reg) ctx as *mut Context as u64,
         lateout("x9") _,
@@ -213,7 +213,7 @@ pub unsafe fn restore_context(ctx: &Context, non_zero: i32) -> ! {
         "mov sp, x9",
         // Restore return address and return with value in x0.
         "ldr x30, [{ctx}, #56]",
-        "mov x0, {v}",
+        "mov w0, {v:w}",
         "ret",
         v = in(reg) non_zero,
         ctx = in(reg) ctx as *const Context as u64,

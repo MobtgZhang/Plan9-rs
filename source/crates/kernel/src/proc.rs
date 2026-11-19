@@ -639,7 +639,11 @@ pub type Pid = u32;
 /// [8*i], PC at [248], PSTATE at [256], user SP at [264]; the syscall
 /// number travels in x8 and the return value in x0.  This struct is
 /// byte-for-byte that frame, so `kernel_resume_user` can ERET from it.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+    target_arch = "loongarch64"
+)))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SavedUserFrame {
@@ -672,50 +676,91 @@ pub struct SavedUserFrame {
     pub sp: u64,
 }
 
+#[cfg(target_arch = "riscv64")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SavedUserFrame {
+    /// x0..x31; the syscall return value travels in x[10] (a0), the
+    /// syscall number in x[17] (a7).  x[2] doubles as the user sp.
+    pub x: [u64; 32],
+    pub pc: u64,
+    pub sstatus: u64,
+    pub sp: u64,
+}
+
+/// LoongArch64 trap frame: `x[i]` = register $r(i+1), so x[2] = $r3 (the
+/// user sp), x[3] = $r4 (a0, syscall return value) and x[10] = $r11 (a7,
+/// syscall number).  `pc` is ERA and `prmd` the trapped PRMD — both at
+/// the trap-frame offsets `kernel_resume_user` reads (248 / 256).
+#[cfg(target_arch = "loongarch64")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SavedUserFrame {
+    /// $r1..$r31 ($r0 is the hard-wired zero register).
+    pub x: [u64; 31],
+    /// ERA (exception return address).
+    pub pc: u64,
+    /// PRMD as trapped (PPLV / PIE / PWE).
+    pub prmd: u64,
+    /// Duplicate of x[2] ($r3) for API parity with the other arches.
+    pub sp: u64,
+}
+
 impl SavedUserFrame {
     /// User resume address (RIP / PC).
     #[inline]
     pub fn entry(&self) -> u64 {
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64")))]
         { self.rip }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
         { self.pc }
     }
 
     /// User stack pointer (RSP / SP).
     #[inline]
     pub fn stack(&self) -> u64 {
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64")))]
         { self.rsp }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
         { self.sp }
     }
 
     /// Set the user resume address.
     #[inline]
     pub fn set_entry(&mut self, v: u64) {
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64")))]
         { self.rip = v; }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
         { self.pc = v; }
     }
 
     /// Set the user stack pointer.
     #[inline]
     pub fn set_stack(&mut self, v: u64) {
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64")))]
         { self.rsp = v; }
         #[cfg(target_arch = "aarch64")]
         { self.sp = v; }
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+        {
+            // x[2] doubles as the user sp in the trap-frame layout the
+            // resume asm reads (offset 16), so keep both slots in sync.
+            self.sp = v;
+            self.x[2] = v;
+        }
     }
 
-    /// Set the syscall return value (RAX / x0).
+    /// Set the syscall return value (RAX / x0 / a0).
     #[inline]
     pub fn set_ret(&mut self, v: u64) {
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64")))]
         { self.rax = v; }
         #[cfg(target_arch = "aarch64")]
         { self.x[0] = v; }
+        #[cfg(target_arch = "riscv64")]
+        { self.x[10] = v; }
+        #[cfg(target_arch = "loongarch64")]
+        { self.x[3] = v; }
     }
 }
 
@@ -966,6 +1011,13 @@ pub trait Chan: Send + Sync {
     }
     /// Duplicate channel
     fn dup(&self) -> Box<dyn Chan>;
+    /// If this channel wraps a raw device channel (DevChanAdapter), hand
+    /// back a copy of it.  Used by the VFS to bridge the two process
+    /// "current directory" representations (`Proc.dot` and the namespace
+    /// `dot`) so relative paths resolve against the real working directory.
+    fn dev_chan(&self) -> Option<crate::dev::Chan> {
+        None
+    }
     /// Get file status (Plan 9 stat shape)
     fn stat(&mut self) -> Result<crate::dev::DirEntry> {
         Err(Error::General)
@@ -4288,7 +4340,6 @@ pub fn do_fork(parent: &Proc, _options: ForkOptions) -> Option<ForkResult> {
 // Global Process Table
 // ============================================================================
 
-use core::sync::atomic::{AtomicPtr, Ordering};
 
 /// Get the scheduler's global process table.
 pub fn proctable() -> &'static ProcTable {

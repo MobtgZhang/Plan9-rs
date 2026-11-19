@@ -41,10 +41,8 @@ pub fn init_timer() {
     }
     // Disable the comparator interrupt; the kernel polls `current_tick`
     // between one-shot rearms.
-    unsafe {
-        // CNTV_CTL: bit0 Enable=0, bit1 IMask=1 (masked)
-        write_sysreg!("CNTV_CTL_EL0", 0x2u64);
-    }
+    // CNTV_CTL: bit0 Enable=0, bit1 IMask=1 (masked)
+    write_sysreg!("CNTV_CTL_EL0", 0x2u64);
     super::cpu::isb();
 }
 
@@ -83,11 +81,9 @@ pub fn ms_since_boot() -> u64 {
 pub fn set_oneshot(ticks: u64) {
     let f = frequency();
     let delta = (ticks * f / HZ).max(1);
-    unsafe {
-        // CNTV_TVAL: countdown ticks from now.
-        write_sysreg!("CNTV_TVAL_EL0", delta);
-        // Enable + unmask: bit0 Enable=1, bit1 IMask=0.
-        write_sysreg!("CNTV_CTL_EL0", 0x1u64);
-    }
+    // CNTV_TVAL: countdown ticks from now.
+    write_sysreg!("CNTV_TVAL_EL0", delta);
+    // Enable + unmask: bit0 Enable=1, bit1 IMask=0.
+    write_sysreg!("CNTV_CTL_EL0", 0x1u64);
     super::cpu::isb();
 }

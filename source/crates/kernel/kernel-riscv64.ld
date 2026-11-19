@@ -5,16 +5,21 @@
  * there in S-mode.
  *
  *   0x8000_0000            — OpenSBI firmware
- *   0x8020_0000            — KERNEL_PHYS_BASE — kernel image begins
+ *   0x8030_0000            — uefiboot loader image (UEFI boot path)
+ *   0x8100_0000            — KERNEL_PHYS_BASE — kernel image begins
  *   ...                    — .text, .rodata, .data, .bss
  *   _kernel_end            — heap / frame allocator takes over from here
+ *
+ * The kernel sits 16 MiB above the RAM base: low allocations (the UEFI
+ * loader image and its buffers cluster right above OpenSBI) must never
+ * overlap the kernel image the loader copies into place.
  * ============================================================================ */
 
 OUTPUT_FORMAT("elf64-littleriscv")
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
-KERNEL_PHYS_BASE = 0x80200000;
+KERNEL_PHYS_BASE = 0x81000000;
 
 /* Stack size — 64 KiB for early boot. */
 KERNEL_STACK_SIZE = 64K;
@@ -79,7 +84,7 @@ SECTIONS
         *(.note .note.*)
         *(.comment)
         *(.llvm_addrsig)
-        *(.symtab .strtab)
-        *(.debug_*)
+        /* .symtab .strtab */
+        /* .debug_* */
     }
 }

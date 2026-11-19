@@ -67,7 +67,7 @@ pub unsafe fn frame_init_from_bootinfo(boot: &BootInfo) {
         best = Some((0x100000, 256 * 1024 * 1024));
     }
 
-    let (base, size) = match best {
+    let (mut base, mut size) = match best {
         Some(b) => b,
         None => {
             serial::put_bytes(b"[kernel] frame_init: ERROR - no available memory regions!\n");
@@ -80,6 +80,37 @@ pub unsafe fn frame_init_from_bootinfo(boot: &BootInfo) {
     serial::put_bytes(b" size=");
     serial::put_hex_u64(size);
     serial::put_bytes(b"\n");
+
+    // The boot heap is live kernel memory (its free-list blocks are
+    // scattered across the whole reserved window).  A pool overlapping
+    // it would have the allocator's own metadata — the struct including
+    // the Spinlock plus the bitmap, both written at the pool base —
+    // clobbered by heap blocks as soon as heap_init() runs, which
+    // deadlocks the first alloc_frame() on x86_64 (heap at 16-48 MiB,
+    // largest region starting at ~23.5 MiB).  Trim the pool so it starts
+    // above the heap end; the allocator's metadata then lives in real
+    // free RAM.
+    let heap_start = crate::heap::BOOT_HEAP_START;
+    let heap_end = crate::heap::BOOT_HEAP_END;
+    {
+        let end = base + size;
+        if base < heap_end && end > heap_start {
+            if end <= heap_end {
+                // Region entirely inside the heap — unusable as a pool.
+                base = 0;
+                size = 0;
+            } else {
+                let trimmed = heap_end - base;
+                base = heap_end;
+                size -= trimmed;
+            }
+            serial::put_bytes(b"[kernel] frame_init: trimmed pool away from boot heap, base=");
+            serial::put_hex_u64(base);
+            serial::put_bytes(b" size=");
+            serial::put_hex_u64(size);
+            serial::put_bytes(b"\n");
+        }
+    }
 
     // Align the pool so the FrameAllocator's metadata lives at a page
     // boundary (it is constructed at the start of the region).
@@ -153,6 +184,11 @@ unsafe fn reserve_kernel_image() {
     let stk_start = align_down(&_bootstack_bottom as *const _ as u64, PAGESIZE as u64);
     let stk_end   = align_up  (&_bootstack_top    as *const _ as u64, PAGESIZE as u64);
     reserve_range(stk_start, stk_end);
+
+    // The boot heap is live kernel memory; frames inside it must never
+    // be handed out.  (Ranges outside the pool are ignored by the
+    // marker, so this is safe even if the pool was trimmed away.)
+    reserve_range(crate::heap::BOOT_HEAP_START, crate::heap::BOOT_HEAP_END);
 }
 
 fn reserve_range(start: u64, end: u64) {

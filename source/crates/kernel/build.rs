@@ -23,11 +23,10 @@ fn main() {
 
     let src_dir = manifest_dir.join("src");
 
-    // The linker script is per-target (normalize riscv64gc → riscv64).
-    let arch_name = target.split('-').next().unwrap_or("x86_64");
-    let arch_name = arch_name.trim_end_matches("gc");
+    let arch_name = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let ld = manifest_dir.join(format!("kernel-{arch_name}.ld"));
     println!("cargo:rustc-link-arg=-T{}", ld.display());
+    println!("cargo:rerun-if-changed={}", ld.display());
 
     match target.as_str() {
         "x86_64-unknown-none" => {
@@ -49,14 +48,16 @@ fn main() {
         "aarch64-unknown-none" => {
             assemble_cross(
                 "aarch64-linux-gnu-gcc",
+                &[],
                 &manifest_dir.join("src/arch/aarch64/boot.S"),
                 &out_dir.join("boot_aarch64.o"),
             );
             println!("cargo:rerun-if-changed=src/arch/aarch64/boot.S");
         }
-        "riscv64gc-unknown-none-elf" => {
+        "riscv64imac-unknown-none-elf" => {
             assemble_cross(
                 "riscv64-linux-gnu-gcc",
+                &["-march=rv64imac_zicsr_zifencei", "-mabi=lp64"],
                 &manifest_dir.join("src/arch/riscv64/boot.S"),
                 &out_dir.join("boot_riscv64.o"),
             );
@@ -65,6 +66,7 @@ fn main() {
         "loongarch64-unknown-none" => {
             assemble_cross(
                 "loongarch64-linux-gnu-gcc",
+                &[],
                 &manifest_dir.join("src/arch/loongarch64/boot.S"),
                 &out_dir.join("boot_loongarch64.o"),
             );
@@ -89,9 +91,10 @@ fn main() {
 
 /// Assemble `src` with a cross-binutils GCC driver into `obj` and pass the
 /// object to the linker.
-fn assemble_cross(compiler: &str, src: &PathBuf, obj: &PathBuf) {
+fn assemble_cross(compiler: &str, flags: &[&str], src: &PathBuf, obj: &PathBuf) {
     let status = Command::new(compiler)
         .args(["-c", "-fno-pic"])
+        .args(flags)
         .arg(src)
         .arg("-o")
         .arg(obj)

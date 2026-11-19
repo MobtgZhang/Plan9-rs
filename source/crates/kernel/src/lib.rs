@@ -12,6 +12,9 @@ extern crate plan9_drivers;
 
 // Kernel entry point (called by GRUB2/Multiboot2)
 pub mod entry;
+/// LoongArch64 direct-boot Multiboot2 synthesis (no firmware loader).
+#[cfg(target_arch = "loongarch64")]
+pub mod directboot;
 
 // Process management
 pub mod proc;
@@ -50,6 +53,8 @@ pub mod rootfs;
 pub mod cpio;
 pub mod upasswd;
 pub mod keymap;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
+pub mod vkey;
 
 // Devices
 pub mod cons;
@@ -112,6 +117,14 @@ pub use timer::get_ticks as timer_get_ticks;
 pub use plan9_common::sync::Spinlock;
 
 // Memory constants
+/// Common ELF load bias for init, exec and absolute-pointer relocations.
+/// LoongArch uses the DMW-free canonical upper half; AArch64 uses L0[1]
+/// to avoid the boot identity map in L0[0].
+#[cfg(target_arch = "loongarch64")]
+pub const USER_BASE: u64 = 0xFFFF_8000_4000_0000;
+#[cfg(target_arch = "aarch64")]
+pub const USER_BASE: u64 = 0x0000_0080_0000_0000;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "loongarch64")))]
 pub const USER_BASE: u64 = 0x0000_0000_4000_0000;
 pub const KERNEL_BASE: u64 = 0xFFFF_8000_0000_0000;
 

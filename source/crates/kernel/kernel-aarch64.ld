@@ -17,8 +17,8 @@ ENTRY(_start)
 
 KERNEL_PHYS_BASE = 0x40200000;
 
-/* Stack size — 64 KiB for early boot. */
-KERNEL_STACK_SIZE = 64K;
+/* Stack size — 256 KiB for early boot (console/font paths are deep). */
+KERNEL_STACK_SIZE = 256K;
 
 PHDRS {
     text     PT_LOAD FLAGS(5);    /* R+X */
@@ -82,7 +82,6 @@ SECTIONS
     {
         *(.note .note.*)
         *(.comment)
-        *(.llvm_addrsig)
         *(.symtab .strtab)
         *(.debug_*)
     }

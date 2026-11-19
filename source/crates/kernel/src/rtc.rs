@@ -143,7 +143,7 @@ pub fn now_unix() -> Option<i64> {
         // generic timer (boot epoch, 2026-01-01) so `date` and file
         // timestamps stay monotonic and plausible.
         let boot_epoch: i64 = 1767225600; // 2026-01-01T00:00:00Z
-        Some(boot_epoch + crate::plan9_arch::aarch64::timer::ms_since_boot() as i64)
+        Some(boot_epoch + crate::plan9_arch::hal::timer::ms_since_boot() as i64)
     }
     #[cfg(target_arch = "x86_64")]
     {
