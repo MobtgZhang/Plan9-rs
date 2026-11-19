@@ -7,9 +7,8 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use alloc::string::String;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Flash error type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,7 +315,6 @@ impl FlashDevice {
         size: usize,
         block_size: usize,
         page_size: usize,
-        pages_per_block: usize,
     ) -> Self {
         let geometry = FlashGeometry {
             size,

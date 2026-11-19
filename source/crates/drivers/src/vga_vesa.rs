@@ -618,89 +618,89 @@ impl Default for VesaDriver {
 /// Common video modes
 pub mod vesa_modes {
     /// Mode 640x480x8 (256 colors)
-    pub const V640x480x8: u16 = 0x101;
+    pub const V640X480X8: u16 = 0x101;
     /// Mode 640x480x16 (64K colors)
-    pub const V640x480x16: u16 = 0x111;
+    pub const V640X480X16: u16 = 0x111;
     /// Mode 640x480x24 (16M colors)
-    pub const V640x480x24: u16 = 0x112;
+    pub const V640X480X24: u16 = 0x112;
     /// Mode 640x480x32 (16M colors)
-    pub const V640x480x32: u16 = 0x114;
+    pub const V640X480X32: u16 = 0x142;
     
     /// Mode 800x600x8 (256 colors)
-    pub const V800x600x8: u16 = 0x103;
+    pub const V800X600X8: u16 = 0x103;
     /// Mode 800x600x16 (64K colors)
-    pub const V800x600x16: u16 = 0x114;
+    pub const V800X600X16: u16 = 0x114;
     /// Mode 800x600x24 (16M colors)
-    pub const V800x600x24: u16 = 0x115;
+    pub const V800X600X24: u16 = 0x115;
     /// Mode 800x600x32 (16M colors)
-    pub const V800x600x32: u16 = 0x11E;
+    pub const V800X600X32: u16 = 0x11E;
     
     /// Mode 1024x768x8 (256 colors)
-    pub const V1024x768x8: u16 = 0x105;
+    pub const V1024X768X8: u16 = 0x105;
     /// Mode 1024x768x16 (64K colors)
-    pub const V1024x768x16: u16 = 0x117;
+    pub const V1024X768X16: u16 = 0x117;
     /// Mode 1024x768x24 (16M colors)
-    pub const V1024x768x24: u16 = 0x118;
+    pub const V1024X768X24: u16 = 0x118;
     /// Mode 1024x768x32 (16M colors)
-    pub const V1024x768x32: u16 = 0x11B;
+    pub const V1024X768X32: u16 = 0x144;
     
     /// Mode 1280x720x16 (HD 720)
-    pub const V1280x720x16: u16 = 0x155;
+    pub const V1280X720X16: u16 = 0x155;
     /// Mode 1280x720x24
-    pub const V1280x720x24: u16 = 0x157;
+    pub const V1280X720X24: u16 = 0x157;
     /// Mode 1280x720x32
-    pub const V1280x720x32: u16 = 0x15F;
+    pub const V1280X720X32: u16 = 0x15F;
     
     /// Mode 1280x800x16 (WXGA)
-    pub const V1280x800x16: u16 = 0x160;
+    pub const V1280X800X16: u16 = 0x160;
     /// Mode 1280x800x32
-    pub const V1280x800x32: u16 = 0x164;
+    pub const V1280X800X32: u16 = 0x164;
     
     /// Mode 1280x1024x8 (SXGA)
-    pub const V1280x1024x8: u16 = 0x107;
+    pub const V1280X1024X8: u16 = 0x107;
     /// Mode 1280x1024x16
-    pub const V1280x1024x16: u16 = 0x11A;
+    pub const V1280X1024X16: u16 = 0x11A;
     /// Mode 1280x1024x24
-    pub const V1280x1024x24: u16 = 0x11B;
+    pub const V1280X1024X24: u16 = 0x11B;
     /// Mode 1280x1024x32
-    pub const V1280x1024x32: u16 = 0x11F;
+    pub const V1280X1024X32: u16 = 0x11F;
     
     /// Mode 1920x1080x32 (Full HD)
-    pub const V1920x1080x32: u16 = 0x1E1;
+    pub const V1920X1080X32: u16 = 0x1E1;
     
     /// Mode 2560x1440x32 (2K)
-    pub const V2560x1440x32: u16 = 0x1E2;
+    pub const V2560X1440X32: u16 = 0x1E2;
     
     /// Mode 3840x2160x32 (4K UHD)
-    pub const V3840x2160x32: u16 = 0x1E3;
+    pub const V3840X2160X32: u16 = 0x1E3;
     
     /// Get mode name
     pub fn mode_name(mode: u16) -> &'static str {
         match mode {
-            V640x480x8 => "640x480x8",
-            V640x480x16 => "640x480x16",
-            V640x480x24 => "640x480x24",
-            V640x480x32 => "640x480x32",
-            V800x600x8 => "800x600x8",
-            V800x600x16 => "800x600x16",
-            V800x600x24 => "800x600x24",
-            V800x600x32 => "800x600x32",
-            V1024x768x8 => "1024x768x8",
-            V1024x768x16 => "1024x768x16",
-            V1024x768x24 => "1024x768x24",
-            V1024x768x32 => "1024x768x32",
-            V1280x720x16 => "1280x720x16",
-            V1280x720x24 => "1280x720x24",
-            V1280x720x32 => "1280x720x32",
-            V1280x800x16 => "1280x800x16",
-            V1280x800x32 => "1280x800x32",
-            V1280x1024x8 => "1280x1024x8",
-            V1280x1024x16 => "1280x1024x16",
-            V1280x1024x24 => "1280x1024x24",
-            V1280x1024x32 => "1280x1024x32",
-            V1920x1080x32 => "1920x1080x32",
-            V2560x1440x32 => "2560x1440x32",
-            V3840x2160x32 => "3840x2160x32",
+            V640X480X8 => "640x480x8",
+            V640X480X16 => "640x480x16",
+            V640X480X24 => "640x480x24",
+            V640X480X32 => "640x480x32",
+            V800X600X8 => "800x600x8",
+            V800X600X16 => "800x600x16",
+            V800X600X24 => "800x600x24",
+            V800X600X32 => "800x600x32",
+            V1024X768X8 => "1024x768x8",
+            V1024X768X16 => "1024x768x16",
+            V1024X768X24 => "1024x768x24",
+            V1024X768X32 => "1024x768x32",
+            V1280X720X16 => "1280x720x16",
+            V1280X720X24 => "1280x720x24",
+            V1280X720X32 => "1280x720x32",
+            V1280X800X16 => "1280x800x16",
+            V1280X800X32 => "1280x800x32",
+            V1280X1024X8 => "1280x1024x8",
+            V1280X1024X16 => "1280x1024x16",
+            V1280X1024X24 => "1280x1024x24",
+            V1280X1024X32 => "1280x1024x32",
+            V1920X1080X32 => "1920x1080x32",
+            V2560X1440X32 => "2560x1440x32",
+            V3840X2160X32 => "3840x2160x32",
             _ => "unknown",
         }
     }

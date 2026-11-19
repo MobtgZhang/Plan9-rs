@@ -4,71 +4,19 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::sync::Arc;
-use crate::plan9_common::sync::Spinlock;
-
-/// Virtio device status
-const VIRTIO_CONFIG_STATUS_ACKNOWLEDGE: u8 = 1;
-const VIRTIO_CONFIG_STATUS_DRIVER: u8 = 2;
-const VIRTIO_CONFIG_STATUS_DRIVER_OK: u8 = 4;
-const VIRTIO_CONFIG_STATUS_FEATURES_OK: u8 = 8;
-const VIRTIO_CONFIG_STATUS_NEEDS_RESET: u8 = 64;
-const VIRTIO_CONFIG_STATUS_FAILED: u8 = 128;
-
-/// Virtio net status
-const VIRTIO_NET_S_LINK_UP: u16 = 1;
-const VIRTIO_NET_S_ANNOUNCE: u16 = 2;
 
 /// Virtio network guest feature flags
-const VIRTIO_NET_F_CSUM: u32 = 0;           // Host handles pkts w/ partial csum
-const VIRTIO_NET_F_GUEST_CSUM: u32 = 1;    // Guest handles pkts w/ partial csum
 const VIRTIO_NET_F_MAC: u32 = 5;           // Host has given MAC address
 const VIRTIO_NET_F_GUEST_TSO4: u32 = 7;    // Guest can handle TSOv4
 const VIRTIO_NET_F_GUEST_TSO6: u32 = 8;    // Guest can handle TSOv6
-const VIRTIO_NET_F_GUEST_ECN: u32 = 9;     // Guest can handle TSO with ECN
-const VIRTIO_NET_F_GUEST_UFO: u32 = 10;    // Guest can handle UFO
-const VIRTIO_NET_F_HOST_TSO4: u32 = 11;   // Host can handle TSOv4
-const VIRTIO_NET_F_HOST_TSO6: u32 = 12;   // Host can handle TSOv6
-const VIRTIO_NET_F_HOST_ECN: u32 = 13;     // Host can handle TSO with ECN
-const VIRTIO_NET_F_HOST_UFO: u32 = 14;     // Host can handle UFO
 const VIRTIO_NET_F_MRG_RXBUF: u32 = 15;    // Host can merge rx buffers
 const VIRTIO_NET_F_STATUS: u32 = 16;       // virtio_net_config.status available
 const VIRTIO_NET_F_CTRL_VQ: u32 = 17;      // Control channel available
-const VIRTIO_NET_F_CTRL_RX: u32 = 18;      // Control channel RX mode support
-const VIRTIO_NET_F_CTRL_VLAN: u32 = 19;    // Control channel VLAN filtering
-const VIRTIO_NET_F_GUEST_ANNOUNCE: u32 = 21; // Guest can announce itself
 const VIRTIO_NET_F_MQ: u32 = 22;           // Multi-queue support
-const VIRTIO_NET_F_CTRL_MAC_ADDR: u32 = 23; // Set MAC address
-
-/// Virtqueue notification
-const VIRTIO_PCI_QUEUE_notify: usize = 16;
-
-/// PCI Configuration Space
-const VIRTIO_PCI_CAP_VNDR: u8 = 0;
-const VIRTIO_PCI_CAP_NEXT: u8 = 1;
-const VIRTIO_PCI_CAP_LEN: u8 = 2;
-const VIRTIO_PCI_CAP_CFG_TYPE: u8 = 3;
-
-/// Virtio PCI capability types
-const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
-const VIRTIO_PCI_CAP_NOTIF_CFG: u8 = 2;
-const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
-const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
-
-/// Virtio interrupt status
-const VIRTIO_PCI_ISR_INTR_USED: u8 = 1;
-const VIRTIO_PCI_ISR_INTR_CONFIG: u8 = 2;
 
 /// Virtio descriptor flags
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
-const VIRTQ_DESC_F_INDIRECT: u16 = 4;
-
-/// Virtqueue available flags
-const VIRTQ_AVAILABLE_F_NO_INTERRUPT: u16 = 1;
-
-/// Virtqueue used flags
-const VIRTQ_USED_F_NO_NOTIFY: u16 = 1;
 
 // ============================================================================
 // Virtio Network Device Structure
@@ -177,8 +125,6 @@ pub struct VirtQueue {
     pub used: VirtqUsed,
     /// Last used index
     last_used_idx: u16,
-    /// Queue number
-    queue_num: u16,
 }
 
 impl VirtQueue {
@@ -191,7 +137,6 @@ impl VirtQueue {
             avail: VirtqAvail::new(size),
             used: VirtqUsed::new(size),
             last_used_idx: 0,
-            queue_num: 0,
         }
     }
     
@@ -287,8 +232,6 @@ pub enum VirtioNetState {
 pub struct VirtioNetDriver {
     /// Device state
     state: VirtioNetState,
-    /// Configuration
-    config: VirtioNetConfig,
     /// Receive virtqueue
     recv_q: VirtQueue,
     /// Transmit virtqueue
@@ -309,12 +252,6 @@ pub struct VirtioNetDriver {
     rx_buffers: Vec<VirtioNetRxBuf>,
     /// Transmit buffers
     tx_buffers: Vec<VirtioNetTxBuf>,
-    /// Status register address
-    status_addr: usize,
-    /// Config register address
-    config_addr: usize,
-    /// Interrupt handle
-    irq: Option<u32>,
 }
 
 impl VirtioNetDriver {
@@ -322,7 +259,6 @@ impl VirtioNetDriver {
     pub fn new() -> Self {
         Self {
             state: VirtioNetState::Unknown,
-            config: VirtioNetConfig::default(),
             recv_q: VirtQueue::new(256),
             send_q: VirtQueue::new(256),
             ctrl_q: None,
@@ -333,9 +269,6 @@ impl VirtioNetDriver {
             max_mtu: 1500,
             rx_buffers: Vec::new(),
             tx_buffers: Vec::new(),
-            status_addr: 0,
-            config_addr: 0,
-            irq: None,
         }
     }
 
@@ -492,15 +425,8 @@ impl VirtioNetDriver {
 
     /// Process used ring
     fn process_used_ring(&mut self) {
-        // Process receive completions
-        while let Some((desc_idx, len)) = self.recv_q.get_used() {
-            // Find corresponding rx buffer
-            if (desc_idx as usize) < self.rx_buffers.len() {
-                // Process received packet
-                let buf = &mut self.rx_buffers[desc_idx as usize];
-                // Would deliver packet to network stack
-            }
-        }
+        // Drain receive completions; packet delivery isn't implemented yet.
+        while self.recv_q.get_used().is_some() {}
         
         // Process transmit completions
         while let Some((desc_idx, _len)) = self.send_q.get_used() {
@@ -554,7 +480,7 @@ impl VirtioNetDriver {
     }
 
     /// Receive a packet
-    pub fn receive(&mut self, buffer: &mut [u8]) -> Result<usize, VirtioError> {
+    pub fn receive(&mut self, _buffer: &mut [u8]) -> Result<usize, VirtioError> {
         // Would dequeue from receive queue
         
         // For now, return error
@@ -602,7 +528,7 @@ impl VirtioNetDriver {
     }
 
     /// Notify device
-    fn notify(&mut self, queue: u16) -> Result<(), VirtioError> {
+    fn notify(&mut self, _queue: u16) -> Result<(), VirtioError> {
         // Would write to notification register
         // This triggers device to process available ring
         

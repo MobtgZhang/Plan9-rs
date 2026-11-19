@@ -720,25 +720,25 @@ impl SshClient {
     }
     
     /// Open a channel (shell or exec)
-    pub fn channel_open(&mut self, channel_type: &str) -> Result<ChannelId, SshError> {
+    pub fn channel_open(&mut self, _channel_type: &str) -> Result<ChannelId, SshError> {
         // Send SSH_MSG_CHANNEL_OPEN
         Ok(ChannelId(0))
     }
     
     /// Request a shell
-    pub fn request_pty(&mut self, term: &str, width: u32, height: u32) -> Result<(), SshError> {
+    pub fn request_pty(&mut self, _term: &str, _width: u32, _height: u32) -> Result<(), SshError> {
         // Send SSH_MSG_CHANNEL_REQUEST with pty-req
         Ok(())
     }
     
     /// Execute a command
-    pub fn exec(&mut self, command: &str) -> Result<(), SshError> {
+    pub fn exec(&mut self, _command: &str) -> Result<(), SshError> {
         // Open channel and send exec request
         Ok(())
     }
     
     /// Disconnect
-    pub fn disconnect(&mut self, reason: DisconnectReason, message: &str) -> Result<(), SshError> {
+    pub fn disconnect(&mut self, _reason: DisconnectReason, _message: &str) -> Result<(), SshError> {
         // Send SSH_MSG_DISCONNECT
         self.session.set_connected(false);
         Ok(())

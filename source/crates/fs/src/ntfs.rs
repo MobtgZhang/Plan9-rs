@@ -177,7 +177,7 @@ impl NtfsFilesystem {
         le64(rec, data) & 0x0000_FFFF_FFFF_FFFF
     }
 
-    fn file_size(&self, rec: &[u8], attrs: &[Attr], id: u64) -> u64 {
+    fn file_size(&self, attrs: &[Attr], id: u64) -> u64 {
         let mut best = 0u64;
         for a in attrs {
             if a.typ == ATTR_DATA && a.name_len == 0 {
@@ -196,7 +196,7 @@ impl NtfsFilesystem {
         let attrs = parse_attrs(&rec)?;
         let flags = le16(&rec, 22);
         let is_dir = (flags & 0x2) != 0;
-        let size = if is_dir { 0 } else { self.file_size(&rec, &attrs, id) };
+        let size = if is_dir { 0 } else { self.file_size(&attrs, id) };
         Ok(FsNode {
             id,
             name: Vec::new(),

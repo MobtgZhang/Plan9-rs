@@ -21,7 +21,6 @@ pub struct ExtFilesystem {
     inodes_per_group: u64,
     group_desc_size: u64,
     gdt_block: u64,
-    first_data_block: u64,
     inodes_count: u64,
 }
 
@@ -59,7 +58,6 @@ impl ExtFilesystem {
             inodes_per_group,
             group_desc_size,
             gdt_block: first_data_block + 1,
-            first_data_block,
             inodes_count,
         })
     }

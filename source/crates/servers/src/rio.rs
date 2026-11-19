@@ -36,8 +36,6 @@
 //! mount -a /srv/rio /mnt
 //! ```
 
-#![no_std]
-
 extern crate alloc;
 
 use alloc::string::String;

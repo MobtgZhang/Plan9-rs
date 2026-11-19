@@ -12,8 +12,6 @@ use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::storage::{StorageBackend, SdError, SdResult};
-use plan9_common::types::PhysAddr;
-use plan9_arch::hal::paging::phys_to_virt;
 
 // Temporary diagnostic byte to the serial port.
 fn dbg(c: u8) {

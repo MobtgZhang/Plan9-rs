@@ -8,9 +8,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::string::String;
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 // ============================================================================
 // USB Constants
@@ -141,61 +139,61 @@ pub enum UsbClass {
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 pub struct UsbDeviceDescriptor {
-    pub bLength: u8,           // Descriptor length (18 bytes)
-    pub bDescriptorType: u8,   // Descriptor type (1 = device)
-    pub bcdUsb: u16,           // USB spec version
-    pub bDeviceClass: u8,      // Device class
-    pub bDeviceSubClass: u8,   // Device subclass
-    pub bDeviceProtocol: u8,   // Device protocol
-    pub bMaxPacketSize0: u8,   // Max packet size for EP0
-    pub idVendor: u16,         // Vendor ID
-    pub idProduct: u16,        // Product ID
-    pub bcdDevice: u16,        // Device release number
-    pub iManufacturer: u8,     // Manufacturer string index
-    pub iProduct: u8,          // Product string index
-    pub iSerialNumber: u8,     // Serial number string index
-    pub bNumConfigurations: u8, // Number of configurations
+    pub b_length: u8,           // Descriptor length (18 bytes)
+    pub b_descriptor_type: u8,   // Descriptor type (1 = device)
+    pub bcd_usb: u16,           // USB spec version
+    pub b_device_class: u8,      // Device class
+    pub b_device_sub_class: u8,   // Device subclass
+    pub b_device_protocol: u8,   // Device protocol
+    pub b_max_packet_size0: u8,   // Max packet size for EP0
+    pub id_vendor: u16,         // Vendor ID
+    pub id_product: u16,        // Product ID
+    pub bcd_device: u16,        // Device release number
+    pub i_manufacturer: u8,     // Manufacturer string index
+    pub i_product: u8,          // Product string index
+    pub i_serial_number: u8,     // Serial number string index
+    pub b_num_configurations: u8, // Number of configurations
 }
 
 /// USB configuration descriptor
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 pub struct UsbConfigurationDescriptor {
-    pub bLength: u8,             // Descriptor length
-    pub bDescriptorType: u8,     // Descriptor type (2 = configuration)
-    pub wTotalLength: u16,       // Total length of all descriptors
-    pub bNumInterfaces: u8,       // Number of interfaces
-    pub bConfigurationValue: u8,  // Configuration value
-    pub iConfiguration: u8,      // Configuration string index
-    pub bmAttributes: u8,        // Configuration characteristics
-    pub bMaxPower: u8,           // Max power consumption (2mA units)
+    pub b_length: u8,             // Descriptor length
+    pub b_descriptor_type: u8,     // Descriptor type (2 = configuration)
+    pub w_total_length: u16,       // Total length of all descriptors
+    pub b_num_interfaces: u8,       // Number of interfaces
+    pub b_configuration_value: u8,  // Configuration value
+    pub i_configuration: u8,      // Configuration string index
+    pub bm_attributes: u8,        // Configuration characteristics
+    pub b_max_power: u8,           // Max power consumption (2mA units)
 }
 
 /// USB interface descriptor
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 pub struct UsbInterfaceDescriptor {
-    pub bLength: u8,            // Descriptor length
-    pub bDescriptorType: u8,   // Descriptor type (4 = interface)
-    pub bInterfaceNumber: u8,  // Interface number
-    pub bAlternateSetting: u8, // Alternate setting
-    pub bNumEndpoints: u8,     // Number of endpoints (excl. EP0)
-    pub bInterfaceClass: u8,   // Interface class
-    pub bInterfaceSubClass: u8,// Interface subclass
-    pub bInterfaceProtocol: u8,// Interface protocol
-    pub iInterface: u8,        // Interface string index
+    pub b_length: u8,            // Descriptor length
+    pub b_descriptor_type: u8,   // Descriptor type (4 = interface)
+    pub b_interface_number: u8,  // Interface number
+    pub b_alternate_setting: u8, // Alternate setting
+    pub b_num_endpoints: u8,     // Number of endpoints (excl. EP0)
+    pub b_interface_class: u8,   // Interface class
+    pub b_interface_sub_class: u8,// Interface subclass
+    pub b_interface_protocol: u8,// Interface protocol
+    pub i_interface: u8,        // Interface string index
 }
 
 /// USB endpoint descriptor
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 pub struct UsbEndpointDescriptor {
-    pub bLength: u8,            // Descriptor length
-    pub bDescriptorType: u8,   // Descriptor type (5 = endpoint)
-    pub bEndpointAddress: u8,   // Endpoint address (dir + number)
-    pub bmAttributes: u8,       // Endpoint attributes
-    pub wMaxPacketSize: u16,   // Max packet size
-    pub bInterval: u8,         // Polling interval (ms)
+    pub b_length: u8,            // Descriptor length
+    pub b_descriptor_type: u8,   // Descriptor type (5 = endpoint)
+    pub b_endpoint_address: u8,   // Endpoint address (dir + number)
+    pub bm_attributes: u8,       // Endpoint attributes
+    pub w_max_packet_size: u16,   // Max packet size
+    pub b_interval: u8,         // Polling interval (ms)
     // Note: USB 3.0 adds bIntervalEx for high-speed interrupt/isochronous
 }
 
@@ -203,17 +201,17 @@ pub struct UsbEndpointDescriptor {
 impl UsbEndpointDescriptor {
     /// Get endpoint number (0-15)
     pub fn endpoint_number(&self) -> u8 {
-        self.bEndpointAddress & 0x0F
+        self.b_endpoint_address & 0x0F
     }
     
     /// Get endpoint direction (true = IN, false = OUT)
     pub fn is_in(&self) -> bool {
-        (self.bEndpointAddress & 0x80) != 0
+        (self.b_endpoint_address & 0x80) != 0
     }
     
     /// Get endpoint type
     pub fn endpoint_type(&self) -> EndpointType {
-        match self.bmAttributes & 0x03 {
+        match self.bm_attributes & 0x03 {
             0 => EndpointType::Control,
             1 => EndpointType::Isochronous,
             2 => EndpointType::Bulk,
@@ -224,12 +222,12 @@ impl UsbEndpointDescriptor {
     
     /// Get max packet size
     pub fn max_packet_size(&self) -> u16 {
-        self.wMaxPacketSize & 0x07FF
+        self.w_max_packet_size & 0x07FF
     }
     
     /// Get transaction opportunities per microframe (high-speed interrupt/isochronous)
     pub fn transactions_per_microframe(&self) -> u8 {
-        ((self.wMaxPacketSize >> 11) & 0x03) as u8 + 1
+        ((self.w_max_packet_size >> 11) & 0x03) as u8 + 1
     }
 }
 
@@ -241,55 +239,55 @@ impl UsbEndpointDescriptor {
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 pub struct UsbSetup {
-    pub bmRequestType: u8,    // Request type
-    pub bRequest: u8,         // Specific request
-    pub wValue: u16,          // Value
-    pub wIndex: u16,          // Index
-    pub wLength: u16,         // Number of bytes to transfer
+    pub bm_request_type: u8,    // Request type
+    pub b_request: u8,         // Specific request
+    pub w_value: u16,          // Value
+    pub w_index: u16,          // Index
+    pub w_length: u16,         // Number of bytes to transfer
 }
 
 impl UsbSetup {
     /// Create a GET_DESCRIPTOR request
     pub fn get_descriptor(desc_type: u8, desc_index: u8, lang_id: u16, length: u16) -> Self {
         Self {
-            bmRequestType: 0x80, // Device-to-host, standard, device recipient
-            bRequest: UsbRequest::GetDescriptor as u8,
-            wValue: ((desc_type as u16) << 8) | (desc_index as u16),
-            wIndex: lang_id,
-            wLength: length,
+            bm_request_type: 0x80, // Device-to-host, standard, device recipient
+            b_request: UsbRequest::GetDescriptor as u8,
+            w_value: ((desc_type as u16) << 8) | (desc_index as u16),
+            w_index: lang_id,
+            w_length: length,
         }
     }
     
     /// Create a SET_ADDRESS request
     pub fn set_address(address: u8) -> Self {
         Self {
-            bmRequestType: 0x00, // Host-to-device, standard, device recipient
-            bRequest: UsbRequest::SetAddress as u8,
-            wValue: address as u16,
-            wIndex: 0,
-            wLength: 0,
+            bm_request_type: 0x00, // Host-to-device, standard, device recipient
+            b_request: UsbRequest::SetAddress as u8,
+            w_value: address as u16,
+            w_index: 0,
+            w_length: 0,
         }
     }
     
     /// Create a SET_CONFIGURATION request
     pub fn set_configuration(config: u8) -> Self {
         Self {
-            bmRequestType: 0x00,
-            bRequest: UsbRequest::SetConfiguration as u8,
-            wValue: config as u16,
-            wIndex: 0,
-            wLength: 0,
+            bm_request_type: 0x00,
+            b_request: UsbRequest::SetConfiguration as u8,
+            w_value: config as u16,
+            w_index: 0,
+            w_length: 0,
         }
     }
     
     /// Create a GET_STATUS request
     pub fn get_status(recipient: u8) -> Self {
         Self {
-            bmRequestType: 0x80 | (recipient & 0x1F),
-            bRequest: UsbRequest::GetStatus as u8,
-            wValue: 0,
-            wIndex: 0,
-            wLength: 2,
+            bm_request_type: 0x80 | (recipient & 0x1F),
+            b_request: UsbRequest::GetStatus as u8,
+            w_value: 0,
+            w_index: 0,
+            w_length: 2,
         }
     }
 }

@@ -64,9 +64,9 @@ impl EdidInfo {
         let c2 = ((mfg_id_word >> 5) & 0x1F) as u8;
         let c3 = (mfg_id_word & 0x1F) as u8;
         let manufacturer_id = [
-            if c1 > 0 { (b'A' - 1 + c1) } else { b'?' },
-            if c2 > 0 { (b'A' - 1 + c2) } else { b'?' },
-            if c3 > 0 { (b'A' - 1 + c3) } else { b'?' },
+            if c1 > 0 { b'A' - 1 + c1 } else { b'?' },
+            if c2 > 0 { b'A' - 1 + c2 } else { b'?' },
+            if c3 > 0 { b'A' - 1 + c3 } else { b'?' },
         ];
 
         // Product code (bytes 10-11, little-endian).
