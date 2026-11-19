@@ -403,7 +403,7 @@ fn field_u32(line: &[u8], idx: usize) -> Option<u32> {
 
 fn write_profile(home: &[u8]) {
     let mut lib = [0u8; 128];
-    let mut n = home.len();
+    let n = home.len();
     lib[..n].copy_from_slice(home);
     lib[n..n + 4].copy_from_slice(b"/lib");
     make_dir(&lib[..n + 4]);

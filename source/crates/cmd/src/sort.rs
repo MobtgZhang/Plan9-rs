@@ -2,14 +2,16 @@
 //! -n numeric).  Input is limited by the arena (4096 lines).
 
 use core::cmp::Ordering;
+use core::sync::atomic::AtomicBool;
+use crate::workspace::WorkspaceLease;
 
 const MAX_LINES: usize = 4096;
 const ARENA_SIZE: usize = 65536;
 
-struct Sorter {
-    arena: &'static mut [u8; ARENA_SIZE],
-    starts: &'static mut [u32; MAX_LINES],
-    lens: &'static mut [u16; MAX_LINES],
+struct Sorter<'a> {
+    arena: &'a mut [u8; ARENA_SIZE],
+    starts: &'a mut [u32; MAX_LINES],
+    lens: &'a mut [u16; MAX_LINES],
     count: usize,
     arena_len: usize,
     numeric: bool,
@@ -17,7 +19,7 @@ struct Sorter {
     unique: bool,
 }
 
-impl Sorter {
+impl Sorter<'_> {
     fn append(&mut self, line: &[u8]) -> bool {
         if self.count >= MAX_LINES || self.arena_len + line.len() + 1 > ARENA_SIZE {
             return false;
@@ -140,16 +142,23 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
     static mut ARENA: [u8; ARENA_SIZE] = [0u8; ARENA_SIZE];
     static mut STARTS: [u32; MAX_LINES] = [0; MAX_LINES];
     static mut LENS: [u16; MAX_LINES] = [0; MAX_LINES];
+    static BUSY: AtomicBool = AtomicBool::new(false);
 
-    let mut s = Sorter {
-        arena: unsafe { &mut ARENA },
-        starts: unsafe { &mut STARTS },
-        lens: unsafe { &mut LENS },
-        count: 0,
-        arena_len: 0,
-        numeric,
-        reverse,
-        unique,
+    let Some(_lease) = WorkspaceLease::claim(&BUSY) else {
+        crate::outln("sort: workspace is busy");
+        return 1;
+    };
+    let mut s = unsafe {
+        Sorter {
+            arena: &mut *(&raw mut ARENA),
+            starts: &mut *(&raw mut STARTS),
+            lens: &mut *(&raw mut LENS),
+            count: 0,
+            arena_len: 0,
+            numeric,
+            reverse,
+            unique,
+        }
     };
 
     if nfiles == 0 {

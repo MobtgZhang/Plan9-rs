@@ -176,7 +176,7 @@ pub const COMMANDS: &[&str] = &[
     "basename", "cat", "chmod", "chown", "clear", "cmp", "cp", "cut", "date",
     "dc", "diff", "dirname", "du", "echo", "ed", "env", "expr", "false",
     "fortune", "grep", "group", "head", "hostname", "id", "kill", "ln", "ls",
-    "mkdir", "more", "mv", "nl", "passwd", "ps", "pwd", "rc", "rm", "rmdir",
+    "mkdir", "more", "mv", "nl", "passwd", "printf", "ps", "pwd", "rc", "rm", "rmdir",
     "seq", "sleep", "sort", "stat", "su", "tail", "tee", "test", "time",
     "touch", "tr", "true", "tty", "uname", "uniq", "units", "uptime",
     "useradd", "usermod", "wc", "who", "whoami", "yes",

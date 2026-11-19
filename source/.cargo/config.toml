@@ -3,3 +3,16 @@
 
 [target.x86_64-unknown-none]
 runner = "none"
+
+# PIC codegen for riscv64/loongarch64 user programs (plan9-cmd).  The default
+# codegen emits absolute 8-byte jump-table entries in .rodata, which dangle
+# once exec maps the image at USER_BASE + p_vaddr.  PIC emits table-relative
+# entries (as AArch64 already does) and puts true absolute pointers into
+# .got/.data.rel.ro, which the kernel's GOT patch pass relocates.
+# NOTE: source/crates/kernel/.cargo/config.toml overrides this for the kernel
+# (deeper config file wins), keeping the kernel's relocation-model=static.
+[target.riscv64imac-unknown-none-elf]
+rustflags = ["-C", "relocation-model=pic"]
+
+[target.loongarch64-unknown-none]
+rustflags = ["-C", "relocation-model=pic"]

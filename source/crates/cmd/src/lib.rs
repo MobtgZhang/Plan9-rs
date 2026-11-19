@@ -15,6 +15,7 @@
 use core::arch::global_asm;
 
 pub mod syscall;
+mod workspace;
 
 // ---------------------------------------------------------------------------
 // Command modules
@@ -126,6 +127,45 @@ _start:
 .halt_a64:
     wfi
     b       .halt_a64
+    .size _start, . - _start
+"#
+);
+
+#[cfg(target_arch = "riscv64")]
+global_asm!(
+    r#"
+    .section .text.start, "ax", @progbits
+    .global _start
+    .type _start, @function
+_start:
+    ld      a0, 0(sp)                   /* argc */
+    addi    a1, sp, 8                   /* argv */
+    call    cmd_main
+    /* exit status in a0 -> exits(status) */
+    li      a7, 2                       /* SYS_EXITS */
+    ecall
+.halt_rv64:
+    wfi
+    j       .halt_rv64
+    .size _start, . - _start
+"#
+);
+
+#[cfg(target_arch = "loongarch64")]
+global_asm!(
+    r#"
+    .section .text.start, "ax", @progbits
+    .global _start
+    .type _start, @function
+_start:
+    ld.d    $a0, $sp, 0                 /* argc */
+    addi.d  $a1, $sp, 8                 /* argv */
+    bl      cmd_main
+    /* exit status in a0 -> exits(status) */
+    li.d    $a7, 2                      /* SYS_EXITS */
+    syscall 0x0                         /* Plan 9 syscall gate (ECODE=SYS) */
+.halt_la:
+    b       .halt_la
     .size _start, . - _start
 "#
 );

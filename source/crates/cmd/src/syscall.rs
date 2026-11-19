@@ -89,6 +89,28 @@ pub unsafe fn syscall0(n: usize) -> i64 {
         );
         r as i64
     }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let r: u64;
+        asm!(
+            "ecall",
+            in("a7") n,
+            inout("a0") 0u64 => r,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let r: u64;
+        asm!(
+            "syscall 0x0",
+            in("$a7") n,
+            inout("$a0") 0u64 => r,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
 }
 
 #[inline(always)]
@@ -117,6 +139,28 @@ pub unsafe fn syscall1(n: usize, a0: u64) -> i64 {
             "svc #0",
             in("x8") n,
             inout("x0") a0 => r,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let r: u64;
+        asm!(
+            "ecall",
+            in("a7") n,
+            inout("a0") a0 => r,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let r: u64;
+        asm!(
+            "syscall 0x0",
+            in("$a7") n,
+            inout("$a0") a0 => r,
             options(nostack, preserves_flags),
         );
         r as i64
@@ -155,6 +199,30 @@ pub unsafe fn syscall2(n: usize, a0: u64, a1: u64) -> i64 {
         );
         r as i64
     }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let r: u64;
+        asm!(
+            "ecall",
+            in("a7") n,
+            inout("a0") a0 => r,
+            in("a1") a1,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let r: u64;
+        asm!(
+            "syscall 0x0",
+            in("$a7") n,
+            inout("$a0") a0 => r,
+            in("$a1") a1,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
 }
 
 #[inline(always)]
@@ -187,6 +255,32 @@ pub unsafe fn syscall3(n: usize, a0: u64, a1: u64, a2: u64) -> i64 {
             inout("x0") a0 => r,
             in("x1") a1,
             in("x2") a2,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let r: u64;
+        asm!(
+            "ecall",
+            in("a7") n,
+            inout("a0") a0 => r,
+            in("a1") a1,
+            in("a2") a2,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let r: u64;
+        asm!(
+            "syscall 0x0",
+            in("$a7") n,
+            inout("$a0") a0 => r,
+            in("$a1") a1,
+            in("$a2") a2,
             options(nostack, preserves_flags),
         );
         r as i64
@@ -228,6 +322,34 @@ pub unsafe fn syscall4(n: usize, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         );
         r as i64
     }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let r: u64;
+        asm!(
+            "ecall",
+            in("a7") n,
+            inout("a0") a0 => r,
+            in("a1") a1,
+            in("a2") a2,
+            in("a3") a3,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let r: u64;
+        asm!(
+            "syscall 0x0",
+            in("$a7") n,
+            inout("$a0") a0 => r,
+            in("$a1") a1,
+            in("$a2") a2,
+            in("$a3") a3,
+            options(nostack, preserves_flags),
+        );
+        r as i64
+    }
 }
 
 /// Terminate the process with `code`.
@@ -239,6 +361,8 @@ pub fn exit(code: i32) -> ! {
         #[cfg(target_arch = "x86_64")]
         unsafe { asm!("hlt", options(nostack, preserves_flags)) }
         #[cfg(target_arch = "aarch64")]
+        unsafe { asm!("wfi", options(nostack, preserves_flags)) }
+        #[cfg(target_arch = "riscv64")]
         unsafe { asm!("wfi", options(nostack, preserves_flags)) }
     }
 }

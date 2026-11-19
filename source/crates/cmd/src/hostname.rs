@@ -3,7 +3,7 @@
 //! The kernel keeps no mutable host name in this prototype, so only the
 //! query form is implemented; setting prints a diagnostic.
 
-pub fn main(argc: usize, argv: *const *const u8) -> i32 {
+pub fn main(argc: usize, _argv: *const *const u8) -> i32 {
     if argc > 1 {
         crate::outln("hostname: changing the host name is not supported");
         return 1;

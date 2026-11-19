@@ -58,7 +58,7 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
             }
         }
         &line[i.min(line.len())..]
-    };
+    }
 
     let mut lr = crate::LineReader::new(fd);
     let mut line = [0u8; 1024];

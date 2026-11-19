@@ -17,14 +17,16 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
             }
         };
         let mut path = crate::ls::String8::new();
+        let mut pid_buffer = [0; 20];
+        let pid_text = crate::utoa(pid, &mut pid_buffer);
         path.push_str("/proc/");
-        path.push_str(pid_text(pid));
+        path.push_str(pid_text);
         path.push_str("/ctl");
         let cs = crate::syscall::make_cstr(path.as_str());
         let fd = crate::syscall::open(cs.as_ptr(), crate::syscall::OWRITE);
         if fd < 0 {
             crate::out_str("kill: no such process ");
-            crate::out_str(pid_text(pid));
+            crate::out_str(pid_text);
             crate::out(b"\n");
             status = 1;
             continue;
@@ -35,18 +37,4 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
         crate::syscall::close(fd);
     }
     status
-}
-
-fn pid_text(pid: u64) -> &'static str {
-    static mut BUF: [u8; 20] = [0u8; 20];
-    unsafe {
-        let s = crate::utoa(pid, &mut BUF);
-        // copy into the static so the slice lifetime is 'static
-        let mut i = 0;
-        for &b in s.as_bytes() {
-            BUF[i] = b;
-            i += 1;
-        }
-        core::str::from_utf8_unchecked(&BUF[..s.len()])
-    }
 }

@@ -1,0 +1,18 @@
+# Per-crate codegen flags for the plan9-cmd binaries.
+#
+# riscv64 (and loongarch64) default to absolute 8-byte jump-table entries in
+# .rodata.  The kernel's exec loader maps these ET_EXEC images at USER_BASE +
+# p_vaddr, so link-time absolute table entries dangle (the code computes the
+# table base PC-relative, but each entry still reads as the link address and
+# the indirect `jr` faults).  PIC codegen emits table-relative entries — the
+# same form AArch64 uses — and routes genuine absolute pointers into
+# .got/.data.rel.ro, where the kernel's GOT patch pass already relocates them.
+
+[target.aarch64-unknown-none]
+rustflags = ["-C", "relocation-model=pic"]
+
+[target.riscv64imac-unknown-none-elf]
+rustflags = ["-C", "relocation-model=pic"]
+
+[target.loongarch64-unknown-none]
+rustflags = ["-C", "relocation-model=pic"]

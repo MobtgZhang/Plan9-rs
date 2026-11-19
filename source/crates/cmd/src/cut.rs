@@ -105,22 +105,16 @@ fn parse_list(list: &str) -> [Range; 16] {
 
 fn emit_fields(line: &[u8], delim: u8, ranges: &[Range; 16]) {
     // Split by delim into fields (1-based).
-    let mut idx = 0usize;
-    let mut start = 0usize;
     let mut first = true;
     for r in ranges.iter() {
         if r.from == 0 && r.to == 0 {
             break;
         }
         // find the r.from-th field
-        let mut want = r.from;
+        let want = r.from;
         let mut fs = 0usize;
-        let mut fe = line.len();
-        let mut i = start;
-        // walk from beginning for simplicity
-        i = 0;
+        let mut i = 0usize;
         let mut fno = 1usize;
-        fs = 0;
         while fno < want && i < line.len() {
             if line[i] == delim {
                 fno += 1;
@@ -131,12 +125,10 @@ fn emit_fields(line: &[u8], delim: u8, ranges: &[Range; 16]) {
         if want > 0 && fs >= line.len() {
             continue; // no such field
         }
-        fe = fs;
+        let mut fe = fs;
         while fe < line.len() && line[fe] != delim {
             fe += 1;
         }
-        let _ = idx;
-        idx += 1;
         if !first {
             crate::out(&[delim]);
         }

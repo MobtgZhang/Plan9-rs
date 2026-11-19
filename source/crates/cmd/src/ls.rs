@@ -204,14 +204,6 @@ fn octal(v: u32, buf: &mut [u8; 8]) -> &str {
     core::str::from_utf8(&buf[..n]).unwrap_or("0")
 }
 
-/// stat text for `path` reduced to just the mode field.
-fn stat_mode(path: &str) -> Option<u64> {
-    let mut sb = [0u8; 256];
-    let n = crate::stat_text(path, &mut sb)?;
-    let parts = split4(&sb[..n]);
-    u64_bytes(parts[1])
-}
-
 /// Split "a b c d\n" into the four fields.
 fn split4(text: &[u8]) -> [&[u8]; 4] {
     let mut out: [&[u8]; 4] = [b"", b"", b"", b""];

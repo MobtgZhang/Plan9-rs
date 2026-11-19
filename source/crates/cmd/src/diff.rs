@@ -4,6 +4,9 @@
 //! All working tables are statics: the user stack is 64 KiB and the LCS
 //! table alone is over half a megabyte.
 
+use core::sync::atomic::AtomicBool;
+use crate::workspace::WorkspaceLease;
+
 const MAX_LINES: usize = 512;
 const MAX_LINE: usize = 200;
 const N1: usize = MAX_LINES + 1;
@@ -17,9 +20,10 @@ static mut NB: usize = 0;
 // LCS lengths: LCSC[x][y] = LCS length of A[x..] vs B[y..].
 static mut LCSC: [[u16; N1]; N1] = [[0; N1]; N1];
 // Edit script, backtracked from the LCS table then reversed.
-static mut OPK: [u8; 2 * MAX_LINES] = [0; 2 * MAX_LINES]; // 0 eq, 1 del, 2 ins
-static mut OPA: [u16; 2 * MAX_LINES] = [0; 2 * MAX_LINES]; // A line index
-static mut OPB: [u16; 2 * MAX_LINES] = [0; 2 * MAX_LINES]; // B line index
+const MAX_OPS: usize = 2 * MAX_LINES;
+static mut OPK: [u8; MAX_OPS] = [0; MAX_OPS]; // 0 eq, 1 del, 2 ins
+static mut OPA: [u16; MAX_OPS] = [0; MAX_OPS]; // A line index
+static mut OPB: [u16; MAX_OPS] = [0; MAX_OPS]; // B line index
 static mut NOPS: usize = 0;
 
 unsafe fn read_lines(fd: i64, which: usize) {
@@ -87,7 +91,7 @@ unsafe fn build_script() {
     let mut n = 0usize;
     while i < na && j < nb {
         if eq(i, j) {
-            if n < OPK.len() {
+            if n < MAX_OPS {
                 OPK[n] = 0;
                 OPA[n] = i as u16;
                 OPB[n] = j as u16;
@@ -96,7 +100,7 @@ unsafe fn build_script() {
             i += 1;
             j += 1;
         } else if LCSC[i + 1][j] >= LCSC[i][j + 1] {
-            if n < OPK.len() {
+            if n < MAX_OPS {
                 OPK[n] = 1;
                 OPA[n] = i as u16;
                 OPB[n] = j as u16;
@@ -104,7 +108,7 @@ unsafe fn build_script() {
             }
             i += 1;
         } else {
-            if n < OPK.len() {
+            if n < MAX_OPS {
                 OPK[n] = 2;
                 OPA[n] = i as u16;
                 OPB[n] = j as u16;
@@ -114,7 +118,7 @@ unsafe fn build_script() {
         }
     }
     while i < na {
-        if n < OPK.len() {
+        if n < MAX_OPS {
             OPK[n] = 1;
             OPA[n] = i as u16;
             OPB[n] = j as u16;
@@ -123,7 +127,7 @@ unsafe fn build_script() {
         i += 1;
     }
     while j < nb {
-        if n < OPK.len() {
+        if n < MAX_OPS {
             OPK[n] = 2;
             OPA[n] = i as u16;
             OPB[n] = j as u16;
@@ -153,6 +157,11 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
         crate::outln("usage: diff file1 file2");
         return 1;
     }
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    let Some(_lease) = WorkspaceLease::claim(&BUSY) else {
+        crate::outln("diff: workspace is busy");
+        return 2;
+    };
     let f1 = crate::arg(argc, argv, 1).unwrap_or("");
     let f2 = crate::arg(argc, argv, 2).unwrap_or("");
 
@@ -235,7 +244,7 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
         for t in start..end {
             if unsafe { OPK[t] } == 1 {
                 crate::out_str("< ");
-                crate::out(unsafe { get(0, unsafe { OPA[t] } as usize) });
+                crate::out(unsafe { get(0, OPA[t] as usize) });
                 crate::out(b"\n");
             }
         }
@@ -245,7 +254,7 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
         for t in start..end {
             if unsafe { OPK[t] } == 2 {
                 crate::out_str("> ");
-                crate::out(unsafe { get(1, unsafe { OPB[t] } as usize) });
+                crate::out(unsafe { get(1, OPB[t] as usize) });
                 crate::out(b"\n");
             }
         }

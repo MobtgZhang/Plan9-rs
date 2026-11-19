@@ -1,5 +1,16 @@
 //! `uname` — print kernel identity (`-s` system name, `-r` release).
 
+/// Architecture of the running kernel; the command is compiled per
+/// target, so this resolves at build time.
+#[cfg(target_arch = "aarch64")]
+const KERNEL_ARCH: &str = "aarch64";
+#[cfg(target_arch = "riscv64")]
+const KERNEL_ARCH: &str = "riscv64";
+#[cfg(target_arch = "loongarch64")]
+const KERNEL_ARCH: &str = "loongarch64";
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64")))]
+const KERNEL_ARCH: &str = "x86_64";
+
 pub fn main(argc: usize, argv: *const *const u8) -> i32 {
     let mut all = argc == 1;
     let mut s = false;
@@ -15,7 +26,9 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
         }
     }
     if all || (!s && !r && !v) {
-        crate::outln("Plan9 plan9rs 1.0 x86_64");
+        crate::out(b"Plan9 plan9rs 1.0 ");
+        crate::out_str(KERNEL_ARCH);
+        crate::out(b"\n");
         return 0;
     }
     let mut wrote = false;
@@ -35,7 +48,6 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
             crate::out(b" ");
         }
         crate::out_str("plan9rs-rust");
-        wrote = true;
     }
     crate::out(b"\n");
     0
