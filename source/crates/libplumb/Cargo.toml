@@ -7,6 +7,3 @@ description = "Plan 9 Plumb message library"
 [features]
 default = ["alloc"]
 alloc = []
-
-[dependencies]
-plan9-common = { path = "../common", features = ["alloc"] }

@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 regex-lite = "0.1"
-plan9-security = { path = "../security" }
 
 [[bin]]
 name = "ls"

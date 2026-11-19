@@ -10,8 +10,6 @@ plan9-arch = { path = "../arch" }
 plan9_drivers = { path = "../drivers" }
 plan9-net = { path = "../net" }
 plan9-fs = { path = "../fs" }
-plan9-ipc = { path = "../ipc" }
-plan9-servers = { path = "../servers" }
 spin = "0.9"
 bitflags = { version = "2.13.0", default-features = false }
 
@@ -21,9 +19,3 @@ cc = "1"
 [[bin]]
 name = "plan9_kernel"
 path = "src/main.rs"
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"

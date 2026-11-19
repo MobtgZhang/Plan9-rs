@@ -239,9 +239,6 @@ dependencies = [
 [[package]]
 name = "plan9-bootloader"
 version = "0.1.0"
-dependencies = [
- "plan9-common",
-]
 
 [[package]]
 name = "plan9-cmd"
@@ -262,10 +259,6 @@ dependencies = [
 [[package]]
 name = "plan9-init"
 version = "0.1.0"
-dependencies = [
- "plan9-common",
- "plan9-net",
-]
 
 [[package]]
 name = "plan9-ipc"
@@ -284,9 +277,7 @@ dependencies = [
  "plan9-arch",
  "plan9-common",
  "plan9-fs",
- "plan9-ipc",
  "plan9-net",
- "plan9-servers",
  "plan9_drivers",
  "spin",
 ]
@@ -302,9 +293,6 @@ version = "0.1.0"
 [[package]]
 name = "plan9-libsys"
 version = "0.1.0"
-dependencies = [
- "plan9-common",
-]
 
 [[package]]
 name = "plan9-net"
@@ -345,7 +333,6 @@ version = "0.1.0"
 name = "plan9-userspace"
 version = "0.1.0"
 dependencies = [
- "plan9-security",
  "regex-lite",
 ]
 
@@ -371,9 +358,6 @@ version = "0.1.0"
 [[package]]
 name = "plan9_libplumb"
 version = "0.1.0"
-dependencies = [
- "plan9-common",
-]
 
 [[package]]
 name = "plan9_libregexp"
@@ -382,9 +366,6 @@ version = "0.1.0"
 [[package]]
 name = "plan9_libventi"
 version = "0.1.0"
-dependencies = [
- "plan9-common",
-]
 
 [[package]]
 name = "proc-macro2"

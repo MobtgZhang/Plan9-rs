@@ -2,6 +2,3 @@
 name = "plan9-libsys"
 version = "0.1.0"
 edition = "2021"
-
-[dependencies]
-plan9-common = { path = "../common" }
