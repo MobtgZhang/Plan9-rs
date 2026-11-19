@@ -107,7 +107,6 @@ fn main() -> Result<()> {
 
 /// Main build orchestrator
 struct Builder {
-    #[allow(dead_code)]
     project_root: PathBuf,
     source_dir: PathBuf,
     build_dir: PathBuf,
@@ -145,7 +144,7 @@ impl Builder {
         match self.arch.as_str() {
             "x86_64" => "x86_64-unknown-none",
             "aarch64" => "aarch64-unknown-none",
-            "riscv64" => "riscv64gc-unknown-none-elf",
+            "riscv64" => "riscv64imac-unknown-none-elf",
             "loongarch64" => "loongarch64-unknown-none",
             _ => "x86_64-unknown-none",
         }
@@ -181,7 +180,10 @@ impl Builder {
     /// built for the bare-metal kernel triple with a `svc`/`int 0x80`
     /// syscall gate).  Bash and SSH ports remain x86_64-only.
     fn has_user_space(&self) -> bool {
-        self.arch == "x86_64" || self.arch == "aarch64"
+        self.arch == "x86_64"
+            || self.arch == "aarch64"
+            || self.arch == "riscv64"
+            || self.arch == "loongarch64"
     }
 
     /// Build the Plan 9 command binaries (`/bin/*`, `/rc/bin/rc`).
@@ -192,6 +194,7 @@ impl Builder {
         }
         println!("[BUILD] Compiling plan9-cmd commands...");
         let status = Command::new("cargo")
+            .current_dir(self.source_dir.join("crates/cmd"))
             .arg("build")
             .arg("--manifest-path")
             .arg(self.source_dir.join("Cargo.toml"))
@@ -261,14 +264,18 @@ impl Builder {
         println!("[BUILD] Building UEFI boot loader for {} ...", self.arch);
         self.ensure_dirs()?;
 
+        let status = Command::new("cargo")
+            .current_dir(&self.source_dir)
+            .args(["build", "-p", "plan9-uefiboot", "--target", self.target_triple(), "--release"])
+            .status()
+            .context("Failed to run Cargo for the UEFI boot loader")?;
+        if !status.success() {
+            anyhow::bail!("UEFI boot loader build failed for {}", self.arch);
+        }
+
         let uefi_elf = self.uefi_elf_source();
         if !uefi_elf.exists() {
-            anyhow::bail!(
-                "uefiboot ELF not found at {}. Build it first with \
-                 'cargo build -p plan9-uefiboot --target {} --release'",
-                uefi_elf.display(),
-                self.target_triple()
-            );
+            anyhow::bail!("UEFI boot loader artifact not found at {}", uefi_elf.display());
         }
 
         let out_efi = self.boot_efi();
@@ -309,7 +316,7 @@ impl Builder {
         let triples = [
             "x86_64-unknown-none",
             "aarch64-unknown-none",
-            "riscv64gc-unknown-none-elf",
+            "riscv64imac-unknown-none-elf",
             "loongarch64-unknown-none",
         ];
         let mut failures: Vec<String> = Vec::new();
@@ -317,8 +324,7 @@ impl Builder {
             println!("[CHECK] {}", triple);
             let status = Command::new("cargo")
                 .arg("check")
-                .arg("-p")
-                .arg("plan9-kernel")
+                .args(["-p", "plan9-kernel", "-p", "plan9-init", "-p", "plan9-cmd"])
                 .arg("--manifest-path")
                 .arg(self.source_dir.join("Cargo.toml"))
                 .arg("--target")
@@ -549,8 +555,8 @@ impl Builder {
     ///
     ///   EFI/BOOT/BOOT<ARCH>.EFI    (the uefiboot boot loader)
     ///   \boot\9kernel.elf          (kernel image, loaded by uefiboot)
-    ///   \boot\init                   (x86_64 only: userspace init)
-    ///   \boot\rootfs.cpio            (x86_64 only: RAM root archive)
+    ///   \boot\init                   (userspace init)
+    ///   \boot\rootfs.cpio            (RAM root archive)
     fn build_esp(&self) -> Result<()> {
         println!("[BUILD] Building EFI System Partition for {} ...", self.arch);
         self.ensure_dirs()?;
@@ -564,11 +570,7 @@ impl Builder {
         let esp_boot = self.esp_dir().join("boot");
         std::fs::create_dir_all(&esp_boot)?;
         std::fs::copy(&self.kernel_elf(), esp_boot.join("9kernel.elf"))?;
-        // init/bash/ssh are x86_64 user-space binaries (ring-3 ELF over
-        // int 0x80); other architectures ship kernel + rootfs only.
-        if self.init_elf_source().exists() {
-            std::fs::copy(&self.init_elf_source(), esp_boot.join("init"))?;
-        }
+        std::fs::copy(&self.init_elf_source(), esp_boot.join("init"))?;
         std::fs::copy(&self.rootfs_cpio(), esp_boot.join("rootfs.cpio"))?;
 
         println!("[BUILD] ESP built: {}", self.esp_dir().display());
@@ -688,23 +690,13 @@ impl Builder {
         // Assemble the ISO tree.
         let tmp_dir = tempfile::tempdir_in(self.build_dir.parent().unwrap())?;
 
-        // Build a FAT12 ESP image holding the boot loader + kernel (+init/rootfs).
+        // Build a FAT16 ESP image holding the boot loader, kernel, init and rootfs.
         // xorriso's -e needs a real FAT El Torito boot image, not a directory.
         let esp_img = tmp_dir.path().join("esp.img");
-        let esp_mb: u64 = 32;
-        let status = Command::new("dd")
-            .arg("if=/dev/zero")
-            .arg(format!("of={}", esp_img.display()))
-            .arg("bs=1024")
-            .arg(format!("count={}", esp_mb * 1024))
-            .status()
-            .context("Failed to create ESP image")?;
-        if !status.success() {
-            anyhow::bail!("dd failed to create ESP image");
-        }
+        std::fs::File::create(&esp_img)?.set_len(24 * 1024 * 1024)?;
         let mkfs = Command::new("mkfs.vfat")
             .arg("-F")
-            .arg("12")
+            .arg("16")
             .arg("-n")
             .arg("PLAN9ESP")
             .arg(&esp_img)
@@ -750,6 +742,9 @@ impl Builder {
             mcopy(&self.init_boot_elf(), "/boot/init")?;
         }
         mcopy(&self.rootfs_cpio(), "/boot/rootfs.cpio")?;
+
+        copy_dir_all(&self.esp_dir().join("EFI"), &tmp_dir.path().join("EFI"))?;
+        copy_dir_all(&self.esp_dir().join("boot"), &tmp_dir.path().join("boot"))?;
 
         // Volume label matters: OVMF/EDK2 scans every El Torito/ISO9660
         // volume for EFI/BOOT.

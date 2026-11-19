@@ -4,12 +4,26 @@
 //! `loongarch64-unknown-none`, which have no official `*-unknown-uefi`
 //! rustc target) is wrapped into a PE32+ image that UEFI firmware can load.
 //!
-//! Layout: every PT_LOAD segment becomes one PE section placed at its link
-//! address (ImageBase = 0, VirtualAddress = p_paddr, section-aligned to
-//! 0x1000).  The entry point is the ELF entry (`efi_main`).  UEFI passes
-//! ImageHandle and SystemTable in the architecture's argument registers,
-//! which match `efi_main`'s `extern "efiapi"` signature, so no relocation
-//! stub is needed — the kernel entry contract is satisfied directly.
+//! Layout
+//! ------
+//! UEFI loads a PE image by allocating `SizeOfImage` bytes and copying the
+//! sections to `ImageBase + VirtualAddress`.  The image is therefore
+//! *relocatable*: the sections are laid out contiguously starting at RVA 0,
+//! and `ImageBase` is set to the ELF's link address so the code still runs
+//! at the address it was linked for.
+//!
+//! Each `PT_LOAD` segment becomes one PE section:
+//!
+//!   * `VirtualAddress` — the segment's offset from `ImageBase`
+//!     (`p_paddr - image_base`), rounded down to `SectionAlignment`.
+//!   * `VirtualSize`    — the segment's memory size, rounded up so the
+//!     next section starts on a `SectionAlignment` boundary.
+//!   * `SizeOfRawData`  — the segment's file contents, rounded up to
+//!     `FileAlignment`; the tail is zero-filled (that is where .bss
+//!     lives).
+//!
+//! The entry point is the ELF entry (`_start`), which is the stub that
+//! sets up the stack and calls `efi_main`.
 //!
 //! Usage:
 //!   wrap <input.elf> <output.efi> <arch>
@@ -38,10 +52,20 @@ const PT_LOAD: u32 = 1;
 const PE32_PLUS_MAGIC: u16 = 0x20b;
 const SUBSYSTEM_EFI_APPLICATION: u16 = 10;
 const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
+const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
 
 const SECTION_ALIGN: u64 = 0x1000;
 const FILE_ALIGN: u64 = 0x200;
-const IMAGE_BASE: u64 = 0;
+
+/// Size of the PE32+ optional header.
+///
+/// EDK2's PE loader rejects an image whose `SizeOfOptionalHeader` does not
+/// equal `sizeof(EFI_IMAGE_OPTIONAL_HEADER64)` (0xF0), so the full header
+/// must be emitted even though this image has no data directories.
+const OPT_SIZE: u64 = 0xF0;
+
+/// Number of data-directory entries in the PE32+ optional header.
+const NUMBER_OF_RVA_AND_SIZES: u32 = 16;
 
 fn align_up(v: u64, a: u64) -> u64 {
     (v + a - 1) & !(a - 1)
@@ -111,7 +135,7 @@ pub fn wrap_elf_to_pe(elf_path: &Path, out_path: &Path, arch: &str) -> Result<()
     let elf = fs::read(elf_path)
         .with_context(|| format!("reading ELF {}", elf_path.display()))?;
 
-    if &elf[..4] != ELF_MAGIC {
+    if elf.len() < 64 || &elf[..4] != ELF_MAGIC {
         anyhow::bail!("{} is not an ELF file", elf_path.display());
     }
 
@@ -138,9 +162,15 @@ pub fn wrap_elf_to_pe(elf_path: &Path, out_path: &Path, arch: &str) -> Result<()
     let machine = machine_for(arch)?;
     segs.sort_by_key(|s| s.p_paddr);
 
-    let entry_rva = eh.e_entry as u32; // ImageBase = 0 => RVA == VA
+    // Place the image base one SectionAlignment below the first segment so
+    // that the first section's RVA (and the entry RVA) are non-zero. EDK2's
+    // PE loader rejects images whose first section or entry point sits at
+    // RVA 0.  ImageBase + VirtualAddress still equals each segment's link
+    // address, so the code runs at the address it was linked for.
+    let image_base = align_down(segs[0].p_paddr - SECTION_ALIGN, SECTION_ALIGN);
+    let entry_rva = eh.e_entry - image_base;
 
-    // ----- Compute section layout -----
+    // ----- Compute the section layout -----
     // Headers: DOS header + PE sig + COFF header + Optional header + section table.
     let dos_size: u64 = 64;
     let pe_sig_size: u64 = 4;
@@ -157,28 +187,36 @@ pub fn wrap_elf_to_pe(elf_path: &Path, out_path: &Path, arch: &str) -> Result<()
     let mut image_end = 0u64;
 
     for s in &segs {
-        let va_aligned = align_down(s.p_paddr, SECTION_ALIGN);
-        let section_end = align_up(s.p_paddr + s.p_memsz, SECTION_ALIGN);
-        let sec_vsize = section_end - va_aligned;
+        // RVA of this segment relative to the image base.
+        let rva = align_down(s.p_paddr - image_base, SECTION_ALIGN);
+        let sec_end = align_up(s.p_paddr - image_base + s.p_memsz, SECTION_ALIGN);
+        let sec_vsize = sec_end - rva;
 
         let raw_start = raw_offset;
         let rsize = s.p_filesz;
-        let raw_end = align_up(raw_start + rsize, FILE_ALIGN);
-
+        // Raw data covers the full in-memory size (p_memsz), zero-filling
+        // the .bss tail so the PE loader allocates those pages (e.g. the
+        // boot stack) rather than leaving them unmapped.
+        let raw_end = align_up(raw_start + s.p_memsz, FILE_ALIGN);
         let mut raw_data = vec![0u8; (raw_end - raw_start) as usize];
         if rsize > 0 {
             let off = s.p_offset as usize;
-            raw_data[..rsize as usize].copy_from_slice(&elf[off..off + rsize as usize]);
+            let end = off
+                .checked_add(rsize as usize)
+                .filter(|e| *e <= elf.len())
+                .ok_or_else(|| anyhow::anyhow!("segment data out of ELF bounds"))?;
+            raw_data[..rsize as usize].copy_from_slice(&elf[off..end]);
         }
 
-        let mut characteristics: u32 = IMAGE_SCN_MEM_READ;
-        if s.p_flags & 1 != 0 {
+        // ELF p_flags: PF_R=4, PF_W=2, PF_X=1 (NOT 1/2/4 as read/write/exec!).
+        let mut characteristics: u32 = 0;
+        if s.p_flags & 4 != 0 {
             characteristics |= IMAGE_SCN_MEM_READ;
         }
         if s.p_flags & 2 != 0 {
             characteristics |= IMAGE_SCN_MEM_WRITE;
         }
-        if s.p_flags & 4 != 0 {
+        if s.p_flags & 1 != 0 {
             characteristics |= IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
         } else if rsize > 0 {
             characteristics |= IMAGE_SCN_CNT_INITIALIZED_DATA;
@@ -186,10 +224,9 @@ pub fn wrap_elf_to_pe(elf_path: &Path, out_path: &Path, arch: &str) -> Result<()
             characteristics |= IMAGE_SCN_CNT_UNINITIALIZED_DATA;
         }
 
-        image_end = section_end;
-        raw_offset = raw_end;
-        section_infos.push(SectionInfo {
-            va_aligned,
+        image_end = rva + sec_vsize;
+        raw_offset = raw_end;        section_infos.push(SectionInfo {
+            va_aligned: rva,
             sec_vsize,
             raw_size: raw_end - raw_start,
             raw_ptr: raw_start,
@@ -204,9 +241,12 @@ pub fn wrap_elf_to_pe(elf_path: &Path, out_path: &Path, arch: &str) -> Result<()
         FILE_ALIGN,
     ) as u32;
 
+    // The file is the headers followed by every section's raw data.
+    let file_size = raw_offset as usize;
+
     // ----- Build the PE byte buffer -----
     // DOS header (64 bytes), only e_magic and e_lfanew matter.
-    let mut buf = vec![0u8; size_of_headers as usize];
+    let mut buf = vec![0u8; file_size];
     write_u16(&mut buf, 0, 0x5A4D); // e_magic
     write_u32(&mut buf, 0x3C, dos_size as u32); // e_lfanew -> PE sig
 
@@ -222,9 +262,47 @@ pub fn wrap_elf_to_pe(elf_path: &Path, out_path: &Path, arch: &str) -> Result<()
     write_u32(&mut buf, coff_off + 8, 0); // pointer to symbol table
     write_u32(&mut buf, coff_off + 12, 0); // number of symbols
     write_u16(&mut buf, coff_off + 16, opt_size as u16); // size of optional header
-    write_u16(&mut buf, coff_off + 18, IMAGE_FILE_EXECUTABLE_IMAGE); // characteristics
+    // Position-dependent image loaded at its link address: no base
+    // relocations are needed (and none are emitted), so strip the
+    // relocation flag to keep EDK2 from trying to apply them to read-only
+    // sections.
+    write_u16(
+        &mut buf,
+        coff_off + 18,
+        IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_RELOCS_STRIPPED,
+    ); // characteristics
 
     // Optional header (PE32+)
+    //
+    // The PE32+ optional header layout is:
+    //   0x00 Magic (u16) = 0x20b
+    //   0x02 MajorLinkerVersion, 0x03 MinorLinkerVersion
+    //   0x04 SizeOfCode, 0x08 SizeOfInitializedData, 0x0c SizeOfUninitializedData
+    //   0x10 AddressOfEntryPoint
+    //   0x14 BaseOfCode
+    //   0x18 ImageBase (u64)          <- PE32+ only
+    //   0x20 SectionAlignment
+    //   0x24 FileAlignment
+    //   0x28 MajorOperatingSystemVersion, 0x2a MinorOperatingSystemVersion
+    //   0x2c MajorImageVersion, 0x2e MinorImageVersion
+    //   0x30 MajorSubsystemVersion, 0x32 MinorSubsystemVersion
+    //   0x34 Win32VersionValue
+    //   0x38 SizeOfImage
+    //   0x3c SizeOfHeaders
+    //   0x40 CheckSum
+    //   0x44 Subsystem (u16)
+    //   0x46 DllCharacteristics
+    //   0x48 SizeOfStackReserve (u64)
+    //   0x50 SizeOfStackCommit
+    //   0x58 SizeOfHeapReserve
+    //   0x60 SizeOfHeapCommit
+    //   0x68 LoaderFlags
+    //   0x6c NumberOfRvaAndSizes
+    //   0x70 DataDirectory[16]
+    //
+    // NOTE: PE32 and PE32+ differ after offset 0x24 (PE32 has 4-byte
+    // BaseOfData at 0x1c and no ImageBase).  All offsets below are the
+    // PE32+ ones.
     let opt_off = coff_off + 20;
     // 0x00 magic (u16) = 0x20b
     write_u16(&mut buf, opt_off, PE32_PLUS_MAGIC);
@@ -233,39 +311,37 @@ pub fn wrap_elf_to_pe(elf_path: &Path, out_path: &Path, arch: &str) -> Result<()
     buf[opt_off + 3] = 0;
     // 0x04 SizeOfCode, 0x08 SizeOfInitializedData, 0x0c SizeOfUninitializedData (leave 0)
     // 0x10 AddressOfEntryPoint
-    write_u32(&mut buf, opt_off + 0x10, entry_rva);
+    write_u32(&mut buf, opt_off + 0x10, entry_rva as u32);
     // 0x14 BaseOfCode (leave 0)
     // 0x18 ImageBase (u64, PE32+)
-    write_u64(&mut buf, opt_off + 0x18, IMAGE_BASE);
+    write_u64(&mut buf, opt_off + 0x18, image_base);
     // 0x20 SectionAlignment
     write_u32(&mut buf, opt_off + 0x20, SECTION_ALIGN as u32);
     // 0x24 FileAlignment
     write_u32(&mut buf, opt_off + 0x24, FILE_ALIGN as u32);
-    // 0x28..0x3c OS/image/subsystem versions (leave 0)
-    // 0x3c Win32VersionValue (0)
-    // 0x40 SizeOfImage
-    write_u32(&mut buf, opt_off + 0x40, size_of_image);
-    // 0x44 SizeOfHeaders
-    write_u32(&mut buf, opt_off + 0x44, size_of_headers);
-    // 0x48 Checksum (0)
-    // 0x4c Subsystem (u16) = 10 EFI_APPLICATION
-    write_u16(&mut buf, opt_off + 0x4c, SUBSYSTEM_EFI_APPLICATION);
-    // 0x4e DllCharacteristics (0)
-    // 0x50 SizeOfStackReserve (u64)
-    write_u64(&mut buf, opt_off + 0x50, 0x100000);
-    // 0x58 SizeOfStackCommit
-    write_u64(&mut buf, opt_off + 0x58, 0x1000);
-    // 0x60 SizeOfHeapReserve
-    write_u64(&mut buf, opt_off + 0x60, 0x100000);
-    // 0x68 SizeOfHeapCommit
-    write_u64(&mut buf, opt_off + 0x68, 0x1000);
-    // 0x70 LoaderFlags (0)
-    // 0x74 NumberOfRvaAndSizes
-    write_u32(&mut buf, opt_off + 0x74, 0); // no data directories
-    // optional header size = 0x78 + ... actually PE32+ optional header is 0xE0 (224) with no data dirs?
-    // The standard PE32+ optional header with 0 data directories is 0x78 bytes (120).
-    // We set size_of_optional_header in COFF to opt_size which should be 0x78.
-    // (opt_size computed from Optional64Template must equal 0x78.)
+    // 0x28..0x38 OS/image/subsystem versions (leave 0)
+    // 0x38 SizeOfImage
+    write_u32(&mut buf, opt_off + 0x38, size_of_image);
+    // 0x3c SizeOfHeaders
+    write_u32(&mut buf, opt_off + 0x3c, size_of_headers);
+    // 0x40 CheckSum (0)
+    // 0x44 Subsystem (u16) = 10 EFI_APPLICATION
+    write_u16(&mut buf, opt_off + 0x44, SUBSYSTEM_EFI_APPLICATION);
+    // 0x46 DllCharacteristics (0)
+    // 0x48 SizeOfStackReserve (u64)
+    write_u64(&mut buf, opt_off + 0x48, 0x100000);
+    // 0x50 SizeOfStackCommit
+    write_u64(&mut buf, opt_off + 0x50, 0x1000);
+    // 0x58 SizeOfHeapReserve
+    write_u64(&mut buf, opt_off + 0x58, 0x100000);
+    // 0x60 SizeOfHeapCommit
+    write_u64(&mut buf, opt_off + 0x60, 0x1000);
+    // 0x68 LoaderFlags (0)
+    // 0x6c NumberOfRvaAndSizes
+    write_u32(&mut buf, opt_off + 0x6c, NUMBER_OF_RVA_AND_SIZES);
+    // 0x70 DataDirectory[16] — all zero: this image needs no imports,
+    // no relocations and no debug directory (it is position-dependent
+    // and loaded at its link address).
 
     // Section table
     let sec_off = opt_off + opt_size as usize;
@@ -292,19 +368,24 @@ pub fn wrap_elf_to_pe(elf_path: &Path, out_path: &Path, arch: &str) -> Result<()
     // Section raw data
     for si in &section_infos {
         let dst_off = si.raw_ptr as usize;
-        buf[dst_off..dst_off + si.raw_data.len()].copy_from_slice(&si.raw_data);
+        let end = dst_off + si.raw_data.len();
+        if end > buf.len() {
+            anyhow::bail!("section data overflows the PE image");
+        }
+        buf[dst_off..end].copy_from_slice(&si.raw_data);
     }
 
     fs::write(out_path, &buf)
         .with_context(|| format!("writing PE {}", out_path.display()))?;
 
     println!(
-        "[WRAP] {} -> {}  machine={:#x} sections={} entry={:#x} image_size={:#x}",
+        "[WRAP] {} -> {}  machine={:#x} sections={} base={:#x} entry={:#x} image_size={:#x}",
         elf_path.display(),
         out_path.display(),
         machine,
         section_infos.len(),
-        entry_rva,
+        image_base,
+        image_base + entry_rva,
         size_of_image
     );
 
@@ -319,8 +400,3 @@ struct SectionInfo {
     characteristics: u32,
     raw_data: Vec<u8>,
 }
-
-/// Size of the PE32+ optional header with zero data directories (0x70 bytes).
-/// The real header is hand-written above for full layout control; this
-/// constant is only used to size the section table / headers region.
-const OPT_SIZE: u64 = 0x70;

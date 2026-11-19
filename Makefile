@@ -18,7 +18,9 @@
 #   make check-all                # cargo check for all four targets
 #   make clean                    # Clean build artifacts
 #   make run                      # Launch the selected ARCH in QEMU
+#   make run-console              # Launch QEMU with an interactive serial console
 #   make run-serial               # Launch QEMU with serial output to a file
+#   make boot-smoke               # Test the GOP menu, graphical console and shell
 #   make help                     # Print this help message
 #
 # Override defaults:
@@ -38,48 +40,13 @@ ISO_FILE     := $(BUILD_DIR)/plan9.iso
 # Cargo commands should run from source/ where the workspace is.
 CARGO_CMD = cd $(SOURCE_DIR) && $(CARGO)
 
-# Per-architecture target triple and boot image.
-TARGET_TRIPLE = $(shell case "$(ARCH)" in \
-	x86_64) echo x86_64-unknown-none ;; \
-	aarch64) echo aarch64-unknown-none ;; \
-	riscv64) echo riscv64gc-unknown-none-elf ;; \
-	loongarch64) echo loongarch64-unknown-none ;; \
-	*) echo x86_64-unknown-none ;; \
-esac)
-
-KERNEL_ELF := $(BUILD_DIR)/kernel/plan9_kernel.elf
-
-# x86_64 boots from the GRUB/OVMF ISO; the other targets are loaded
-# directly by QEMU with -kernel.
-ifeq ($(ARCH),x86_64)
-RUN_DEPS  := iso
-ALL_TARGET := iso
-else
-RUN_DEPS  := kernel
-ALL_TARGET := kernel
-endif
-
-# Firmware paths (only needed by the x86 UEFI smoke path).
-OVMF_FD_2M   := /usr/share/ovmf/OVMF.fd
-OVMF_WORK_FILE := $(BUILD_DIR)/OVMF.fd
-OPENSBI      := /usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
-
-# Per-arch QEMU tweaks: CPU model and extra BIOS for the direct fallback.
-QEMU_CPU_x86_64      :=
-QEMU_CPU_aarch64     := -cpu cortex-a72
-QEMU_CPU_riscv64     :=
-QEMU_CPU_loongarch64 := -cpu la464
-QEMU_BIOS_riscv64    := -bios $(OPENSBI)
-QEMU_BIOS_aarch64    :=
-QEMU_BIOS_loongarch64 :=
-
-.PHONY: all build-tool kernel init esp rootfs iso check-all clean run run-serial help
+.PHONY: all build-tool kernel init esp rootfs iso check-all clean run run-console run-serial boot-smoke help
 
 # =============================================================================
 # Build targets (delegate to build-tool)
 # =============================================================================
 
-all: $(ALL_TARGET)
+all: iso
 
 build-tool:
 	$(CARGO_CMD) build -p build-tool
@@ -108,110 +75,40 @@ clean:
 # =============================================================================
 # QEMU launcher
 #
-# x86_64 uses a GRUB-multiboot2 ISO with OVMF because QEMU's direct
-# `-kernel` path does not understand the Multiboot2 image without a PVH
-# ELF note.  All architectures boot the same way: UEFI firmware + the
-# GRUB ISO.  Per-arch firmware:
-#   x86_64      OVMF                (ovmf package)
-#   aarch64     OVMF-AA64           (edk2-aarch64 package, QEMU_EFI.fd)
-#   riscv64     edk2-riscv64        (QEMU_EFI.fd) or OpenSBI+GRUB
-#   loongarch64 edk2-loongarch64    (QEMU_EFI.fd)
-# If a per-arch firmware is not installed, non-x86 targets fall back to
-# the direct `-kernel` path.
-# =============================================================================
-
-# Per-architecture UEFI firmware candidates, first match wins.
-#   aarch64     qemu-efi-aarch64 -> QEMU_EFI.fd (loaded with -bios)
-#   riscv64     qemu-efi-riscv64 -> RISCV_VIRT_CODE.fd + VARS (pflash)
-#   loongarch64 edk2-loongarch64 -> QEMU_EFI.fd (pflash)
-UEFI_FW_aarch64  = $(firstword $(wildcard /usr/share/qemu-efi-aarch64/QEMU_EFI.fd /usr/share/edk2-aarch64/QEMU_EFI.fd /usr/share/ovmf/OVMF.fd))
-UEFI_FW_riscv64  = $(firstword $(wildcard /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd /usr/share/edk2-riscv64/RISCV_VIRT_CODE.fd))
-UEFI_VARS_riscv64_SRC = $(firstword $(wildcard /usr/share/qemu-efi-riscv64/RISCV_VIRT_VARS.fd /usr/share/edk2-riscv64/RISCV_VIRT_VARS.fd))
-# EDK2 writes variable stores back, so the template must be copied into
-# the build tree (the packaged file is read-only).
-UEFI_VARS_riscv64 = $(BUILD_DIR)/RISCV_VIRT_VARS.fd
-UEFI_FW_loongarch64 = $(firstword $(wildcard /usr/share/qemu-efi-loongarch64/QEMU_EFI.fd /usr/share/edk2-loongarch64/QEMU_EFI.fd))
+# The EFI loader supplies the kernel with the memory map, init and rootfs.
+# Boot the freshly built ISO on every target. A bare kernel alone cannot
+# start user space, so a missing firmware is an error, not a fallback.
+UEFI_FW_x86_64 ?= $(firstword $(wildcard /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd /usr/share/OVMF/OVMF_CODE_4M.fd))
+UEFI_FW_aarch64 ?= $(firstword $(wildcard /usr/share/qemu-efi-aarch64/QEMU_EFI.fd /usr/share/edk2-aarch64/QEMU_EFI.fd))
+UEFI_FW_riscv64 ?= $(firstword $(wildcard /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd /usr/share/edk2-riscv64/RISCV_VIRT_CODE.fd))
+UEFI_FW_loongarch64 ?= $(firstword $(wildcard /usr/share/qemu-efi-loongarch64/QEMU_EFI.fd /usr/share/edk2-loongarch64/QEMU_EFI.fd))
+UEFI_VARS_riscv64 ?= $(firstword $(wildcard /usr/share/qemu-efi-riscv64/RISCV_VIRT_VARS.fd /usr/share/edk2-riscv64/RISCV_VIRT_VARS.fd))
+UEFI_VARS_x86_64 ?= $(if $(filter %OVMF_CODE_4M.fd,$(UEFI_FW_x86_64)),$(dir $(UEFI_FW_x86_64))OVMF_VARS_4M.fd)
 UEFI_FW = $(UEFI_FW_$(ARCH))
+UEFI_VARS = $(UEFI_VARS_$(ARCH))
+UEFI_PFLASH = -drive if=pflash,format=raw,readonly=on,file="$(UEFI_FW)" \
+	-drive if=pflash,format=raw,snapshot=on,file="$(UEFI_VARS)"
+UEFI_ARGS = $(if $(UEFI_VARS),$(UEFI_PFLASH),-bios "$(UEFI_FW)")
 
-# Extra firmware wiring: riscv64/loongarch64 EDK2 images are pflash
-# devices, not -bios blobs.
-UEFI_ARGS_aarch64  = -bios $(UEFI_FW)
-UEFI_ARGS_riscv64  = -drive if=pflash,format=raw,readonly=on,file=$(UEFI_FW) \
-                     -drive if=pflash,format=raw,file=$(UEFI_VARS_riscv64)
-UEFI_ARGS_loongarch64 = -bios $(UEFI_FW)
-UEFI_ARGS = $(UEFI_ARGS_$(ARCH))
+QEMU_UEFI_KEYBOARD = -device qemu-xhci -device usb-kbd
+QEMU_MACHINE_aarch64 = -M virt -cpu cortex-a72 -device ramfb $(QEMU_UEFI_KEYBOARD) -device virtio-keyboard-device
+QEMU_MACHINE_riscv64 = -M virt -device VGA $(QEMU_UEFI_KEYBOARD) -device virtio-keyboard-device
+QEMU_MACHINE_loongarch64 = -M virt -cpu la464 -device VGA $(QEMU_UEFI_KEYBOARD) -device virtio-keyboard-pci
+QEMU_CMD = qemu-system-$(ARCH) $(QEMU_MACHINE_$(ARCH)) -m $(MEM) $(UEFI_ARGS) \
+	-cdrom "$(ISO_FILE)" -monitor none
 
-run: $(RUN_DEPS)
-	@mkdir -p $(BUILD_DIR)
-	@if [ "$(ARCH)" = "x86_64" ] && [ -f "$(OVMF_FD_2M)" ] && [ ! -f "$(OVMF_WORK_FILE)" ]; then \
-		cp "$(OVMF_FD_2M)" "$(OVMF_WORK_FILE)"; \
-	fi; \
-	if [ "$(ARCH)" = "riscv64" ] && [ -n "$(UEFI_VARS_riscv64_SRC)" ] && [ ! -f "$(UEFI_VARS_riscv64)" ]; then \
-		cp "$(UEFI_VARS_riscv64_SRC)" "$(UEFI_VARS_riscv64)"; \
-	fi; \
-	case "$(ARCH)" in \
-		x86_64) \
-			qemu-system-x86_64 -m $(MEM) \
-				-bios $(OVMF_WORK_FILE) \
-				-cdrom $(ISO_FILE) \
-				-display gtk -monitor none ;; \
-		aarch64|riscv64|loongarch64) \
-			if [ -n "$(UEFI_FW)" ]; then \
-				echo "[RUN] $(ARCH) UEFI firmware: $(UEFI_FW)"; \
-				qemu-system-$(ARCH) -M virt -m $(MEM) \
-					$(QEMU_CPU_$(ARCH)) \
-					$(UEFI_ARGS) \
-					-cdrom $(ISO_FILE) \
-					-display gtk -monitor none; \
-			else \
-				echo "[RUN] no UEFI firmware for $(ARCH) (install edk2-$(ARCH) / qemu-efi-$(ARCH)); falling back to direct -kernel boot"; \
-				qemu-system-$(ARCH) -M virt -m $(MEM) \
-					$(QEMU_CPU_$(ARCH)) \
-					$(QEMU_BIOS_$(ARCH)) \
-					-kernel $(KERNEL_ELF) \
-					-display gtk -monitor none; \
-			fi ;; \
-		*) \
-			echo "Unsupported ARCH=$(ARCH)"; exit 1 ;; \
-	esac
+run: QEMU_OUTPUT = -display gtk
+run-console: QEMU_OUTPUT = -display none -serial stdio
+run-serial: QEMU_OUTPUT = -display none -serial file:"$(BUILD_DIR)/serial.log"
+boot-smoke: QEMU_OUTPUT = -display none -serial stdio
+boot-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" "$(ARCH)" "$(BUILD_DIR)/smoke-serial.log" --
 
-run-serial: $(RUN_DEPS)
-	@mkdir -p $(BUILD_DIR)
-	@rm -f $(BUILD_DIR)/serial.log
-	@if [ "$(ARCH)" = "x86_64" ] && [ -f "$(OVMF_FD_2M)" ] && [ ! -f "$(OVMF_WORK_FILE)" ]; then \
-		cp "$(OVMF_FD_2M)" "$(OVMF_WORK_FILE)"; \
-	fi; \
-	if [ "$(ARCH)" = "riscv64" ] && [ -n "$(UEFI_VARS_riscv64_SRC)" ] && [ ! -f "$(UEFI_VARS_riscv64)" ]; then \
-		cp "$(UEFI_VARS_riscv64_SRC)" "$(UEFI_VARS_riscv64)"; \
-	fi; \
-	case "$(ARCH)" in \
-		x86_64) \
-			qemu-system-x86_64 -m $(MEM) \
-				-bios $(OVMF_WORK_FILE) \
-				-cdrom $(ISO_FILE) \
-				-display none -monitor none \
-				-serial file:$(BUILD_DIR)/serial.log ;; \
-		aarch64|riscv64|loongarch64) \
-			if [ -n "$(UEFI_FW)" ]; then \
-				echo "[RUN] $(ARCH) UEFI firmware: $(UEFI_FW)"; \
-				qemu-system-$(ARCH) -M virt -m $(MEM) \
-					$(QEMU_CPU_$(ARCH)) \
-					$(UEFI_ARGS) \
-					-cdrom $(ISO_FILE) \
-					-display none -monitor none \
-					-serial file:$(BUILD_DIR)/serial.log; \
-			else \
-				echo "[RUN] no UEFI firmware for $(ARCH); falling back to direct -kernel boot"; \
-				qemu-system-$(ARCH) -M virt -m $(MEM) \
-					$(QEMU_CPU_$(ARCH)) \
-					$(QEMU_BIOS_$(ARCH)) \
-					-kernel $(KERNEL_ELF) \
-					-display none -monitor none \
-					-serial file:$(BUILD_DIR)/serial.log; \
-			fi ;; \
-		*) \
-			echo "Unsupported ARCH=$(ARCH)"; exit 1 ;; \
-	esac
+run run-console run-serial boot-smoke: iso
+	@test -f "$(UEFI_FW)" || { echo "No UEFI firmware for $(ARCH); set UEFI_FW_$(ARCH)." >&2; exit 1; }
+	@if [ "$(ARCH)" = "riscv64" ] || [ -n "$(UEFI_VARS)" ]; then \
+		test -f "$(UEFI_VARS)" || { echo "No UEFI variables image for $(ARCH); set UEFI_VARS_$(ARCH)." >&2; exit 1; }; \
+	fi
+	$(QEMU_RUNNER) $(QEMU_CMD) $(QEMU_OUTPUT)
 
 # =============================================================================
 # Help
@@ -232,14 +129,15 @@ help:
 	@echo "  clean        - Clean build artifacts"
 	@echo ""
 	@echo "Runtime targets:"
-	@echo "  run          - Launch selected ARCH in QEMU (graphical)"
+	@echo "  run          - Launch QEMU with a graphical console"
+	@echo "  run-console  - Launch QEMU with an interactive serial console"
 	@echo "  run-serial   - Launch QEMU with serial output to build/<arch>/serial.log"
+	@echo "  boot-smoke   - Test the GOP menu, graphical keyboard and shell"
 	@echo ""
 	@echo "Variables:"
 	@echo "  ARCH=x86_64|aarch64|riscv64|loongarch64"
 	@echo "  MEM=512                    # QEMU memory in MB"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make ARCH=aarch64 kernel && make ARCH=aarch64 run-serial"
-	@echo "  make ARCH=riscv64 run-serial"
-	@echo "  make ARCH=x86_64 run-serial"
+	@echo "  make ARCH=aarch64 boot-smoke"
+	@echo "  make ARCH=riscv64 run-console"
