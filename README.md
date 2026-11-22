@@ -56,19 +56,67 @@ make ARCH=aarch64 run-console # Interactive serial console
 make ARCH=riscv64 run-serial  # Serial output in build/riscv64/serial.log
 ```
 
-All three targets rebuild and boot the selected ISO. At the `root@plan9:/>` prompt, run `help` to list the shell built-ins and available commands. Passing a kernel ELF alone to QEMU with `-kernel` does not provide `init` and the root filesystem and is not a substitute for booting the ISO.
+All three targets rebuild and boot the selected ISO. At the `root@plan9:/usr/root>` prompt, run `help` to list the shell built-ins and available commands. Boot the ISO to load `init` and the root filesystem along with the kernel.
+
+### Login environment
+
+`init` starts `rc -l`. The shell runs `/rc/lib/rcmain`, which sources `/rc/bin/termrc` and changes to the account's home. It then sources `$home/lib/profile` if present. The image includes profiles for `/usr/root` and `/usr/glenda`. Use `path=(. /bin)` to set the command search path and `env` or `ls /env` to view the current environment.
+
+Plan 9 environment variables are files in `/env`. `rc` stores lists as NUL-terminated words. A plain `fork` shares the environment group. In `rc`, `rfork e` copies the current group into a private one, and `rfork E` replaces it with an empty group. The machine-wide environment `#ec` is readable by all users and writable by the host owner.
 
 ## QEMU Smoke Tests
 
 ```bash
 for arch in x86_64 aarch64 riscv64 loongarch64; do
-    make ARCH="$arch" boot-smoke || break
+    make ARCH="$arch" boot-smoke mount-smoke || break
 done
 ```
 
 The test uses QEMU Machine Protocol (QMP) to inspect the GOP boot menu, select the verbose boot entry with the graphical keyboard, and run `uname` and `help` in the kernel's graphical console. It checks the architecture string, the complete help listing, argument handling in `echo`, and the restart of `rc` after `exit`.
 
 The serial log is written to `build/<arch>/smoke-serial.log`. The four framebuffer captures are `smoke-menu.ppm`, `smoke-shell.ppm`, `smoke-uname.ppm`, and `smoke-help.ppm` in the same directory. The README images come from the `smoke-uname.ppm` captures.
+
+`boot-smoke` also exercises `rc` expansion, functions, here-documents, redirection, pipeline scope, exit strings and executable `#!` scripts. Its process checks cover debugger stops through `/proc/<pid>/ctl`, general registers in the port's saved user-frame layout, executable-image reads (including boot init), `hang` inheritance, `NSAVE` and `NRSTR`, recovery from user traps, `alarm` and note delivery to CPU-bound processes, and `notepg` delivery after the group leader exits. It verifies that `await` and `/proc/<pid>/wait` share exit records, including note interruption, short reads and external readers. It also checks orphan and `RFNOWAIT` cleanup, shared, copied and empty descriptor groups, and `ORCLOSE` cleanup of `/srv` entries at exit. The shell initializes its environment through `/env`, `/rc/lib/rcmain` and `$home/lib/profile`.
+
+`mount-smoke` publishes connected channels through `/srv`, closes the original descriptors, and mounts a 9P2000 test server. It covers explicit relative service paths, service permissions, session reuse, `rfork nm` mount isolation, `Tauth` and attach using a simulated factotum RPC service, chunked I/O with a small `iounit`, and the race between `Tflush` and an in-flight reply. It also verifies binary stat records for `/srv` and mixed union directories, remote file operations, unmount by source, and final fid cleanup. Local directory reads use the same stat-record format; `LIST` remains a names-only compatibility interface. The serial log is written to `build/<arch>/mount-serial.log`.
+
+These tests do not establish complete upstream compatibility. `/proc/<pid>/regs` uses the port's register layout rather than the historical Plan 9 register ABI; floating-point and kernel register files and EDF controls are not covered. The 9P client serializes requests per transport and has not been tested against a native factotum and authentication server.
+
+Noninteractive `rc` executes complete commands as it reads them, preserving multiline constructs and here-documents without buffering the entire script. Script input files use `OCEXEC`; the smoke test checks that successful `exec` closes marked channels, including duplicates, without closing ordinary channels or affecting a parent's copied descriptor group. A failed `exec` leaves marked descriptors open.
+
+## Networking
+
+The x86_64, AArch64, RISC-V 64 and LoongArch64 QEMU targets share two PCI drivers under `source/crates/drivers/src/network/`. `etherigbe.rs` drives Intel 82540EM and follows the device split of upstream Plan 9's `sys/src/9/pc/etherigbe.c`. `ethervirtio.rs` drives modern PCI VirtIO Ethernet. The kernel exposes Ethernet queues through `#l` and `/net/etherN`. Its `#I` device follows the conversation model in upstream `sys/src/9/ip/devip.c`.
+
+Each bound Ethernet interface supports DHCPv4, static addresses and IPv6 SLAAC. `/net/ipifc` configures interfaces, `/net/iproute` manages longest-prefix routing and `/net/arp` lists IPv4 and IPv6 neighbors and accepts manual IPv4 entries. `iprouting 1` on an interface's `ctl` enables IPv4 and IPv6 forwarding between Ethernet interfaces. Forwarding defaults to off.
+
+Open `/net/{tcp,udp,icmp,icmpv6,gre,rudp,ipmux,esp}/clone` to create a conversation, then use its numbered directory's `ctl`, `data`, `local`, `remote`, `status` and `err` files. TCP and UDP listeners can accept new conversations through `listen`. UDP supports the 52-byte `headers` mode. `/net/dns` resolves A and AAAA records. `/net/cs` translates dial strings using numeric addresses, DNS and local `/net/ndb` entries.
+
+```text
+ip/ipconfig
+ip/ipconfig routes
+ip/ipconfig dhcp
+ip/ipconfig add 10.0.2.15/24 10.0.2.2
+ip/ping -n 2 127.0.0.1
+ip/ping -6 -n 1 ::1
+ip/ping -n 1 10.0.2.2
+netcat -m message 10.0.2.2 9000
+netcat -u -m message 10.0.2.2 9000
+netcat -u -l -H -n 2 '*' 8124
+netcat -l -m reply 10.0.2.15 8123
+ndb/dnsquery localhost
+ndb/csquery tcp!127.0.0.1!http
+snoopy -n 3 -t 0x0800 ether0
+ip/traceroute -a 1 -t 10 10.0.2.2
+```
+
+`ping` and `ipconfig` are also available under their short names. `ping` accepts `-c` as an alias for `-n`. `netcat -u -l -H` echoes UDP datagrams to their senders through a single `headers` conversation and copies their payloads to stdout. `netcat -g` uses IPv4 GRE and `netcat -r` uses IPv4 RUDP with stop-and-wait retransmission. `snoopy -f 'proto=fd;data[0]=ca'` consumes matching IPv4 packets through `ipmux`. `netcat -I packet-file` sends one complete IPv4 or IPv6 packet through `ipmux` without a receive filter. Ethernet unicast output preserves the caller's IP header and recomputes the IPv4 header checksum. Socket I/O uses a bounded wait.
+
+ESP supports manually configured unidirectional associations for IPv4 and IPv6. Connect to `address!*` for an inbound association and read `local` to obtain its SPI. Connect to `address!spi` with the peer's decimal SPI for outbound traffic. Configure `esp aes_128_cbc <32 hex digits>` and `ah aes_xcbc_mac_96 <32 hex digits>` with independently generated keys. Outbound associations also require `ivseed <32 hex digits>` with a fresh secret random value per association. Rotate the association keys when recreating a session. `netcat -E config address spi` reads these settings from a file with one control command per line and sends stdin. `netcat -E config -n 2 address '*'` receives two payloads and prints the local SPI to stderr.
+
+Run `make ARCH=<arch> net-smoke` for the E1000 configuration or add `QEMU_NIC=virtio-net-pci,disable-legacy=on` for VirtIO. The tests exercise DHCP, ICMPv4/v6, TCP/UDP data and listeners, UDP headers with two peers, DNS/CS, GRE, RUDP retransmission, IPv4 and IPv6 ESP interoperability with OpenSSL, ARP, `ipmux` filtering and raw output, Ethernet capture, dual-stack forwarding and traceroute. `net-smoke` uses Python 3 and OpenSSL. The serial log is written to `build/<arch>/net-serial.log`.
+
+Packet filters, RUDP and GRE currently support IPv4. IPv6 uses automatic Neighbor Discovery. Physical NICs, additional `ipifc` media, IKE, additional ESP transforms and the full Plan 9 NDB/DNS service suite are outside the tested implementation.
 
 ## Architecture and Boot Layout
 
