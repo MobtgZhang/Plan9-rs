@@ -45,6 +45,8 @@ pub struct RamNode {
     pub uid: u32,
     /// Owning group id.
     pub gid: u32,
+    pub atime: u32,
+    pub mtime: u32,
     /// Explicit per-user access-control entries.
     pub acl: Vec<AclEntry>,
     /// File contents.
@@ -131,6 +133,8 @@ impl RootFsDev {
             perm: 0o755 | 0o40000,
             uid: 0,
             gid: 0,
+            atime: 0,
+            mtime: 0,
             acl: Vec::new(),
             data: Vec::new(),
         });
@@ -144,7 +148,7 @@ impl RootFsDev {
         for path in [
             "bin", "boot", "cfg", "dev", "etc", "proc", "tmp", "usr", "home",
             "adm", "env", "fd", "mnt", "n", "net", "rc", "srv",
-            "lib", "lib/modules", "usr/glenda", "home/glenda",
+            "lib", "lib/modules", "usr/glenda", "usr/root",
         ] {
             dev.mkdir_path(path);
         }
@@ -206,6 +210,8 @@ impl RootFsDev {
             perm,
             uid: owner.uid,
             gid: owner.gid,
+            atime: 0,
+            mtime: 0,
             acl: Vec::new(),
             data,
         });
@@ -382,8 +388,8 @@ impl RootFsDev {
                 qidtype::FILE
             }),
             mode,
-            atime: 0,
-            mtime: 0,
+            atime: node.atime,
+            mtime: node.mtime,
             length: node.data.len() as u64,
             name: node.name.as_bytes().to_vec(),
             uid: node.uid,
@@ -522,7 +528,12 @@ impl Dev for RootFsDev {
                 .filter(|n| n.parent == Some(node.id))
                 .map(|n| n.name.clone())
                 .collect();
+            drop(nodes);
+            if let Some(path) = &ch.namespace_path {
+                names.extend(crate::vfs::mount_children(path));
+            }
             names.sort();
+            names.dedup();
             let mut text = String::new();
             for name in names {
                 text.push_str(&name);
@@ -605,14 +616,42 @@ impl Dev for RootFsDev {
         if dir.uid != node.uid && who.uid != 0 {
             return Err(DevError::Eperm);
         }
+        if dir.gid != node.gid && who.uid != 0 && !who.in_group(dir.gid) {
+            return Err(DevError::Eperm);
+        }
+
+        let name = core::str::from_utf8(&dir.name).map_err(|_| DevError::Einval)?;
+        let length = usize::try_from(dir.length).map_err(|_| DevError::Einval)?;
+        if length != node.data.len() && (node.is_dir || !permitted(&node, &who, want::WRITE)) {
+            return Err(DevError::Eperm);
+        }
+        if name != node.name {
+            if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\n', '\0']) {
+                return Err(DevError::Einval);
+            }
+            let parent = node.parent.and_then(|id| self.node(id)).ok_or(DevError::Eperm)?;
+            if !permitted(&parent, &who, want::WRITE | want::EXEC) {
+                return Err(DevError::Eperm);
+            }
+        }
 
         let mut nodes = self.nodes.lock();
+        if name != node.name && nodes.iter().any(|other| other.parent == node.parent && other.name == name) {
+            return Err(DevError::Eexists);
+        }
         let n = nodes.iter_mut().find(|n| n.id == node.id).ok_or(DevError::Enoent)?;
+        n.data.try_reserve(length.saturating_sub(n.data.len())).map_err(|_| DevError::Enomem)?;
+        n.data.resize(length, 0);
+        if name != node.name {
+            n.name = name.to_string();
+        }
         // The mode field carries the type bits when it comes from `stat`;
         // keep only the low nine permission bits.
         n.perm = (n.perm & !0o777) | (dir.mode & 0o777);
         n.uid = dir.uid;
         n.gid = dir.gid;
+        n.atime = dir.atime;
+        n.mtime = dir.mtime;
         Ok(())
     }
 

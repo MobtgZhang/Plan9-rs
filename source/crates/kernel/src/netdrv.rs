@@ -1,732 +1,402 @@
-//! Kernel NIC and TCP data plane.
-//!
-//! Wires the E1000 driver into the `plan9_net` stack and implements a small
-//! synchronous TCP client used by the Plan 9 `/net` device.  The NIC is
-//! polled directly because the kernel does not install an interrupt handler
-//! for the network device in this boot path.
+//! PCI Ethernet and loopback media for the kernel IP stack.
 
-extern crate alloc;
-
-use alloc::sync::Arc;
-use alloc::vec;
-use alloc::vec::Vec;
-
-use crate::plan9_common::sync::Spinlock;
-use crate::serial;
+use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
+use core::net::{Ipv4Addr, Ipv6Addr};
 use plan9_common::types::PhysAddr;
-use plan9_drivers::network::E1000;
-use plan9_drivers::pci::{PciHeader};
-use plan9_net::netstack::{Frame, NetBackend, set_backend, try_tx};
+use plan9_drivers::{network::{E1000, ethervirtio::{DMA_PAGES, VirtioNet}}, pci};
+use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::time::Instant;
+use smoltcp::wire::{EthernetAddress, HardwareAddress, Icmpv6Packet, Icmpv6Repr, IpAddress, IpProtocol, Ipv6Packet, Ipv6Repr, NdiscRepr};
+use crate::{dev::Error, etherport::EtherPort};
 
-/// Guest IP used by QEMU's default user-mode network.
-const LOCAL_IP: [u8; 4] = [10, 0, 2, 15];
-/// QEMU's user-mode gateway (host side).
-const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+const FRAME_SIZE: usize = 1514;
+const LOOP_CAPACITY: usize = 16;
 
-const ETHERTYPE_IPV4: u16 = 0x0800;
-const ETHERTYPE_ARP: u16 = 0x0806;
-const TCP_HEADER_LEN: usize = 20;
-const IPV4_HEADER_LEN: usize = 20;
-const MAX_FRAME: usize = 2048;
-
-// ============================================================================
-// NIC backend
-// ============================================================================
-
-pub struct NicBackend {
-    nic: Spinlock<E1000>,
-    pub mac: [u8; 6],
+pub struct Link {
+    medium: LinkMedium,
+    rx: Box<[u8]>,
+    pending: Option<usize>,
+    tx: Box<[u8]>,
+    port: Option<Box<EtherPort>>,
+    promiscuous: bool,
 }
 
-impl NicBackend {
-    pub fn receive(&self, buffer: &mut [u8]) -> usize {
-        let mut nic = self.nic.lock();
-        nic.receive(buffer).unwrap_or(0)
-    }
-
-    fn transmit(&self, bytes: &[u8]) -> bool {
-        let mut nic = self.nic.lock();
-        nic.transmit(bytes).is_ok()
-    }
+enum LinkMedium {
+    Ethernet(Box<E1000>),
+    Virtio(Box<VirtioNet>),
+    Loopback {
+        spare: Vec<Box<[u8]>>,
+        queue: VecDeque<(Box<[u8]>, usize)>,
+    },
 }
 
-impl NetBackend for NicBackend {
-    fn tx(&self, frame: &Frame) -> bool {
-        let mut out = Vec::with_capacity(14 + frame.payload.len());
-        out.extend_from_slice(&frame.dst);
-        out.extend_from_slice(&frame.src);
-        out.extend_from_slice(&frame.ethertype.to_be_bytes());
-        out.extend_from_slice(&frame.payload);
-        self.transmit(&out)
-    }
-
-    fn dispatch_rx(&self, frame: Frame) {
-        // The synchronous TCP path polls the receive ring directly.  This
-        // hook exists so the backend remains a valid `NetBackend`.
-        let _ = frame;
-    }
-}
-
-static NIC: Spinlock<Option<Arc<NicBackend>>> = Spinlock::new(None);
-
-fn backend() -> Option<Arc<NicBackend>> {
-    NIC.lock().clone()
-}
-
-fn local_mac() -> [u8; 6] {
-    backend().map(|b| b.mac).unwrap_or([0; 6])
-}
-
-// ============================================================================
-// ARP
-// ============================================================================
-
-static ARP: Spinlock<Vec<([u8; 4], [u8; 6])>> = Spinlock::new(Vec::new());
-
-fn arp_get(ip: [u8; 4]) -> Option<[u8; 6]> {
-    let table = ARP.lock();
-    for (addr, mac) in table.iter() {
-        if *addr == ip {
-            return Some(*mac);
-        }
-    }
-    None
-}
-
-fn arp_set(ip: [u8; 4], mac: [u8; 6]) {
-    let mut table = ARP.lock();
-    if let Some(e) = table.iter_mut().find(|(a, _)| *a == ip) {
-        e.1 = mac;
-    } else {
-        table.push((ip, mac));
-    }
-}
-
-fn send_eth(dst: [u8; 6], src: [u8; 6], ethertype: u16, payload: &[u8]) -> bool {
-    try_tx(&Frame {
-        dst,
-        src,
-        ethertype,
-        payload: payload.to_vec(),
-    })
-}
-
-fn send_arp_request() -> bool {
-    let src = local_mac();
-    let mut p = vec![0u8; 28];
-    p[0..2].copy_from_slice(&1u16.to_be_bytes());          // Ethernet
-    p[2..4].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes()); // IPv4 protocol
-    p[4] = 6;
-    p[5] = 4;
-    p[6..8].copy_from_slice(&1u16.to_be_bytes());          // request
-    p[8..14].copy_from_slice(&src);
-    p[14..18].copy_from_slice(&LOCAL_IP);
-    // target MAC is zero
-    p[24..28].copy_from_slice(&GATEWAY_IP);
-    send_eth([0xff; 6], src, ETHERTYPE_ARP, &p)
-}
-
-fn ensure_arp(ip: [u8; 4]) -> Option<[u8; 6]> {
-    if let Some(m) = arp_get(ip) {
-        return Some(m);
-    }
-    if backend().is_none() {
-        return None;
-    }
-    send_arp_request();
-    // Poll for an ARP reply.  The gateway normally answers immediately.
-    for _ in 0..3000 {
-        if let Some(bytes) = poll_frame() {
-            handle_frame(&bytes);
-            if let Some(m) = arp_get(ip) {
-                return Some(m);
-            }
-        }
-    }
-    None
-}
-
-fn handle_arp(payload: &[u8]) {
-    if payload.len() < 28 {
-        return;
-    }
-    let op = be16(&payload[6..8]);
-    let sender_mac = [
-        payload[8], payload[9], payload[10], payload[11], payload[12], payload[13],
-    ];
-    let sender_ip = [payload[14], payload[15], payload[16], payload[17]];
-    let target_ip = [payload[24], payload[25], payload[26], payload[27]];
-
-    if op == 2 {
-        arp_set(sender_ip, sender_mac);
-    } else if op == 1 && target_ip == LOCAL_IP {
-        // Reply to a local ARP request.
-        let src = local_mac();
-        let mut p = vec![0u8; 28];
-        p[0..2].copy_from_slice(&1u16.to_be_bytes());
-        p[2..4].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
-        p[4] = 6;
-        p[5] = 4;
-        p[6..8].copy_from_slice(&2u16.to_be_bytes());
-        p[8..14].copy_from_slice(&src);
-        p[14..18].copy_from_slice(&LOCAL_IP);
-        p[18..24].copy_from_slice(&sender_mac);
-        p[24..28].copy_from_slice(&sender_ip);
-        send_eth(sender_mac, src, ETHERTYPE_ARP, &p);
-    }
-}
-
-// ============================================================================
-// TCP connection state
-// ============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TcpConnState {
-    Closed,
-    SynSent,
-    Established,
-    FinWait1,
-    TimeWait,
-}
-
-#[derive(Debug, Clone)]
-struct TcpConn {
-    id: u32,
-    local_port: u16,
-    remote_ip: [u8; 4],
-    remote_port: u16,
-    state: TcpConnState,
-    seq: u32,
-    ack: u32,
-    rx: Vec<u8>,
-}
-
-static CONNS: Spinlock<Vec<TcpConn>> = Spinlock::new(Vec::new());
-
-fn find_conn(id: u32) -> Option<TcpConn> {
-    CONNS.lock().iter().find(|c| c.id == id).cloned()
-}
-
-fn find_conn_mut<F: FnOnce(&mut TcpConn)>(id: u32, f: F) -> bool {
-    let mut g = CONNS.lock();
-    if let Some(c) = g.iter_mut().find(|c| c.id == id) {
-        f(c);
-        true
-    } else {
-        false
-    }
-}
-
-pub fn tcp_open(id: u32) {
-    let mut g = CONNS.lock();
-    if !g.iter().any(|c| c.id == id) {
-        g.push(TcpConn {
-            id,
-            local_port: 40000 + (id % 1000) as u16,
-            remote_ip: [0, 0, 0, 0],
-            remote_port: 0,
-            state: TcpConnState::Closed,
-            seq: 0,
-            ack: 0,
-            rx: Vec::new(),
-        });
-    }
-}
-
-pub fn tcp_is_established(id: u32) -> bool {
-    find_conn(id).map(|c| c.state == TcpConnState::Established).unwrap_or(false)
-}
-
-pub fn tcp_state(id: u32) -> Option<TcpConnState> {
-    find_conn(id).map(|c| c.state)
-}
-
-pub fn tcp_connect(id: u32, remote_ip: [u8; 4], remote_port: u16) -> bool {
-    if tcp_is_established(id) {
-        return true;
-    }
-
-    // Record the endpoint before polling so incoming SYN-ACK can match it.
-    let (local_port, seq) = {
-        let mut g = CONNS.lock();
-        let c = match g.iter_mut().find(|c| c.id == id) {
-            Some(c) => c,
-            None => return false,
+fn dma_pages<const COUNT: usize>() -> Option<[PhysAddr; COUNT]> {
+    let mut pages = [PhysAddr::new(0); COUNT];
+    for index in 0..COUNT {
+        let Some(page) = crate::frame_alloc::frame_alloc_zeroed() else {
+            free_pages(&pages[..index]);
+            return None;
         };
-        c.remote_ip = remote_ip;
-        c.remote_port = remote_port;
-        let s = (0x1234_5678u32 ^ id) ^ ((remote_port as u32) << 16);
-        c.seq = s;
-        c.ack = 0;
-        c.state = TcpConnState::SynSent;
-        (c.local_port, s)
-    };
-
-    let dst_mac = match ensure_arp(remote_ip) {
-        Some(m) => m,
-        None => return false,
-    };
-    let src_mac = local_mac();
-
-    let syn = build_ipv4_tcp(
-        LOCAL_IP,
-        remote_ip,
-        local_port,
-        remote_port,
-        seq,
-        0,
-        0x02, // SYN
-        &[],
-    );
-    if !send_eth(dst_mac, src_mac, ETHERTYPE_IPV4, &syn) {
-        return false;
+        pages[index] = page;
     }
-
-    for _ in 0..6000 {
-        if let Some(bytes) = poll_frame() {
-            handle_frame(&bytes);
-            if tcp_is_established(id) {
-                return true;
-            }
-        }
-        // Give the emulated NIC and the host network stack time to deliver
-        // the reply.  A tight polling loop can finish before QEMU processes
-        // the incoming frame.
-        poll_delay();
-    }
-
-    return false;
+    Some(pages)
 }
 
-pub fn tcp_write(id: u32, data: &[u8]) -> usize {
-    let conn = match find_conn(id) {
-        Some(c) if c.state == TcpConnState::Established => c,
-        _ => return 0,
-    };
-    let dst_mac = match arp_get(conn.remote_ip) {
-        Some(m) => m,
-        None => return 0,
-    };
-    let src_mac = local_mac();
-
-    let mut sent = 0usize;
-    while sent < data.len() {
-        let chunk = &data[sent..core::cmp::min(data.len(), sent + 1460)];
-        let packet = build_ipv4_tcp(
-            LOCAL_IP,
-            conn.remote_ip,
-            conn.local_port,
-            conn.remote_port,
-            conn.seq,
-            conn.ack,
-            0x18, // PSH | ACK
-            chunk,
-        );
-        if !send_eth(dst_mac, src_mac, ETHERTYPE_IPV4, &packet) {
-            return sent;
-        }
-        let next_seq = conn.seq.wrapping_add(chunk.len() as u32);
-        find_conn_mut(id, |c| {
-            c.seq = next_seq;
-        });
-        sent += chunk.len();
+fn free_pages(pages: &[PhysAddr]) {
+    for page in pages {
+        let _ = crate::vm::free_frame(*page);
     }
-    sent
 }
 
-pub fn tcp_read(id: u32, buf: &mut [u8]) -> usize {
-    for _ in 0..5000 {
-        if let Some(bytes) = poll_frame() {
-            handle_frame(&bytes);
-        }
-        let conn = match find_conn(id) {
-            Some(c) => c,
-            None => return 0,
+fn virtio_mmio(base: u64, length: u32) -> Option<u64> {
+    if length == 0 { return None; }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let address = unsafe { crate::vm::map_phys_range(base, u64::from(length)) };
+        (!address.is_null()).then_some(address as u64)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (base + u64::from(length) <= (4u64 << 30)).then(|| pci::mmio_address(base))
+    }
+}
+
+impl Link {
+    fn new(medium: LinkMedium) -> Self {
+        let port = match &medium {
+            LinkMedium::Ethernet(nic) => Some(EtherPort::new(nic.mac_address())),
+            LinkMedium::Virtio(nic) => Some(EtherPort::new(nic.mac_address())),
+            LinkMedium::Loopback { .. } => None,
         };
-        if conn.state == TcpConnState::Closed {
-            return 0;
-        }
-        if !conn.rx.is_empty() {
-            let n = core::cmp::min(buf.len(), conn.rx.len());
-            buf[..n].copy_from_slice(&conn.rx[..n]);
-            find_conn_mut(id, |c| {
-                c.rx.drain(0..n);
-            });
-            return n;
-        }
-        poll_delay();
-    }
-    0
-}
-
-pub fn tcp_close(id: u32) {
-    let conn = match find_conn(id) {
-        Some(c) => c,
-        None => return,
-    };
-    if conn.state == TcpConnState::Established {
-        if let Some(dst_mac) = arp_get(conn.remote_ip) {
-            let src_mac = local_mac();
-            let fin = build_ipv4_tcp(
-                LOCAL_IP,
-                conn.remote_ip,
-                conn.local_port,
-                conn.remote_port,
-                conn.seq,
-                conn.ack,
-                0x11, // FIN | ACK
-                &[],
-            );
-            send_eth(dst_mac, src_mac, ETHERTYPE_IPV4, &fin);
-        }
-    }
-    find_conn_mut(id, |c| {
-        c.state = TcpConnState::Closed;
-        c.rx.clear();
-    });
-}
-
-// ============================================================================
-// Frame handling
-// ============================================================================
-
-fn poll_frame() -> Option<Vec<u8>> {
-    let b = backend()?;
-    let mut buf = [0u8; MAX_FRAME];
-    let n = b.receive(&mut buf);
-    if n > 0 {
-        Some(buf[..n].to_vec())
-    } else {
-        None
-    }
-}
-
-/// Short busy wait between synchronous NIC polls.  The NIC is polled without
-/// interrupts, so the guest must yield enough real time for QEMU to deliver
-/// the next frame.
-fn poll_delay() {
-    for _ in 0..20_000 {
-        core::hint::spin_loop();
-    }
-}
-
-fn handle_frame(bytes: &[u8]) {
-    if bytes.len() < 14 {
-        return;
-    }
-    let ethertype = be16(&bytes[12..14]);
-    let payload = &bytes[14..];
-
-    if ethertype == ETHERTYPE_ARP {
-        handle_arp(payload);
-    } else if ethertype == ETHERTYPE_IPV4 {
-        handle_ipv4(payload);
-    }
-}
-
-fn handle_ipv4(payload: &[u8]) {
-    if payload.len() < IPV4_HEADER_LEN {
-        return;
-    }
-    let ihl = ((payload[0] & 0x0F) as usize) * 4;
-    if ihl < IPV4_HEADER_LEN || payload.len() < ihl {
-        return;
-    }
-    let total = be16(&payload[2..4]) as usize;
-    let proto = payload[9];
-    if proto != 6 || total < ihl + TCP_HEADER_LEN || total > payload.len() {
-        return;
-    }
-
-    let src_ip = [payload[12], payload[13], payload[14], payload[15]];
-    let dst_ip = [payload[16], payload[17], payload[18], payload[19]];
-
-    let tcp = &payload[ihl..total];
-    let src_port = be16(&tcp[0..2]);
-    let dst_port = be16(&tcp[2..4]);
-    let seq = be32(&tcp[4..8]);
-    let ack = be32(&tcp[8..12]);
-    let offset = ((tcp[12] >> 4) as usize) * 4;
-    let flags = tcp[13];
-    if offset < TCP_HEADER_LEN || offset > tcp.len() {
-        return;
-    }
-    let body = &tcp[offset..];
-
-    let mut send_ack = false;
-    let mut new_state = None;
-    let mut conn_seq = 0u32;
-    let mut conn_ack = 0u32;
-    let mut conn_local_port = 0u16;
-
-    let mut g = CONNS.lock();
-    if let Some(c) = g.iter_mut().find(|c| {
-        c.remote_ip == src_ip && c.remote_port == src_port && c.local_port == dst_port
-    }) {
-        conn_local_port = c.local_port;
-
-        if c.state == TcpConnState::SynSent && (flags & 0x02) != 0 && (flags & 0x10) != 0 {
-            // SYN-ACK: local SYN consumed one sequence number.
-            c.ack = seq.wrapping_add(1);
-            c.seq = c.seq.wrapping_add(1);
-            c.state = TcpConnState::Established;
-            new_state = Some(c.state);
-            conn_seq = c.seq;
-            conn_ack = c.ack;
-            send_ack = true;
-        } else if c.state == TcpConnState::Established {
-            if !body.is_empty() {
-                c.rx.extend_from_slice(body);
-                c.ack = seq.wrapping_add(body.len() as u32);
-            }
-            conn_seq = c.seq;
-            conn_ack = c.ack;
-            if (flags & 0x01) != 0 {
-                c.state = TcpConnState::FinWait1;
-                new_state = Some(c.state);
-            }
-        }
-    }
-    drop(g);
-
-    if send_ack {
-        if let Some(dst_mac) = arp_get(src_ip) {
-            let src_mac = local_mac();
-            let packet = build_ipv4_tcp(
-                LOCAL_IP,
-                src_ip,
-                conn_local_port,
-                src_port,
-                conn_seq,
-                conn_ack,
-                0x10, // ACK
-                &[],
-            );
-            send_eth(dst_mac, src_mac, ETHERTYPE_IPV4, &packet);
+        Self {
+            medium,
+            rx: alloc::vec![0; FRAME_SIZE].into_boxed_slice(),
+            pending: None,
+            tx: alloc::vec![0; FRAME_SIZE].into_boxed_slice(),
+            port,
+            promiscuous: false,
         }
     }
 
-    let _ = (dst_ip, new_state, ack);
-}
-
-// ============================================================================
-// Packet construction
-// ============================================================================
-
-fn build_ipv4_tcp(
-    src_ip: [u8; 4],
-    dst_ip: [u8; 4],
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    payload: &[u8],
-) -> Vec<u8> {
-    let mut seg = vec![0u8; TCP_HEADER_LEN + payload.len()];
-    seg[0..2].copy_from_slice(&src_port.to_be_bytes());
-    seg[2..4].copy_from_slice(&dst_port.to_be_bytes());
-    seg[4..8].copy_from_slice(&seq.to_be_bytes());
-    seg[8..12].copy_from_slice(&ack.to_be_bytes());
-    let offset_flags = (5u16 << 12) | (flags as u16);
-    seg[12..14].copy_from_slice(&offset_flags.to_be_bytes());
-    seg[14..16].copy_from_slice(&65535u16.to_be_bytes());
-    // checksum field left zero for calculation
-    seg[16..18].copy_from_slice(&[0, 0]);
-    seg[18..20].copy_from_slice(&[0, 0]);
-    seg[TCP_HEADER_LEN..].copy_from_slice(payload);
-
-    let csum = tcp_checksum(src_ip, dst_ip, &seg);
-    seg[16..18].copy_from_slice(&csum.to_be_bytes());
-
-    let mut ip = vec![0u8; IPV4_HEADER_LEN + seg.len()];
-    ip[0] = 0x45; // IPv4, 20-byte header
-    ip[1] = 0;
-    let total = (IPV4_HEADER_LEN + seg.len()) as u16;
-    ip[2..4].copy_from_slice(&total.to_be_bytes());
-    ip[4..6].copy_from_slice(&0u16.to_be_bytes());
-    ip[6..8].copy_from_slice(&0u16.to_be_bytes());
-    ip[8] = 64;
-    ip[9] = 6;
-    ip[12..16].copy_from_slice(&src_ip);
-    ip[16..20].copy_from_slice(&dst_ip);
-    let ip_csum = checksum16(&ip[..IPV4_HEADER_LEN]);
-    ip[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-    ip[IPV4_HEADER_LEN..].copy_from_slice(&seg);
-
-    ip
-}
-
-fn net_init() {
-    serial::put_bytes(b"[net] scanning for NIC\n");
-
-    let mut found: Option<(u64, u32, u32)> = None;
-    for d in crate::dev::pci_iter() {
-        if d.class_code != 0x02 {
-            continue;
-        }
-        let header = PciHeader::read(d.bus, d.dev, d.func);
-        for i in 0..6 {
-            let bar = header.read_bar(d.bus, d.dev, d.func, i);
-            if bar == 0 || (bar & 1) != 0 {
+    pub fn ethernet() -> Vec<([u8; 6], Self)> {
+        let mut links = Vec::new();
+        for device in crate::dev::pci_iter() {
+            if links.len() >= 4 { break; }
+            let (bus, slot, func) = (device.bus, device.dev, device.func);
+            if matches!((device.vendor_id, device.device_id), (0x1af4, 0x1041 | 0x1000)) {
+                let Some(pages) = dma_pages::<DMA_PAGES>() else { break; };
+                if let Some(nic) = unsafe { VirtioNet::attach(bus, slot, func, pages, virtio_mmio) } {
+                    crate::serial::put_bytes(b"[net] virtio-net registered\n");
+                    links.push((nic.mac_address(), Self::new(LinkMedium::Virtio(Box::new(nic)))));
+                } else {
+                    free_pages(&pages);
+                }
                 continue;
             }
-            let addr = bar & !0xFu32;
-            if addr != 0 && addr != 0xFFFF_FFFF {
-                found = Some((addr as u64, d.vendor_id as u32, d.device_id as u32));
+            if (device.vendor_id, device.device_id) != (0x8086, 0x100e) {
+                continue;
+            }
+            let header = pci::PciHeader::read(bus, slot, func);
+            let bar = header.read_bar(bus, slot, func, 0);
+            if bar == u32::MAX || bar & 1 != 0 || bar & 6 != 0 || bar & !15 == 0 {
+                continue;
+            }
+
+            let register = pci::PciConfigAddr::new(bus, slot, func, 4);
+            let command = u32::from(header.command);
+            pci::pci_config_write(register, (command | 2) & !4);
+            let Some(pages) = dma_pages::<19>() else {
+                pci::pci_config_write(register, command);
                 break;
+            };
+
+            let mut nic = Box::new(E1000::new(PhysAddr::new(u64::from(bar & !15))));
+            nic.stop();
+            let mut receive = [PhysAddr::new(0); 16];
+            receive.copy_from_slice(&pages[3..]);
+            if unsafe { nic.init_dma(pages[0], pages[1], pages[2], receive) }.is_err()
+                || nic.init().is_err()
+            {
+                nic.stop();
+                free_pages(&pages);
+                pci::pci_config_write(register, command);
+                continue;
             }
+            pci::pci_config_write(register, command | 6);
+            crate::serial::put_bytes(b"[net] e1000 registered\n");
+            links.push((nic.mac_address(), Self::new(LinkMedium::Ethernet(nic))));
         }
-        if found.is_some() {
-            break;
-        }
+        links
     }
 
-    let (base, vendor, device) = match found {
-        Some(v) => v,
-        None => {
-            serial::put_bytes(b"[net] no PCI NIC found; installing loopback backend\n");
-            plan9_net::netstack::install_default_backend();
-            return;
-        }
-    };
+    pub fn loopback() -> Self {
+        Self::new(LinkMedium::Loopback {
+            spare: (0..LOOP_CAPACITY)
+                .map(|_| alloc::vec![0; FRAME_SIZE].into_boxed_slice())
+                .collect(),
+            queue: VecDeque::with_capacity(LOOP_CAPACITY),
+        })
+    }
 
-    serial::put_bytes(b"[net] NIC vendor=");
-    serial::put_hex_u32(vendor);
-    serial::put_bytes(b" device=");
-    serial::put_hex_u32(device);
-    serial::put_bytes(b" base=");
-    serial::put_hex_u64(base);
-    serial::put_bytes(b"\n");
+    pub fn port(&mut self) -> Result<&mut EtherPort, Error> {
+        self.port.as_deref_mut().ok_or(Error::Enoent)
+    }
 
-    let tx_desc = match crate::frame_alloc::frame_alloc_zeroed() {
-        Some(p) => p,
-        None => {
-            serial::put_bytes(b"[net] no DMA frame for TX descriptors\n");
-            plan9_net::netstack::install_default_backend();
-            return;
-        }
-    };
-    let rx_desc = match crate::frame_alloc::frame_alloc_zeroed() {
-        Some(p) => p,
-        None => {
-            serial::put_bytes(b"[net] no DMA frame for RX descriptors\n");
-            plan9_net::netstack::install_default_backend();
-            return;
-        }
-    };
-    let tx_buf = match crate::frame_alloc::frame_alloc_zeroed() {
-        Some(p) => p,
-        None => {
-            serial::put_bytes(b"[net] no DMA frame for TX buffer\n");
-            plan9_net::netstack::install_default_backend();
-            return;
-        }
-    };
+    pub fn driver_stats(&self) -> Result<alloc::string::String, Error> {
+        Ok(match &self.medium {
+            LinkMedium::Ethernet(nic) => alloc::format!("driver: e1000\nlink: {}\nstatus: {:08x}\n", nic.link_up(), nic.status()),
+            LinkMedium::Virtio(_) => alloc::string::String::from("driver: virtio-net\ntransport: modern-pci\n"),
+            _ => return Err(Error::Enoent),
+        })
+    }
 
-    let mut rx_buffers = [PhysAddr::new(0); 16];
-    for i in 0..16 {
-        match crate::frame_alloc::frame_alloc_zeroed() {
-            Some(p) => rx_buffers[i] = p,
-            None => {
-                serial::put_bytes(b"[net] no DMA frame for RX buffer\n");
-                plan9_net::netstack::install_default_backend();
-                return;
+    pub fn update_promiscuous(&mut self) {
+        if let (Some(port), LinkMedium::Ethernet(nic)) = (&mut self.port, &mut self.medium) {
+            port.reap();
+            let enabled = port.wants_promiscuous();
+            if enabled != self.promiscuous {
+                nic.set_promiscuous(enabled);
+                self.promiscuous = enabled;
             }
         }
     }
 
-    let mut nic = E1000::new(PhysAddr::new(base));
-    nic.tx_size = 64;
-    nic.rx_size = 16;
-    if let Err(_e) = nic.init_dma(tx_desc, rx_desc, tx_buf, rx_buffers) {
-        serial::put_bytes(b"[net] E1000 DMA setup failed\n");
-        plan9_net::netstack::install_default_backend();
-        return;
-    }
-    if let Err(_e) = nic.init() {
-        serial::put_bytes(b"[net] E1000 init failed\n");
-        plan9_net::netstack::install_default_backend();
-        return;
+    pub fn raw_promiscuous(&mut self, tap: usize, enabled: bool) -> Result<(), Error> {
+        if !matches!(self.medium, LinkMedium::Ethernet(_)) { return Err(Error::Enotsup); }
+        self.port()?.promiscuous(tap, enabled)?;
+        self.update_promiscuous();
+        Ok(())
     }
 
-    let mac = nic.mac_address();
-    let link = nic.link_up();
-    serial::put_bytes(b"[net] mac=");
-    for b in mac.iter() {
-        serial::put_hex_u32(*b as u32);
-        serial::put_bytes(b":");
+    pub fn drain_ethernet(&mut self) {
+        self.update_promiscuous();
+        for _ in 0..16 {
+            if self.receive_packet().is_err() { break; }
+        }
     }
-    serial::put_bytes(b" link=");
-    serial::put_hex_u32(if link { 1 } else { 0 });
-    serial::put_bytes(b"\n");
 
-    let backend = Arc::new(NicBackend {
-        nic: Spinlock::new(nic),
-        mac,
-    });
-    *NIC.lock() = Some(backend.clone());
-    set_backend(backend);
-    serial::put_bytes(b"[net] E1000 registered with plan9_net::netstack\n");
-    serial::put_bytes(b"[net] local ip=");
-    serial::put_bytes(b"10.0.2.15\n");
+    pub fn stage_ingress(&mut self) -> bool {
+        self.update_promiscuous();
+        self.pending = self.next_frame();
+        self.pending.is_some()
+    }
+
+    pub fn staged_ip(&self) -> Option<&[u8]> {
+        let frame = &self.rx[..self.pending?];
+        if self.port.is_none() {
+            Some(frame)
+        } else if matches!((frame.get(12..14), frame.get(14).map(|byte| byte >> 4)),
+            (Some([0x08, 0x00]), Some(4)) | (Some([0x86, 0xdd]), Some(6)))
+        {
+            frame.get(14..)
+        } else {
+            None
+        }
+    }
+
+    pub fn staged_unicast(&self) -> bool {
+        self.port.as_deref().is_some_and(|port| self.rx[..6] == port.mac())
+    }
+
+    pub fn discard_ingress(&mut self) {
+        self.pending = None;
+    }
+
+    pub fn forward_ip(&mut self, next_hop: IpAddress, bytes: &[u8], time: Instant) -> Option<bool> {
+        if bytes.len() > FRAME_SIZE - 14 { return Some(false); }
+        let port = self.port.as_deref()?;
+        let destination = port.neighbor(next_hop.into())?;
+        let source = port.mac();
+        if let Some(tx) = self.transmit(time) {
+            tx.consume(14 + bytes.len(), |frame| {
+                frame[..6].copy_from_slice(&destination);
+                frame[6..12].copy_from_slice(&source);
+                let ether_type = match next_hop {
+                    IpAddress::Ipv4(_) => [0x08, 0x00],
+                    IpAddress::Ipv6(_) => [0x86, 0xdd],
+                };
+                frame[12..14].copy_from_slice(&ether_type);
+                frame[14..].copy_from_slice(bytes);
+            });
+            Some(true)
+        } else {
+            Some(false)
+        }
+    }
+
+    pub fn request_arp(&mut self, source: Ipv4Addr, target: Ipv4Addr, time: Instant) {
+        let Some(port) = self.port.as_deref() else { return; };
+        let mac = port.mac();
+        if let Some(tx) = self.transmit(time) {
+            tx.consume(42, |frame| {
+                frame[..6].fill(0xff);
+                frame[6..12].copy_from_slice(&mac);
+                frame[12..22].copy_from_slice(&[8, 6, 0, 1, 8, 0, 6, 4, 0, 1]);
+                frame[22..28].copy_from_slice(&mac);
+                frame[28..32].copy_from_slice(&source.octets());
+                frame[32..38].fill(0);
+                frame[38..42].copy_from_slice(&target.octets());
+            });
+        }
+    }
+
+    pub fn request_ndp(&mut self, source: Ipv6Addr, target: Ipv6Addr, time: Instant) {
+        let Some(port) = self.port.as_deref() else { return; };
+        let mac = port.mac();
+        let target_bytes = target.octets();
+        let destination = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 1, 0xff00 | u16::from(target_bytes[13]),
+            u16::from_be_bytes([target_bytes[14], target_bytes[15]]));
+        let message = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+            target_addr: target,
+            lladdr: Some(HardwareAddress::Ethernet(EthernetAddress(mac)).into()),
+        });
+        let header = Ipv6Repr {
+            src_addr: source,
+            dst_addr: destination,
+            next_header: IpProtocol::Icmpv6,
+            payload_len: message.buffer_len(),
+            hop_limit: 255,
+        };
+        if let Some(tx) = self.transmit(time) {
+            tx.consume(14 + header.buffer_len() + header.payload_len, |frame| {
+                frame[..6].copy_from_slice(&[0x33, 0x33, 0xff, target_bytes[13], target_bytes[14], target_bytes[15]]);
+                frame[6..12].copy_from_slice(&mac);
+                frame[12..14].copy_from_slice(&[0x86, 0xdd]);
+                let mut packet = Ipv6Packet::new_unchecked(&mut frame[14..]);
+                header.emit(&mut packet);
+                let mut payload = Icmpv6Packet::new_unchecked(packet.payload_mut());
+                message.emit(&source, &destination, &mut payload, &ChecksumCapabilities::default());
+            });
+        }
+    }
+
+    pub fn raw_write(&mut self, tap: usize, frame: &[u8], time: Instant) -> Result<Option<usize>, Error> {
+        if !(14..=FRAME_SIZE).contains(&frame.len()) { return Err(Error::Einval); }
+        let port = self.port()?;
+        port.reference(tap)?;
+        let mac = port.mac();
+        Ok(self.transmit(time).map(|mut tx| {
+            tx.3 = false;
+            tx.consume(frame.len(), |out| {
+            out.copy_from_slice(frame);
+            out[6..12].copy_from_slice(&mac);
+            frame.len()
+            })
+        }))
+    }
 }
 
-/// Public init hook called once from `entry::kstart`.
-pub fn init() {
-    net_init();
+pub struct Receive<'a>(&'a [u8]);
+
+impl RxToken for Receive<'_> {
+    fn consume<R, F: FnOnce(&[u8]) -> R>(self, consume: F) -> R {
+        consume(self.0)
+    }
 }
 
-pub fn is_ready() -> bool {
-    NIC.lock().is_some()
+pub struct Transmit<'a>(&'a mut LinkMedium, &'a mut [u8], Option<&'a mut EtherPort>, bool);
+
+impl TxToken for Transmit<'_> {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(mut self, length: usize, produce: F) -> R {
+        let packet = &mut self.1[..length];
+        let result = produce(packet);
+        if self.3 && self.2.as_deref_mut().is_some_and(|port| port.answer_arp(packet)) {
+            return result;
+        }
+        let sent = match self.0 {
+            LinkMedium::Ethernet(nic) => nic.transmit(packet).is_ok(),
+            LinkMedium::Virtio(nic) => nic.transmit(packet).is_ok(),
+            LinkMedium::Loopback { spare, queue } => {
+                if let Some(mut frame) = spare.pop() {
+                    frame[..length].copy_from_slice(packet);
+                    queue.push_back((frame, length));
+                }
+                false
+            }
+        };
+        if sent {
+            if let Some(port) = self.2 { port.observe(packet, false); }
+        }
+        result
+    }
 }
 
-// ============================================================================
-// Byte helpers
-// ============================================================================
+impl Device for Link {
+    type RxToken<'a> = Receive<'a>;
+    type TxToken<'a> = Transmit<'a>;
 
-fn be16(b: &[u8]) -> u16 {
-    ((b[0] as u16) << 8) | b[1] as u16
+    fn receive(&mut self, _time: Instant) -> Option<(Receive<'_>, Transmit<'_>)> {
+        self.update_promiscuous();
+        let length = self.pending.take().or_else(|| self.next_frame())?;
+        Some((
+            Receive(&self.rx[..length]),
+            Transmit(&mut self.medium, &mut self.tx, self.port.as_deref_mut(), true),
+        ))
+    }
+
+    fn transmit(&mut self, _time: Instant) -> Option<Transmit<'_>> {
+        let ready = match &mut self.medium {
+            LinkMedium::Ethernet(nic) => nic.tx_ready(),
+            LinkMedium::Virtio(nic) => nic.tx_ready(),
+            LinkMedium::Loopback { spare, .. } => !spare.is_empty(),
+        };
+        ready.then_some(Transmit(&mut self.medium, &mut self.tx, self.port.as_deref_mut(), true))
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.medium = if self.port.is_some() { Medium::Ethernet } else { Medium::Ip };
+        caps.max_transmission_unit = if caps.medium == Medium::Ethernet { FRAME_SIZE } else { 1500 };
+        caps.max_burst_size = Some(16);
+        caps
+    }
 }
 
-fn be32(b: &[u8]) -> u32 {
-    ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | b[3] as u32
-}
+impl Link {
+    fn next_frame(&mut self) -> Option<usize> {
+        for _ in 0..16 {
+            if let Some(length) = self.receive_packet().ok()? {
+                return Some(length);
+            }
+        }
+        None
+    }
 
-fn checksum16(data: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    let mut i = 0;
-    while i + 1 < data.len() {
-        sum += ((data[i] as u32) << 8) | data[i + 1] as u32;
-        i += 2;
+    fn receive_packet(&mut self) -> Result<Option<usize>, ()> {
+        if let Some(reply) = self.port.as_deref_mut().and_then(EtherPort::local_arp_reply) {
+            self.rx[..reply.len()].copy_from_slice(&reply);
+            return Ok(Some(reply.len()));
+        }
+        let length = match &mut self.medium {
+            LinkMedium::Ethernet(nic) => {
+                if !nic.tx_ready() {
+                    return Err(());
+                }
+                let length = nic.receive(&mut self.rx).map_err(|_| ())?;
+                if length == 0 {
+                    return Err(());
+                }
+                length
+            }
+            LinkMedium::Virtio(nic) => {
+                if !nic.tx_ready() { return Err(()); }
+                let length = nic.receive(&mut self.rx).map_err(|_| ())?;
+                if length == 0 { return Err(()); }
+                length
+            }
+            LinkMedium::Loopback { spare, queue } => {
+                let (frame, length) = queue.pop_front().ok_or(())?;
+                self.rx[..length].copy_from_slice(&frame[..length]);
+                spare.push(frame);
+                length
+            }
+        };
+        if let Some(port) = self.port.as_deref_mut() {
+            if !port.observe(&self.rx[..length], true) {
+                return Ok(None);
+            }
+            port.enforce_arp(&mut self.rx[..length]);
+        }
+        Ok(Some(length))
     }
-    if i < data.len() {
-        sum += (data[i] as u32) << 8;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-fn tcp_checksum(src: [u8; 4], dst: [u8; 4], seg: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    sum += ((src[0] as u32) << 8) | src[1] as u32;
-    sum += ((src[2] as u32) << 8) | src[3] as u32;
-    sum += ((dst[0] as u32) << 8) | dst[1] as u32;
-    sum += ((dst[2] as u32) << 8) | dst[3] as u32;
-    sum += 6;
-    sum += seg.len() as u32;
-    let mut i = 0;
-    while i + 1 < seg.len() {
-        sum += ((seg[i] as u32) << 8) | seg[i + 1] as u32;
-        i += 2;
-    }
-    if i < seg.len() {
-        sum += (seg[i] as u32) << 8;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
 }

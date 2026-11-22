@@ -3,6 +3,7 @@
 
 [target.x86_64-unknown-none]
 runner = "none"
+rustflags = ["--cfg", "aes_force_soft"]
 
 # PIC codegen for riscv64/loongarch64 user programs (plan9-cmd).  The default
 # codegen emits absolute 8-byte jump-table entries in .rodata, which dangle

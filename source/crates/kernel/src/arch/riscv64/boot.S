@@ -25,9 +25,8 @@ _start:
 
     /* The firmware may leave S-mode interrupt sources enabled (EDK2 sets
      * SSIE/STIE/SEIE in `sie` and can leave a timer armed, so STIP stays
-     * pending).  The kernel runs with interrupts off everywhere and has
-     * no interrupt handlers, so clear every source enable before anything
-     * can deliver into the user trap entry. */
+     * pending). Clear the firmware's enables. The kernel arms and enables
+     * its supervisor timer after the scheduler is initialized. */
     li      t0, -1
     csrc    sie, t0
 
@@ -68,7 +67,7 @@ hang:
  *   [ 0..32]  x0..x31   (a0..a5 = [10..15]; syscall number in a7 = [17];
  *                        x2 = [2] holds the user sp)
  *   [32]      sepc
- *   [33]      sstatus   (as trapped: SPP=1, SIE=0; boot.S clears SPP/SPIE
+ *   [33]      sstatus   (as trapped: SPP=0, SIE=0; boot.S clears SPP/SPIE
  *                        on the way back out)
  *
  * Interrupts are kept off everywhere (USER_SSTATUS_INIT clears SPIE), so

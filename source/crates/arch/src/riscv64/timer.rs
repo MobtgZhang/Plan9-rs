@@ -30,19 +30,9 @@ pub fn frequency() -> u64 {
     if f != 0 { f } else { DEFAULT_TIMEBASE }
 }
 
-/// Initialise the timer: install the default timebase and enable the
-/// supervisor timer interrupt source.
+/// Install the default timebase until the device tree is available.
 pub fn init_timer() {
     TIMEBASE.store(DEFAULT_TIMEBASE, Ordering::Relaxed);
-    // riscv64 runs without interrupt handlers (the trap entry only routes
-    // user `ecall`s), and with Sstc a zero `stimecmp` leaves STIP pending
-    // forever — QEMU then delivers a supervisor timer interrupt the moment
-    // user mode starts.  Keep every interrupt source disabled here; the
-    // boot entry clears `sie` for the firmware's leftovers as well.
-    #[cfg(not(target_arch = "riscv64"))]
-    unsafe {
-        super::cpu::enable_timer_interrupts();
-    }
 }
 
 /// Read the raw `time` counter.

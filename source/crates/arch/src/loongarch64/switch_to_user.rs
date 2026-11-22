@@ -27,10 +27,8 @@ extern "C" {
     static _user_trap_area: u8;
 }
 
-/// Initial PRMD for user entry: PPLV = 0b11 (PLV3), PIE = 0.  The
-/// kernel is interrupt-free, so user code runs with CRMD.IE clear too —
-/// the trap entry re-clears PIE on the way back out regardless.
-pub const USER_PRMD_INIT: u64 = 0b11;
+/// Initial PRMD for user entry: PPLV = 0b11 (PLV3), PIE = 1.
+pub const USER_PRMD_INIT: u64 = 0b111;
 
 /// Selectors kept for API parity with the x86_64 module (LoongArch has
 /// no segment selectors; these are informational only).
@@ -133,7 +131,6 @@ pub unsafe fn kernel_resume_user(frame_ptr: u64, pml4_phys: u64) -> ! {
         "ld.d $r9,  $r12, 64",
         "ld.d $r10, $r12, 72",
         "ld.d $r11, $r12, 80",
-        "ld.d $r13, $r12, 96",
         "ld.d $r14, $r12, 104",
         "ld.d $r15, $r12, 112",
         "ld.d $r16, $r12, 120",
@@ -152,11 +149,12 @@ pub unsafe fn kernel_resume_user(frame_ptr: u64, pml4_phys: u64) -> ! {
         "ld.d $r29, $r12, 224",
         "ld.d $r30, $r12, 232",
         "ld.d $r31, $r12, 240",
-        // ERA and PRMD via $t1 ($r13, already reloaded).
+        // ERA and PRMD via $t1 ($r13), then restore the user value.
         "ld.d $r13, $r12, 248",
         "csrwr $r13, 0x6",
         "ld.d $r13, $r12, 256",
         "csrwr $r13, 0x1",
+        "ld.d $r13, $r12, 96",
         // Finally the frame base register itself, then return.
         "ld.d $r12, $r12, 88",
         "ertn",

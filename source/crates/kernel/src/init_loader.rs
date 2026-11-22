@@ -338,10 +338,56 @@ pub fn load_init(boot: &BootInfo) -> Option<InitImage> {
 
 /// Mapping cache so we don't re-allocate page tables between the user
 /// half and the kernel half. Keyed by (pml4_phys, virt_addr).
-static TABLE_CACHE: Spinlock<Vec<u64>> = Spinlock::new(Vec::new());
+static ADDRESS_SPACES: Spinlock<alloc::collections::BTreeMap<u64, OwnedMappings>> =
+    Spinlock::new(alloc::collections::BTreeMap::new());
 
-pub unsafe fn alloc_pte_page(_pml4: PhysAddr) -> Option<u64> {
-    frame_alloc::frame_alloc_zeroed().map(|p| p.as_u64())
+#[derive(Default)]
+struct OwnedMappings {
+    tables: Vec<PhysAddr>,
+    pages: alloc::collections::BTreeMap<(u64, usize), PhysAddr>,
+}
+
+unsafe fn alloc_pte_page(root: PhysAddr) -> Option<u64> {
+    let page = frame_alloc::frame_alloc_zeroed()?;
+    ADDRESS_SPACES.lock().entry(root.as_u64()).or_default().tables.push(page);
+    Some(page.as_u64())
+}
+
+unsafe fn map_owned_page(root: PhysAddr, table: u64, index: usize, address: u64, entry: u64) {
+    let previous = ADDRESS_SPACES.lock().entry(root.as_u64()).or_default()
+        .pages.insert((table, index), PhysAddr::new(address));
+    write_pte(table, index, entry);
+    if let Some(previous) = previous.filter(|previous| previous.as_u64() != address) {
+        crate::plan9_arch::hal::mmu::flush_tlb();
+        let _ = crate::vm::free_frame(previous);
+    }
+}
+
+pub(crate) fn clear_user_mappings(root: PhysAddr) {
+    let pages = ADDRESS_SPACES.lock().get_mut(&root.as_u64())
+        .map(|space| core::mem::take(&mut space.pages));
+    if let Some(pages) = pages {
+        for &(table, index) in pages.keys() {
+            unsafe { write_pte(table, index, 0) };
+        }
+        crate::plan9_arch::hal::mmu::flush_tlb();
+        for page in pages.into_values() {
+            let _ = crate::vm::free_frame(page);
+        }
+    }
+}
+
+pub(crate) fn release_user_root(root: PhysAddr) {
+    if root.as_u64() == 0 {
+        return;
+    }
+    let mappings = ADDRESS_SPACES.lock().remove(&root.as_u64());
+    if let Some(mappings) = mappings {
+        for page in mappings.pages.into_values().chain(mappings.tables) {
+            let _ = crate::vm::free_frame(page);
+        }
+    }
+    let _ = crate::vm::free_frame(root);
 }
 
 fn virt_indices(vaddr: u64) -> (usize, usize, usize, usize) {
@@ -409,9 +455,7 @@ pub unsafe fn map_user_page(
     };
 
     let leaf_val = paddr | leaf_flags(flags);
-    write_pte(pt_phys, i1, leaf_val);
-    let mut cache = TABLE_CACHE.lock();
-    cache.push(pt_phys);
+    map_owned_page(pml4, pt_phys, i1, paddr, leaf_val);
     Some(())
 }
 
@@ -455,9 +499,7 @@ pub unsafe fn map_user_page(
         new
     };
 
-    write_pte(leaf_phys, leaf_idx, ((paddr >> 12) << 10) | leaf_flags(flags));
-    let mut cache = TABLE_CACHE.lock();
-    cache.push(leaf_phys);
+    map_owned_page(pml4, leaf_phys, leaf_idx, paddr, ((paddr >> 12) << 10) | leaf_flags(flags));
     Some(())
 }
 

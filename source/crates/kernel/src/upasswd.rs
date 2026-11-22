@@ -94,9 +94,10 @@ fn read_file(path: &str) -> Vec<u8> {
 
 /// Create (truncating) an identity file and write `data`.
 fn write_file(path: &str, data: &[u8]) -> bool {
+    let perm = if matches!(path, PASSWD_PATH | GROUP_PATH) { 0o644 } else { 0o600 };
     let mut chan = match crate::vfs::namec(
         path.as_bytes(),
-        crate::vfs::NamecMode::Create(1, 0o600),
+        crate::vfs::NamecMode::Create(1, perm),
         0,
         0,
     ) {
@@ -662,8 +663,8 @@ pub fn bootstrap() {
         return;
     }
 
-    let initial_users = "root:x:0:0:root:/root:/bin/rc\n\
-glenda:x:1000:1000:Glenda the Plan 9 Bunny:/home/glenda:/bin/rc\n";
+    let initial_users = "root:x:0:0:root:/usr/root:/bin/rc\n\
+glenda:x:1000:1000:Glenda the Plan 9 Bunny:/usr/glenda:/bin/rc\n";
     let initial_groups = "root:x:0:\n\
 wheel:x:10:root\n\
 users:x:100:glenda\n\
@@ -672,6 +673,17 @@ glenda:x:1000:glenda\n";
     write_file(GROUP_PATH, initial_groups.as_bytes());
     write_file(SHADOW_PATH, b"root:\nglenda:\n");
 
-    mkdir_all("/root");
-    mkdir_all("/home/glenda");
+    mkdir_all("/usr/root");
+    mkdir_all("/usr/glenda");
+    let devices = crate::dev::devs();
+    if let Some(fs) = devices.find_by_char('/')
+        .and_then(|index| devices.get(index))
+        .and_then(|dev| dev.as_any().downcast_ref::<crate::rootfs::RootFsDev>())
+    {
+        for path in ["/usr/glenda", "/usr/glenda/lib", "/usr/glenda/lib/profile"] {
+            if let Some(id) = fs.lookup_path(path) {
+                fs.set_owner(id, 1000, 1000);
+            }
+        }
+    }
 }

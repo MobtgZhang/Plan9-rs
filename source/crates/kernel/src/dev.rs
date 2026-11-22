@@ -47,9 +47,9 @@ pub mod devtype {
     pub const NONE: usize = 0;
     pub const CONS: usize = 1;      // 'c' - console
     pub const ENV: usize = 2;      // 'e' - environment
-    pub const DRAW: usize = 3;     // 'd' - graphics
+    pub const DRAW: usize = 3;     // 'i' - graphics
     pub const IP: usize = 4;       // 'i' - IP/network
-    pub const BRIDGE: usize = 5;   // 'l' - bridge
+    pub const BRIDGE: usize = 5;   // 'B' - bridge
     pub const AUDIO: usize = 6;    // 'a' - audio
     pub const MOUSE: usize = 7;    // 'm' - mouse
     pub const KB: usize = 8;       // 'k' - keyboard
@@ -66,6 +66,8 @@ pub mod devtype {
     pub const MNT: usize = 19;    // '#M' - mount
     pub const DOS: usize = 20;    // '#d' - DOS
     pub const VIRTIO: usize = 21; // virtio
+    pub const ETHER: usize = 22;
+    pub const FD: usize = 23;      // 'd' - open file descriptors
 
     /// User mountable devices start here
     pub const USER: usize = 64;
@@ -94,6 +96,8 @@ pub mod qidtype {
 // ============================================================================
 
 /// Channel - represents an open file or device
+pub(crate) const CREATED_OPEN: u32 = 1 << 31;
+
 pub struct Chan {
     /// Device type
     pub dev: usize,
@@ -105,8 +109,9 @@ pub struct Chan {
     pub flag: u32,
     /// Offset in file
     pub offset: u64,
+    pub namespace_path: Option<Vec<u8>>,
     /// Device-specific data
-    pub aux: Option<Box<dyn Send + Sync>>,
+    pub aux: Option<alloc::sync::Arc<dyn core::any::Any + Send + Sync>>,
     /// Reference count (made pub for internal cloning)
     pub refcount: Mutex<u32>,
 }
@@ -120,7 +125,8 @@ impl Clone for Chan {
             mode: self.mode,
             flag: self.flag,
             offset: self.offset,
-            aux: None,
+            namespace_path: self.namespace_path.clone(),
+            aux: self.aux.clone(),
             refcount: Mutex::new(*self.refcount.lock()),
         }
     }
@@ -135,6 +141,7 @@ impl Chan {
             mode,
             flag: 0,
             offset: 0,
+            namespace_path: None,
             aux: None,
             refcount: Mutex::new(1),
         }
@@ -290,6 +297,10 @@ pub trait Dev: Send + Sync {
     fn read(&mut self, ch: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
         let _ = (ch, buf, offset);
         Err(Error::Eperm)
+    }
+
+    fn read_interruptible(&mut self, ch: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        self.read(ch, buf, offset)
     }
     
     /// Write data
@@ -479,6 +490,7 @@ pub enum Error {
     Ebadfd,
     /// I/O error
     Eio,
+    Eintr,
     /// Invalid argument
     Einval,
     /// Operation not supported
@@ -508,6 +520,7 @@ impl Error {
             Error::Eisdir => -21,
             Error::Ebadfd => -4,
             Error::Eio => -3,
+            Error::Eintr => -13,
             Error::Einval => -10,
             Error::Enotsup => -1,
             Error::Eclosed => -1,
@@ -530,7 +543,7 @@ impl NullDev {
     pub fn new() -> Self {
         Self {
             name: "null",
-            dev_char: '#',
+            dev_char: 'n',
         }
     }
 }
@@ -542,6 +555,10 @@ impl Dev for NullDev {
 
     fn open(&mut self, _ch: &mut Chan, _mode: u8) -> Result<(), Error> {
         Ok(())
+    }
+
+    fn stat(&mut self, ch: &mut Chan) -> Result<DirEntry, Error> {
+        Ok(device_file_stat(ch, b"null"))
     }
 
     fn read(&mut self, _ch: &mut Chan, _buf: &mut [u8], _offset: u64) -> Result<usize, Error> {
@@ -585,6 +602,10 @@ impl Dev for ZeroDev {
 
     fn open(&mut self, _ch: &mut Chan, _mode: u8) -> Result<(), Error> {
         Ok(())
+    }
+
+    fn stat(&mut self, ch: &mut Chan) -> Result<DirEntry, Error> {
+        Ok(device_file_stat(ch, b"zero"))
     }
 
     fn read(&mut self, _ch: &mut Chan, buf: &mut [u8], _offset: u64) -> Result<usize, Error> {
@@ -802,9 +823,11 @@ impl ConsDev {
 
 impl Dev for ConsDev {
     fn attach(&mut self, _spec: Option<&str>) -> Result<Chan, Error> {
-        // Return channel to console root
-        // Qid path 0 is the console root directory
-        Ok(Chan::new(devtype::CONS, Qid::new(0, 0, qidtype::DIR), 0))
+        Ok(Chan::new(devtype::CONS, Qid::new(0, 0, qidtype::FILE), 0))
+    }
+
+    fn stat(&mut self, ch: &mut Chan) -> Result<DirEntry, Error> {
+        Ok(device_file_stat(ch, b"cons"))
     }
 
     fn walk(&mut self, ch: &mut Chan, name: &str) -> Result<Option<Qid>, Error> {
@@ -1255,6 +1278,7 @@ impl DevTable {
         self.register(Box::new(crate::rootfs::RootFsDev::new()));
         // Register console device (#c)
         self.register(Box::new(ConsDev::new()));
+        self.register(Box::new(crate::devenv::EnvDev::new()));
         // Register RAM device for /sd
         self.register(Box::new(RamDev::new()));
         // Register kmesg device (#K) - kernel message buffer
@@ -1273,7 +1297,7 @@ impl DevTable {
         self.register(Box::new(crate::devmouse::MouseDev::new()));
         // Register keyboard device (#k) - PS/2 keyboard
         self.register(Box::new(crate::devkb::KbdDev::new()));
-        // Register draw device (#d) - graphics
+        // Register draw device (#i) - graphics
         self.register(Box::new(crate::devdraw::DrawDev::new()));
         // Register audio device (#a) - audio playback/recording
         self.register(Box::new(crate::devaudio::AudioDev::new()));
@@ -1281,14 +1305,16 @@ impl DevTable {
         self.register(Box::new(crate::devmnt::MntDev::new()));
         // Register TLS device (#T) - TLS/SSL
         self.register(Box::new(crate::devtls::TlsDev::new()));
-        // Register bridge device (#l) - Ethernet bridge
+        // Register bridge device (#B) and Ethernet device (#l).
         self.register(Box::new(crate::devbridge::BridgeDev::new()));
+        self.register(Box::new(crate::netfs::NetFs::ethernet()));
         // Register USB device (#u) - USB host
         self.register(Box::new(crate::devusb::UsbDev::new()));
         // Register network device (#I) - the Plan 9 /net tree
         self.register(Box::new(crate::netfs::NetFs::new()));
         // Register srv device - service access device
         self.register(Box::new(crate::devsrv::SrvDev::new()));
+        self.register(Box::new(crate::devfd::FdDev));
     }
 }
 
@@ -1547,6 +1573,22 @@ pub fn dev_open(dev_char: char, path: &str, mode: u8) -> Result<Chan, Error> {
 pub fn dev_read(chan: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
     let dev = devs_mut().get_mut(chan.dev).ok_or(Error::Enoent)?;
     dev.read(chan, buf, offset)
+}
+
+pub(crate) fn read_bytes(bytes: &[u8], buf: &mut [u8], offset: u64) -> usize {
+    let Some(window) = usize::try_from(offset).ok().and_then(|start| bytes.get(start..)) else {
+        return 0;
+    };
+    let count = window.len().min(buf.len());
+    buf[..count].copy_from_slice(&window[..count]);
+    count
+}
+
+fn device_file_stat(channel: &Chan, name: &[u8]) -> DirEntry {
+    DirEntry {
+        dev: channel.dev, qid: channel.qid, mode: 0o666, atime: 0, mtime: 0,
+        length: 0, name: name.to_vec(), uid: 0, gid: 0,
+    }
 }
 
 /// Write to a device channel

@@ -211,11 +211,10 @@ pub unsafe fn idt_init() {
     unsafe { dbg(b'5'); }
 
     // Install syscall handler at vector 0x80 (128)
-    // 0xEF = present, DPL 3, 64-bit trap gate.  DPL 3 is required because
-    // `int 0x80` is issued from ring 3; 0x8F would set DPL 0 and cause #GP.
+    // DPL 3 permits int 0x80 from ring 3. The interrupt gate masks IRQs in the syscall.
     let syscall_handler = &syscall_stub_entry as *const u8 as u64;
     let syscall_entry = &mut table.entries[0x80];
-    syscall_entry.set_handler(syscall_handler, SEL_KERNEL_CS, 0, 0xEF);
+    syscall_entry.set_handler(syscall_handler, SEL_KERNEL_CS, 0, 0xEE);
 
     unsafe { dbg(b'6'); }
     unsafe { dbg(b'7'); }
@@ -307,6 +306,10 @@ fn pic_init() {
 /// `sti`.  Must be called only after the scheduler and device registry are
 /// initialised, because both handlers dereference them.
 pub fn start_interrupts() {
+    crate::x86_64::outb(0x43, 0x34);
+    let count = (1_193_182 / crate::x86_64::timer::HZ) as u16;
+    crate::x86_64::outb(0x40, count as u8);
+    crate::x86_64::outb(0x40, (count >> 8) as u8);
     crate::x86_64::outb(0x21, 0xFC); // unmask IRQ0 + IRQ1
     crate::x86_64::io_delay();
     crate::x86_64::outb(0xA1, 0xFF); // slave remains masked

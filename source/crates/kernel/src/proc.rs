@@ -11,6 +11,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use alloc::vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use crate::plan9_common::sync::Spinlock;
 use crate::plan9_common::types::{PhysAddr, VirtAddr};
 use crate::user_regs::{UserRegs, Note, Timer};
@@ -124,13 +125,6 @@ impl ProcSegment {
         }
     }
 
-    /// Create a new segment with profiling enabled
-    pub fn new_with_profile(segtype: SegType, base: u64, size: usize, lresprof: u8) -> Self {
-        let mut seg = Self::new(segtype, base, size);
-        seg.profile = Some(ProfileData::new(base, size as u64, lresprof));
-        seg
-    }
-
     /// Get segment size in bytes
     pub fn size(&self) -> usize {
         (self.top - self.base) as usize
@@ -174,8 +168,9 @@ impl ProcSegment {
     }
 
     /// Enable profiling on this segment
-    pub fn enable_profiling(&mut self, lresprof: u8) {
-        self.profile = Some(ProfileData::new(self.base, self.size() as u64, lresprof));
+    pub fn enable_profiling(&mut self) -> core::result::Result<(), alloc::collections::TryReserveError> {
+        self.profile = Some(ProfileData::new(self.base, self.top)?);
+        Ok(())
     }
 
     /// Disable profiling on this segment
@@ -633,9 +628,9 @@ pub type Pid = u32;
 /// x86_64: the assembly syscall stub copies these fields from the kernel
 /// stack after the user registers and the CPU's IRET frame.  `frame_ptr`
 /// points at the first saved register (R15); the IRET fields start at
-/// +80 bytes.
+/// +120 bytes.
 ///
-/// aarch64: the vector table saves a 272-byte trap frame — x0..x30 at
+/// aarch64: the vector table saves an 800-byte trap frame — x0..x30 at
 /// [8*i], PC at [248], PSTATE at [256], user SP at [264]; the syscall
 /// number travels in x8 and the return value in x0.  This struct is
 /// byte-for-byte that frame, so `kernel_resume_user` can ERET from it.
@@ -651,11 +646,16 @@ pub struct SavedUserFrame {
     pub r14: u64,
     pub r13: u64,
     pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
     pub rbp: u64,
-    pub rbx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
     pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
     pub rax: u64,
     pub rip: u64,
     pub cs: u64,
@@ -663,6 +663,9 @@ pub struct SavedUserFrame {
     pub rsp: u64,
     pub ss: u64,
 }
+
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(core::mem::offset_of!(SavedUserFrame, rip) == 120);
 
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
@@ -674,7 +677,13 @@ pub struct SavedUserFrame {
     pub pc: u64,
     pub pstate: u64,
     pub sp: u64,
+    pub simd: [u128; 32],
+    pub fpsr: u64,
+    pub fpcr: u64,
 }
+
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(core::mem::size_of::<SavedUserFrame>() == 800);
 
 #[cfg(target_arch = "riscv64")]
 #[repr(C)]
@@ -762,6 +771,48 @@ impl SavedUserFrame {
         #[cfg(target_arch = "loongarch64")]
         { self.x[3] = v; }
     }
+
+    pub fn set_note_args(&mut self, registers: u64, message: u64) {
+        #[cfg(target_arch = "x86_64")]
+        { self.rdi = registers; self.rsi = message; }
+        #[cfg(target_arch = "aarch64")]
+        { self.x[0] = registers; self.x[1] = message; self.x[30] = 0; }
+        #[cfg(target_arch = "riscv64")]
+        { self.x[10] = registers; self.x[11] = message; self.x[1] = 0; }
+        #[cfg(target_arch = "loongarch64")]
+        { self.x[3] = registers; self.x[4] = message; self.x[0] = 0; }
+    }
+
+    pub fn restore_mode_from(&mut self, original: &Self) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            const USER_FLAGS: u64 = 0xCD5;
+            self.cs = original.cs;
+            self.ss = original.ss;
+            self.rflags = (self.rflags & USER_FLAGS) | (original.rflags & !USER_FLAGS);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            const NZCV: u64 = 0xf000_0000;
+            self.pstate = (self.pstate & NZCV) | (original.pstate & !NZCV);
+            self.fpcr = original.fpcr;
+            self.fpsr = original.fpsr;
+        }
+        #[cfg(target_arch = "riscv64")]
+        { self.sstatus = original.sstatus; }
+        #[cfg(target_arch = "loongarch64")]
+        { self.prmd = original.prmd; }
+        self.set_stack(self.stack());
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NoteFrame {
+    pub original: SavedUserFrame,
+    pub registers: u64,
+    pub message: u64,
+    pub stack: u64,
+    pub note: Note,
 }
 
 /// Label for context switching (setjmp/longjmp style)
@@ -817,19 +868,17 @@ impl Label {
 // ============================================================================
 
 /// File descriptor group - manages open files for a process
+#[derive(Clone)]
 pub struct Fgrp {
     /// Array of open file channels (index = fd number)
-    channels: [Option<Box<dyn Chan>>; NFD],
-    /// Reference count
-    pub refcount: u32,
+    channels: alloc::sync::Arc<Spinlock<[Option<Box<dyn Chan>>; NFD]>>,
 }
 
 impl core::fmt::Debug for Fgrp {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let open_count = self.channels.iter().filter(|c| c.is_some()).count();
+        let open_count = self.channels.lock().iter().filter(|channel| channel.is_some()).count();
         f.debug_struct("Fgrp")
             .field("open_count", &open_count)
-            .field("refcount", &self.refcount)
             .finish()
     }
 }
@@ -838,8 +887,7 @@ impl Fgrp {
     /// Create a new file descriptor group
     pub fn new() -> Self {
         Self {
-            channels: [const { None }; NFD],
-            refcount: 1,
+            channels: alloc::sync::Arc::new(Spinlock::new([const { None }; NFD])),
         }
     }
 
@@ -850,9 +898,17 @@ impl Fgrp {
     /// so the first `open` after `set_stdio()` naturally returns fd 3.
     /// If one of the standard descriptors is closed, a later open may reuse
     /// that slot, which matches Plan 9 fd allocation semantics.
-    pub fn alloc_fd(&mut self, chan: Box<dyn Chan>) -> i32 {
-        for (i, slot) in self.channels.iter_mut().enumerate() {
+    pub fn alloc_fd(&self, chan: Box<dyn Chan>) -> i32 {
+        self.alloc_fd_with_exec_mode(chan, false)
+    }
+
+    pub fn alloc_fd_with_exec_mode(&self, chan: Box<dyn Chan>, close_on_exec: bool) -> i32 {
+        let chan = SharedChan::wrap(chan);
+        for (i, slot) in self.channels.lock().iter_mut().enumerate() {
             if slot.is_none() {
+                if close_on_exec {
+                    chan.mark_close_on_exec();
+                }
                 *slot = Some(chan);
                 return i as i32;
             }
@@ -861,30 +917,24 @@ impl Fgrp {
     }
 
     /// Get channel by file descriptor
-    pub fn get_channel(&mut self, fd: i32) -> Option<&mut Box<dyn Chan>> {
-        if fd >= 0 && (fd as usize) < NFD {
-            self.channels[fd as usize].as_mut()
-        } else {
-            None
-        }
+    pub fn get_channel(&self, fd: i32) -> Option<Box<dyn Chan>> {
+        self.channels.lock().get(fd as usize)?.as_ref().map(|chan| chan.dup())
     }
 
     /// Close and free a file descriptor
-    pub fn close_fd(&mut self, fd: i32) -> Option<Box<dyn Chan>> {
-        if fd >= 0 && (fd as usize) < NFD {
-            self.channels[fd as usize].take()
-        } else {
-            None
-        }
+    pub fn close_fd(&self, fd: i32) -> Option<Box<dyn Chan>> {
+        self.channels.lock().get_mut(fd as usize)?.take()
     }
 
     /// Install a channel at a specific file descriptor.  Returns false for an
     /// out-of-range descriptor.
-    pub fn set_fd(&mut self, fd: i32, chan: Box<dyn Chan>) -> bool {
+    pub fn set_fd(&self, fd: i32, chan: Box<dyn Chan>) -> bool {
         if fd < 0 || (fd as usize) >= NFD {
             return false;
         }
-        self.channels[fd as usize] = Some(chan);
+        let chan = SharedChan::wrap(chan);
+        let old = self.channels.lock()[fd as usize].replace(chan);
+        drop(old);
         true
     }
 
@@ -892,12 +942,10 @@ impl Fgrp {
     /// 2 (stderr) from a single console channel.  Each descriptor gets a
     /// duplicate channel so the process owns three independent fd entries,
     /// just as Plan 9's init does after opening `/dev/console`.
-    pub fn set_stdio(&mut self, chan: Box<dyn Chan>) -> bool {
+    pub fn set_stdio(&self, chan: Box<dyn Chan>) -> bool {
+        let chan = SharedChan::wrap(chan);
         for i in 0..3usize {
-            if let Some(mut old) = self.channels[i].take() {
-                old.close();
-            }
-            self.channels[i] = Some(chan.dup());
+            self.set_fd(i as i32, chan.dup());
         }
         true
     }
@@ -905,67 +953,48 @@ impl Fgrp {
     /// Duplicate a file descriptor.  Returns the new fd number, or -1 if the
     /// source descriptor is invalid.  If `newfd` is supplied, that slot is
     /// used; otherwise the first free descriptor is allocated.
-    pub fn dup(&mut self, fd: i32, newfd: i32) -> Option<i32> {
-        let dup_chan = {
-            let chan = self.get_channel(fd)?;
-            chan.dup()
-        };
-
+    pub fn dup(&self, fd: i32, newfd: i32) -> Option<i32> {
+        let mut channels = self.channels.lock();
+        let chan = channels.get(fd as usize)?.as_ref()?;
+        let duplicate = chan.dup();
         let slot = if newfd >= 0 {
-            if newfd as usize >= NFD {
-                return None;
-            }
-            newfd
+            channels.get_mut(newfd as usize)?;
+            newfd as usize
         } else {
-            // Find the first free slot, including 0..2 if they are free.
-            let mut found = -1;
-            for (i, slot) in self.channels.iter().enumerate() {
-                if slot.is_none() {
-                    found = i as i32;
-                    break;
-                }
-            }
-            if found < 0 {
-                return None;
-            }
-            found
+            channels.iter().position(Option::is_none)?
         };
-
-        self.channels[slot as usize] = Some(dup_chan);
-        Some(slot)
+        let old = channels[slot].replace(duplicate);
+        drop(channels);
+        drop(old);
+        Some(slot as i32)
     }
 
     /// Close all file descriptors
-    pub fn close_all(&mut self) {
-        for slot in &mut self.channels {
-            if let Some(mut chan) = slot.take() {
-                chan.close();
+    pub fn close_all(&self) {
+        let old = core::mem::replace(&mut *self.channels.lock(), [const { None }; NFD]);
+        drop(old);
+    }
+
+    pub fn close_exec(&self) {
+        let mut channels = self.channels.lock();
+        let closed: [_; NFD] = core::array::from_fn(|index| {
+            let slot = &mut channels[index];
+            if slot.as_ref().is_some_and(|channel| channel.close_on_exec()) {
+                slot.take()
+            } else {
+                None
             }
-        }
+        });
+        drop(channels);
+        drop(closed);
     }
 
-    /// Increment reference count
-    pub fn incref(&mut self) {
-        self.refcount += 1;
-    }
-
-    /// Decrement reference count
-    pub fn decref(&mut self) -> u32 {
-        self.refcount = self.refcount.saturating_sub(1);
-        self.refcount
-    }
-
-    /// Duplicate for sharing (increments ref count)
-    pub fn dup_shared(&self) -> Self {
-        let mut new_channels: [Option<Box<dyn Chan>>; NFD] = [const { None }; NFD];
-        for (i, slot) in self.channels.iter().enumerate() {
-            if let Some(c) = slot.as_ref() {
-                new_channels[i] = Some(c.dup());
-            }
-        }
+    /// Copy the descriptor table while keeping the same open channels.
+    pub fn fork(&self) -> Self {
+        let channels = self.channels.lock();
+        let copy = core::array::from_fn(|index| channels[index].as_ref().map(|chan| chan.dup()));
         Self {
-            channels: new_channels,
-            refcount: self.refcount,
+            channels: alloc::sync::Arc::new(Spinlock::new(copy)),
         }
     }
 }
@@ -978,6 +1007,9 @@ impl Fgrp {
 pub trait Chan: Send + Sync {
     /// Read from channel
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+    fn read_interruptible(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.read(buf)
+    }
     /// Write to channel
     fn write(&mut self, buf: &[u8]) -> Result<usize>;
     /// Close channel
@@ -1018,9 +1050,101 @@ pub trait Chan: Send + Sync {
     fn dev_chan(&self) -> Option<crate::dev::Chan> {
         None
     }
+    fn access_mode(&self) -> u8 {
+        2
+    }
+    fn is_shared(&self) -> bool {
+        false
+    }
+    fn close_on_exec(&self) -> bool {
+        false
+    }
+    fn mark_close_on_exec(&self) {}
+    fn open_id(&self) -> Option<usize> {
+        None
+    }
     /// Get file status (Plan 9 stat shape)
     fn stat(&mut self) -> Result<crate::dev::DirEntry> {
         Err(Error::General)
+    }
+}
+
+#[derive(Clone)]
+struct SharedChan(alloc::sync::Arc<SharedChanState>, usize);
+
+struct SharedChanState {
+    channel: Spinlock<OwnedChan>,
+    close_on_exec: AtomicBool,
+}
+
+struct OwnedChan(Box<dyn Chan>);
+
+impl Drop for OwnedChan {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+impl SharedChan {
+    fn wrap(chan: Box<dyn Chan>) -> Box<dyn Chan> {
+        if chan.is_shared() {
+            chan
+        } else {
+            let dev = chan.dev();
+            Box::new(Self(alloc::sync::Arc::new(SharedChanState {
+                channel: Spinlock::new(OwnedChan(chan)),
+                close_on_exec: AtomicBool::new(false),
+            }), dev))
+        }
+    }
+}
+
+impl Chan for SharedChan {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.0.channel.lock().0.read(buf)
+    }
+    fn read_interruptible(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.0.channel.lock().0.read_interruptible(buf)
+    }
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        self.0.channel.lock().0.write(buf)
+    }
+    fn close(&mut self) {}
+    fn dev(&self) -> usize {
+        self.1
+    }
+    fn offset(&self) -> u64 {
+        self.0.channel.lock().0.offset()
+    }
+    fn set_offset(&mut self, offset: u64) {
+        self.0.channel.lock().0.set_offset(offset);
+    }
+    fn seek(&mut self, offset: i64, whence: u8) -> Result<i64> {
+        self.0.channel.lock().0.seek(offset, whence)
+    }
+    fn dup(&self) -> Box<dyn Chan> {
+        Box::new(self.clone())
+    }
+    fn dev_chan(&self) -> Option<crate::dev::Chan> {
+        self.0.channel.lock().0.dev_chan()
+    }
+    fn access_mode(&self) -> u8 {
+        self.0.channel.lock().0.access_mode()
+    }
+    fn is_shared(&self) -> bool {
+        true
+    }
+    fn close_on_exec(&self) -> bool {
+        self.0.close_on_exec.load(Ordering::Relaxed)
+    }
+    fn mark_close_on_exec(&self) {
+        self.0.close_on_exec.store(true, Ordering::Relaxed);
+    }
+    fn open_id(&self) -> Option<usize> {
+        Some(alloc::sync::Arc::as_ptr(&self.0) as usize)
+    }
+    fn stat(&mut self) -> Result<crate::dev::DirEntry> {
+        self.0.channel.lock().0.stat()
     }
 }
 
@@ -1036,6 +1160,8 @@ pub enum Error {
     Einval,
     /// I/O error
     Eio,
+    Eagain,
+    Eintr,
     /// Permission denied
     Eperm,
     /// General error
@@ -1244,6 +1370,8 @@ pub struct Namespace {
     pub dot: Option<crate::dev::Chan>,
     /// Mount hash table
     pub mnthash: Mnthash,
+    pub(crate) mounts: alloc::sync::Arc<Spinlock<crate::vfs::NamespaceMounts>>,
+    pub(crate) noattach: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
     /// Lock for namespace operations
     lock: crate::plan9_common::sync::Spinlock<()>,
 }
@@ -1255,6 +1383,8 @@ impl Clone for Namespace {
             root: self.root.clone(),
             dot: self.dot.clone(),
             mnthash: Mnthash::new(),
+            mounts: self.mounts.clone(),
+            noattach: self.noattach.clone(),
             lock: crate::plan9_common::sync::Spinlock::new(()),
         }
     }
@@ -1268,6 +1398,8 @@ impl Namespace {
             root: None,
             dot: None,
             mnthash: Mnthash::new(),
+            mounts: alloc::sync::Arc::new(Spinlock::new(alloc::collections::BTreeMap::new())),
+            noattach: Default::default(),
             lock: crate::plan9_common::sync::Spinlock::new(()),
         }
     }
@@ -1279,6 +1411,10 @@ impl Namespace {
             root: parent.root.as_ref().map(|c| c.dup()),
             dot: parent.dot.as_ref().map(|c| c.dup()),
             mnthash: Mnthash::new(),
+            mounts: alloc::sync::Arc::new(Spinlock::new(parent.mounts.lock().clone())),
+            noattach: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(
+                parent.noattach.load(core::sync::atomic::Ordering::Relaxed),
+            )),
             lock: crate::plan9_common::sync::Spinlock::new(()),
         }
     }
@@ -1336,6 +1472,8 @@ impl Namespace {
             root: self.root.as_ref().map(|c| c.dup()),
             dot: self.dot.as_ref().map(|c| c.dup()),
             mnthash: Mnthash::new(), // Don't share the hash table
+            mounts: self.mounts.clone(),
+            noattach: self.noattach.clone(),
             lock: crate::plan9_common::sync::Spinlock::new(()),
         }
     }
@@ -1441,54 +1579,26 @@ impl Pgrp {
 /// Environment group - manages environment variables
 #[derive(Debug, Clone)]
 pub struct Egrp {
-    /// Reference count
-    pub refcount: u32,
-    /// Parent environment group
-    pub parent: Option<Box<Egrp>>,
+    pub(crate) values: alloc::sync::Arc<crate::devenv::EnvGroup>,
 }
 
 impl Egrp {
     /// Create a new environment group
     pub fn new() -> Self {
         Self {
-            refcount: 1,
-            parent: None,
+            values: alloc::sync::Arc::default(),
         }
     }
 
     /// Fork environment group
     pub fn fork(parent: &Egrp) -> Self {
-        // Deep copy parent chain
-        let mut parent_copy: Option<Box<Egrp>> = None;
-        if let Some(ref p) = parent.parent {
-            parent_copy = Some(Box::new(Egrp {
-                refcount: 0,
-                parent: p.parent.clone(),
-            }));
-        }
         Self {
-            refcount: 1,
-            parent: parent_copy,
+            values: alloc::sync::Arc::new(crate::devenv::EnvGroup::copy(&parent.values)),
         }
     }
 
-    /// Increment reference count
-    pub fn incref(&mut self) {
-        self.refcount += 1;
-    }
-
-    /// Decrement reference count
-    pub fn decref(&mut self) -> u32 {
-        self.refcount = self.refcount.saturating_sub(1);
-        self.refcount
-    }
-
-    /// Duplicate for sharing (increments ref count)
     pub fn dup_shared(&self) -> Self {
-        Self {
-            refcount: self.refcount,
-            parent: self.parent.clone(),
-        }
+        self.clone()
     }
 }
 
@@ -1647,8 +1757,11 @@ pub struct Waitq {
     pub pid: Pid,
     /// Exit status
     pub status: i32,
+    pub message: Option<alloc::string::String>,
     /// Time used
     pub time: u64,
+    pub system_time: u64,
+    pub elapsed: u64,
 }
 
 impl core::fmt::Debug for Waitq {
@@ -1668,7 +1781,10 @@ impl Waitq {
             next: None,
             pid,
             status,
+            message: None,
             time,
+            system_time: 0,
+            elapsed: time,
         }
     }
 }
@@ -1698,6 +1814,8 @@ pub struct Proc {
     pub pri: i8,
     /// Base priority
     pub basepri: i8,
+    pub fixedpri: bool,
+    pub noswap: bool,
     /// CPU time used (for priority calculation)
     /// Stored as fixed point * 1000 (0-1000 range represents 0-100% CPU usage)
     pub cpu: u64,
@@ -1735,7 +1853,10 @@ pub struct Proc {
     /// Wait queue for exiting children
     pub waitq: Option<Box<Waitq>>,
     /// Child pid this process is currently blocked waiting for
-    pub waiting_child: Option<Pid>,
+    pub waiting_child: Option<(Pid, Option<(u64, usize)>)>,
+    pub awaiting_message: Option<(u64, usize)>,
+    pub reading_proc_wait: Option<(Pid, u64, usize)>,
+    pub sleep_deadline: Option<u64>,
 
     // === Resources ===
     /// File descriptor group
@@ -1765,7 +1886,18 @@ pub struct Proc {
     /// Number of pending notes
     pub nnote: i32,
     /// Signal handler function
-    pub notify: Option<unsafe fn(*mut u8, *const u8) -> i32>,
+    pub notify: Option<u64>,
+    pub note_frames: Vec<NoteFrame>,
+    pub last_note: Option<Note>,
+    pub notified: bool,
+    pub note_group: Pid,
+    pub stopped_from: Option<State>,
+    pub stop_on_exec: bool,
+    pub stop_on_return: bool,
+    pub stop_on_syscall: bool,
+    pub private_memory: bool,
+    pub trace_enabled: bool,
+    pub waiting_stop: Option<(Pid, usize)>,
     /// User register frame (for signal handling)
     pub ureg: Option<Box<UserRegs>>,
 
@@ -1790,6 +1922,7 @@ pub struct Proc {
     pub ktime: u64,
     /// Time spent in child processes
     pub ctime: u64,
+    pub child_system_time: u64,
     /// Wall clock time at start
     pub wtime: u64,
 
@@ -1805,6 +1938,8 @@ pub struct Proc {
     /// Canonical textual path of the working directory (empty = "/").
     /// Kept for `pwd`/`getcwd`; `dot` alone cannot render a path.
     pub cwd_path: Vec<u8>,
+    pub exec_args: Vec<u8>,
+    pub exec_image: Option<crate::dev::Chan>,
 
     // === Next process in queue ===
     /// Next process in ready/wait queue
@@ -1865,6 +2000,8 @@ impl Proc {
             state: State::Dead,
             pri: PRI_NORMAL,
             basepri: PRI_NORMAL,
+            fixedpri: false,
+            noswap: false,
             cpu: 0,
             lastupdate: 0,
             sched: Label::new(),
@@ -1879,6 +2016,9 @@ impl Proc {
             nwait: 0,
             waitq: None,
             waiting_child: None,
+            awaiting_message: None,
+            reading_proc_wait: None,
+            sleep_deadline: None,
             fgrp: None,
             pgrp: None,
             egrp: None,
@@ -1890,6 +2030,17 @@ impl Proc {
             note: [const { Note::empty() }; NNOTE],
             nnote: 0,
             notify: None,
+            note_frames: Vec::new(),
+            last_note: None,
+            notified: false,
+            note_group: 0,
+            stopped_from: None,
+            stop_on_exec: false,
+            stop_on_return: false,
+            stop_on_syscall: false,
+            private_memory: false,
+            trace_enabled: false,
+            waiting_stop: None,
             ureg: None,
             timer: None,
             user: [0; 32],
@@ -1899,11 +2050,14 @@ impl Proc {
             utime: 0,
             ktime: 0,
             ctime: 0,
+            child_system_time: 0,
             wtime: 0,
             insyscall: false,
             nsyscall: 0,
             dot: None,
             cwd_path: Vec::new(),
+            exec_args: Vec::new(),
+            exec_image: None,
             next: None,
             qnext: None,
             cpu_affinity: CpuMask::all(),
@@ -1965,30 +2119,23 @@ impl Proc {
             self.gid = p.gid;
             self.groups = p.groups.clone();
             self.uname = p.uname;
+            self.stop_on_exec = p.stop_on_exec;
             // Handle file descriptor group based on flags
             if flags & rfork::FLAGFDG == 0 {
                 // Copy file descriptors (default behavior in Plan 9)
                 if let Some(ref pfgrp) = p.fgrp {
-                    let mut new_fgrp = Box::new(Fgrp::new());
-                    // Copy all open file descriptors
-                    for (i, chan_opt) in pfgrp.channels.iter().enumerate() {
-                        if let Some(chan) = chan_opt {
-                            // Clone the channel (increments reference count)
-                            new_fgrp.channels[i] = Some(chan.dup());
-                        }
-                    }
-                    self.fgrp = Some(new_fgrp);
+                    self.fgrp = Some(Box::new(pfgrp.fork()));
                 }
             } else {
                 // Share file descriptor group with parent
                 // Use dup to share - this increments ref count
                 if let Some(ref fgrp) = p.fgrp {
-                    self.fgrp = Some(Box::new(fgrp.dup_shared()));
+                    self.fgrp = Some(fgrp.clone());
                 }
             }
 
             // Handle process group (namespace) based on flags
-            if flags & rfork::FLAGFNS == 0 {
+            if flags & rfork::FLAGFNS != 0 {
                 // Copy namespace (default)
                 if let Some(ref ppgrp) = p.pgrp {
                     self.pgrp = Some(Box::new(Pgrp::fork(ppgrp, self.pid)));
@@ -2000,23 +2147,23 @@ impl Proc {
                 }
             }
 
-            // Handle environment group based on flags
-            if flags & rfork::FLAGFENV == 0 {
-                // Copy environment (default)
-                if let Some(ref pegrp) = p.egrp {
-                    self.egrp = Some(Box::new(Egrp::fork(pegrp)));
-                }
+            self.egrp = if flags & rfork::EMPTY_ENV != 0 {
+                Some(Box::new(Egrp::new()))
             } else {
-                // Share environment
-                if let Some(ref egrp) = p.egrp {
-                    self.egrp = Some(Box::new(egrp.dup_shared()));
-                }
-            }
+                p.egrp.as_deref().map(|group| {
+                    Box::new(if flags & rfork::COPY_ENV != 0 {
+                        Egrp::fork(group)
+                    } else {
+                        group.dup_shared()
+                    })
+                })
+            };
 
             // Handle working directory (always share in Plan 9)
             if let Some(ref dot) = p.dot {
                 self.dot = Some(dot.dup());
             }
+            self.cwd_path = p.cwd_path.clone();
         } else {
             // Create new groups for init process
             self.fgrp = Some(Box::new(Fgrp::new()));
@@ -2116,23 +2263,13 @@ impl Proc {
 
         // Create text segment (read-only, executable)
         // Text segment is loaded from the executable file
-        let mut text_seg = ProcSegment::new_with_profile(
-            SegType::Text,
-            text_base,
-            text_size,
-            0, // lresprof for profiling
-        );
+        let mut text_seg = ProcSegment::new(SegType::Text, text_base, text_size);
         text_seg.fstart = 0;
         text_seg.flen = text_size as u64;
         self.seg[0] = Some(text_seg);
 
         // Create data segment (read-write, not executable)
-        let data_seg = ProcSegment::new_with_profile(
-            SegType::Data,
-            data_base,
-            data_size,
-            0,
-        );
+        let data_seg = ProcSegment::new(SegType::Data, data_base, data_size);
         self.seg[1] = Some(data_seg);
 
         // Create BSS segment (uninitialized data, read-write)
@@ -2175,7 +2312,8 @@ impl Proc {
     pub fn pop_signal(&mut self) -> Option<Note> {
         if self.nnote > 0 {
             self.nnote -= 1;
-            let note = self.note[self.nnote as usize];
+            let note = self.note[0];
+            self.note.copy_within(1..=self.nnote as usize, 0);
             self.note[self.nnote as usize] = Note::default();
             Some(note)
         } else {
@@ -2201,6 +2339,7 @@ impl Proc {
             // PNPROC - send to specific process
             0 => {
                 self.add_note(msg)?;
+                crate::syscall::interrupt_child_wait(self);
                 // Wake up process if it's sleeping
                 if self.state == State::Wakeme {
                     // Would wake up via scheduler
@@ -2225,11 +2364,7 @@ impl Proc {
         }
 
         // Store the note message (truncated to fit)
-        let note = Note::new(
-            self.pid,
-            msg.as_ptr() as u64,
-            NNOTE as u32,
-        );
+        let note = Note::new(self.pid, msg, 0);
 
         self.note[self.nnote as usize] = note;
         self.nnote += 1;
@@ -2240,45 +2375,13 @@ impl Proc {
     /// Set the signal handler
     ///
     /// This sets the function that will be called when a signal is delivered.
-    pub fn set_notify(&mut self, handler: Option<unsafe fn(*mut u8, *const u8) -> i32>) {
+    pub fn set_notify(&mut self, handler: Option<u64>) {
         self.notify = handler;
     }
 
     /// Check if a notify handler is set
     pub fn has_notify(&self) -> bool {
         self.notify.is_some()
-    }
-
-    /// Deliver pending signals to this process
-    ///
-    /// This is called when returning from a system call or interrupt.
-    /// Returns true if a signal was delivered and the process should handle it.
-    pub fn deliver_signals(&mut self) -> bool {
-        // Check if there are pending notes
-        if self.nnote == 0 {
-            return false;
-        }
-
-        // Check if there's a notify handler
-        if self.notify.is_none() {
-            // No handler - default action is to terminate
-            return true;
-        }
-
-        // Pop the first note
-        if let Some(note) = self.pop_signal() {
-            // Call the notify handler
-            // In Plan 9, if the handler returns 0, the process handles the note
-            // If it returns non-zero, the note is discarded
-            if let Some(handler) = self.notify {
-                // SAFETY: The handler is set by the process itself, and we trust it
-                let note_ptr = core::ptr::addr_of!(note) as *const u8;
-                let result = unsafe { handler(core::ptr::null_mut(), note_ptr) };
-                return result == 0;
-            }
-        }
-
-        false
     }
 
     /// Save user register state for signal handling
@@ -2410,10 +2513,9 @@ impl ProcTable {
 
     /// Allocate a new PID
     pub fn alloc_pid(&mut self) -> Option<Pid> {
-        let start = self.next_pid;
         for _ in 0..NPROC {
             let pid = self.next_pid;
-            self.next_pid = if self.next_pid >= NPROC as Pid - 1 {
+            self.next_pid = if self.next_pid >= i32::MAX as Pid {
                 1
             } else {
                 self.next_pid + 1
@@ -2425,9 +2527,6 @@ impl ProcTable {
                 return Some(pid);
             }
 
-            if self.next_pid == start {
-                break; // All PIDs in use
-            }
         }
         None
     }
@@ -2447,23 +2546,23 @@ impl ProcTable {
     /// Get a process by PID
     pub fn get(&self, pid: Pid) -> Option<&Box<Proc>> {
         let index = (pid % NPROC as Pid) as usize;
-        self.processes[index].as_ref()
+        self.processes[index].as_ref().filter(|proc| proc.pid == pid)
     }
 
     /// Get a mutable process by PID
     pub fn get_mut(&mut self, pid: Pid) -> Option<&mut Box<Proc>> {
         let index = (pid % NPROC as Pid) as usize;
-        self.processes[index].as_mut()
+        self.processes[index].as_mut().filter(|proc| proc.pid == pid)
     }
     
     /// Get a mutable process by PID, returning a reference to the inner Proc
     pub fn get_mut_proc(&mut self, pid: Pid) -> Option<&mut Proc> {
-        let index = (pid % NPROC as Pid) as usize;
-        self.processes[index].as_mut().map(|p| &mut **p)
+        self.get_mut(pid).map(Box::as_mut)
     }
 
     /// Remove a process from the table
     pub fn remove(&mut self, pid: Pid) -> Option<Box<Proc>> {
+        self.get(pid)?;
         let index = (pid % NPROC as Pid) as usize;
         self.processes[index].take()
     }
@@ -2474,6 +2573,10 @@ impl ProcTable {
             table: self,
             index: 0,
         }
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Proc> {
+        self.processes.iter_mut().filter_map(Option::as_deref_mut)
     }
 }
 
@@ -2823,53 +2926,51 @@ impl Default for PageColor {
 /// Profile data for a segment
 #[derive(Debug)]
 pub struct ProfileData {
-    /// Total ticks in segment
-    pub total: u64,
     /// Per-PC histogram buckets
-    buckets: Vec<u64>,
+    buckets: Vec<u32>,
     /// Base address of profiled region
     base: u64,
     /// Top address of profiled region
     top: u64,
-    /// Bucket size (log2 of bytes per bucket)
-    pub lresprof: u8,
 }
 
 impl ProfileData {
+    const RESOLUTION_SHIFT: u8 = 3;
+
     /// Create new profile data
-    pub fn new(base: u64, size: u64, lresprof: u8) -> Self {
-        let num_buckets = ((size >> lresprof) as usize).min(65536);
-        Self {
-            total: 0,
-            buckets: vec![0; num_buckets],
-            base,
-            top: base + size,
-            lresprof,
-        }
+    fn new(base: u64, top: u64) -> core::result::Result<Self, alloc::collections::TryReserveError> {
+        let count = ((top - base) >> Self::RESOLUTION_SHIFT) as usize;
+        let mut buckets = Vec::new();
+        buckets.try_reserve_exact(count)?;
+        buckets.resize(count, 0);
+        Ok(Self { buckets, base, top })
     }
 
     /// Record a tick at the given PC
     pub fn tick(&mut self, pc: u64) {
-        self.total += 1;
-
-        // Record in per-PC bucket if in range
+        let elapsed = tk2ms(1) as u32;
+        if let Some(total) = self.buckets.first_mut() {
+            *total = total.wrapping_add(elapsed);
+        }
         if pc >= self.base && pc < self.top {
-            let offset = pc - self.base;
-            let bucket = (offset >> self.lresprof) as usize;
-            if bucket < self.buckets.len() {
-                self.buckets[bucket] += 1;
+            let index = ((pc - self.base) >> Self::RESOLUTION_SHIFT) as usize;
+            if let Some(bucket) = self.buckets.get_mut(index) {
+                *bucket = bucket.wrapping_add(elapsed);
             }
         }
     }
 
-    /// Get bucket count
-    pub fn bucket_count(&self) -> usize {
-        self.buckets.len()
+    pub fn byte_len(&self) -> usize {
+        self.buckets.len() * size_of::<u32>()
     }
 
-    /// Get bucket value
-    pub fn bucket(&self, i: usize) -> u64 {
-        self.buckets.get(i).copied().unwrap_or(0)
+    pub fn read(&self, output: &mut [u8], offset: u64) -> usize {
+        let offset = offset as usize;
+        let count = self.byte_len().saturating_sub(offset).min(output.len());
+        for (index, byte) in (offset..offset + count).zip(output) {
+            *byte = self.buckets[index / 4].to_ne_bytes()[index % 4];
+        }
+        count
     }
 }
 
@@ -3665,7 +3766,7 @@ impl AlarmState {
         let alarm_time = if req.absolute {
             req.time
         } else {
-            current_time + req.time
+            current_time.saturating_add(req.time)
         };
 
         self.alarm_time = alarm_time;
@@ -4232,8 +4333,10 @@ pub mod rfork {
     pub const FLAGFSIGNA: u32 = 0x0008;
     /// Share file system (namespace)
     pub const FLAGFNS: u32 = 0x0010;
-    /// Share environment
-    pub const FLAGFENV: u32 = 0x0020;
+    /// Copy the environment instead of sharing it with the parent.
+    pub const COPY_ENV: u32 = 0x0020;
+    /// Start with an empty environment.
+    pub const EMPTY_ENV: u32 = 0x0800;
     /// Wait for child in rfork (Plan 9 specific)
     pub const FLAGFWAIT: u32 = 0x0040;
     /// Clone on fork (for threads)

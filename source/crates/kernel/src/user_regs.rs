@@ -163,8 +163,7 @@ pub struct Note {
     pub flag: u32,
     /// Process/TID to send note to
     pub pid: u32,
-    /// Note label string pointer
-    pub msg: u64,
+    pub msg: [u8; 128],
 }
 
 impl Default for Note {
@@ -175,21 +174,24 @@ impl Default for Note {
 
 impl Note {
     /// Create a new note
-    pub const fn new(pid: u32, msg: u64, flag: u32) -> Self {
-        Self { flag, pid, msg }
+    pub fn new(pid: u32, msg: &[u8], flag: u32) -> Self {
+        let mut note = Self { flag, pid, msg: [0; 128] };
+        let length = msg.len().min(note.msg.len() - 1);
+        note.msg[..length].copy_from_slice(&msg[..length]);
+        note
     }
 
     /// Create an empty (zeroed) note - const-compatible
     pub const fn empty() -> Self {
-        Self { flag: 0, pid: 0, msg: 0 }
+        Self { flag: 0, pid: 0, msg: [0; 128] }
     }
 
     /// Segfault note flag
-    pub const SEGFAULT: Note = Note { flag: 1, pid: 0, msg: 0 };
+    pub const SEGFAULT: Note = Note { flag: 1, pid: 0, msg: [0; 128] };
 
     /// Check if note is empty
     pub fn is_empty(&self) -> bool {
-        self.msg == 0
+        self.msg[0] == 0
     }
 }
 

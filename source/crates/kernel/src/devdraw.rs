@@ -96,7 +96,7 @@ impl DrawDev {
     pub fn new() -> Self {
         Self {
             name: "draw",
-            dev_char: 'd',
+            dev_char: 'i',
             contexts: Spinlock::new(Vec::new()),
             next_id: AtomicU64::new(1),
             screen: Spinlock::new(ScreenInfo::default()),

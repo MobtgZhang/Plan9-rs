@@ -215,6 +215,7 @@ impl Scheduler {
     fn create_idle(&mut self) {
         let mut proc = Box::new(Proc::new());
         proc.pid = self.procs.alloc_pid().unwrap_or(1);
+        proc.note_group = proc.pid;
         proc.state = State::Ready;
         proc.pri = PRI_KPROC;
         proc.basepri = PRI_KPROC;
@@ -737,9 +738,7 @@ impl Scheduler {
         // Close all file descriptors
         let proc_mut = core::ptr::addr_of!(*proc) as *mut Proc;
         unsafe {
-            if let Some(ref mut fgrp) = (*proc_mut).fgrp {
-                fgrp.close_all();
-            }
+            drop((*proc_mut).fgrp.take());
         }
 
         // Wakeup waiting parent
@@ -783,9 +782,6 @@ impl Scheduler {
             self.hzsched();
         }
         
-        // User-mode preemption is not performed in this prototype: switching
-        // from an IRQ stub would need the interrupted user frame to be saved
-        // and resumed, and the shell/fork paths handle their own transitions.
     }
 
     /// Yield CPU - current process voluntarily gives up CPU
@@ -861,15 +857,25 @@ impl Scheduler {
     /// - etc.
     pub fn fork(&mut self, parent: Option<&Proc>, entry: fn(), flags: u32) -> Option<Pid> {
         let mut proc = Box::new(Proc::new());
+        proc.wtime = plan9_arch::hal::timer::ms_since_boot();
 
         // Allocate PID
         proc.pid = self.procs.alloc_pid()?;
+        proc.note_group = proc.pid;
 
         // Copy parent info
         proc.parent = parent.map(|p| p.pid);
         if let Some(p) = parent {
-            proc.pri = p.pri;
+            proc.note_group = p.note_group;
+            proc.notify = p.notify;
+            proc.notified = p.notified;
+            proc.note_frames = p.note_frames.clone();
+            proc.last_note = p.last_note;
+            proc.private_memory = p.private_memory;
+            proc.pri = p.basepri;
             proc.basepri = p.basepri;
+            proc.fixedpri = p.fixedpri;
+            proc.wired = p.wired.clone();
 
             // Fork process groups based on flags
             proc.fork_groups(Some(p), flags);
@@ -877,6 +883,7 @@ impl Scheduler {
             // Inherit the textual working-directory path (`dot` itself is
             // per-process; userland's `pwd` reads this through GETCWD).
             proc.cwd_path = p.cwd_path.clone();
+            proc.exec_image = p.exec_image.as_ref().map(crate::dev::Chan::dup);
 
             // Inherit the parent's segment table (metadata only: the child
             // gets its own page-table copy or shares the parent's, depending
@@ -898,16 +905,13 @@ impl Scheduler {
                         None => return None,
                     };
                     unsafe {
-                        if crate::init_loader::copy_kernel_pml4_into(child_pml4).is_none() {
-                                return None;
+                        if crate::init_loader::copy_kernel_pml4_into(child_pml4).is_none()
+                            || crate::init_loader::copy_user_mappings(p.mmupdb.as_u64(), child_pml4).is_none()
+                        {
+                            crate::init_loader::release_user_root(child_pml4);
+                            return None;
                         }
-                            if crate::init_loader::copy_user_mappings(
-                            p.mmupdb.as_u64(),
-                            child_pml4,
-                        ).is_none() {
-                                return None;
-                        }
-                        }
+                    }
                     proc.mmupdb = child_pml4;
                 } else {
                     if !proc.setup_page_table() {
@@ -941,8 +945,12 @@ impl Scheduler {
 
         // Allocate kernel stack for the new process
         use crate::vm::alloc_frames;
-        if let Some(kstack_phys) = alloc_frames(KSTACK_SIZE / 4096) {
-            proc.kstack = crate::plan9_arch::hal::paging::phys_to_virt(kstack_phys).as_u64();
+        if proc.user_frame.is_none() {
+            if let Some(kstack_phys) = alloc_frames(KSTACK_SIZE / 4096) {
+                proc.kstack = crate::plan9_arch::hal::paging::phys_to_virt(kstack_phys).as_u64();
+            } else {
+                return None;
+            }
         }
 
         // Set up initial scheduler context for child.  A user fork child
@@ -985,7 +993,9 @@ impl Scheduler {
         }
 
         // Add to ready queue
-        self.ready(static_ref);
+        if static_ref.user_frame.is_none() {
+            self.ready(static_ref);
+        }
 
         Some(static_ref.pid)
     }

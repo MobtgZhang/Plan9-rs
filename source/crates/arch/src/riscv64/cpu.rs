@@ -21,10 +21,6 @@ pub fn hart_id() -> usize {
 const SSTATUS_SIE: u64 = 1 << 1;
 /// Supervisor timer interrupt enable in `sie`.
 const SIE_STIE: u64 = 1 << 5;
-/// Supervisor external interrupt enable in `sie`.
-const SIE_SEIE: u64 = 1 << 9;
-/// Supervisor software interrupt enable in `sie`.
-const SIE_SSIE: u64 = 1 << 1;
 
 #[inline(always)]
 pub unsafe fn disable_interrupts() {
@@ -67,7 +63,7 @@ pub fn interrupts_enabled() -> bool {
 pub unsafe fn enable_timer_interrupts() {
     core::arch::asm!(
         "csrs sie, {bits}",
-        bits = in(reg) SIE_STIE | SIE_SEIE | SIE_SSIE,
+        bits = in(reg) SIE_STIE,
         options(nostack)
     );
 }

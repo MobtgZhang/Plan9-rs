@@ -53,11 +53,12 @@ hang:
  * SVC from EL0 is a *synchronous* exception (EC=0x15) and vectors to the
  * 0x400 sync slot; the Rust dispatcher splits SVC from real faults.
  *
- * Trap frame layout (on the kernel stack, 272 bytes):
+ * Trap frame layout (on the kernel stack, 800 bytes):
  *   [8*i]  x0..x30    (i = 0..30; syscall number in x8, return in x0)
  *   [248]  PC         (ELR_EL1)
  *   [256]  PSTATE     (SPSR_EL1)
  *   [264]  user SP    (SP_EL0)
+ *   [272]  q0..q31, FPSR and FPCR
  * -------------------------------------------------------------------------- */
     .section .vectors, "ax"
     .balign 2048                    /* 2 KiB-aligned, 2 KiB total. */
@@ -96,6 +97,41 @@ _vectors_end:
  * Trap-frame save/restore macros.
  * -------------------------------------------------------------------------- */
     .text
+
+.macro SIMD_FRAME action, base
+    \action q0,  q1,  [\base, #0]
+    \action q2,  q3,  [\base, #32]
+    \action q4,  q5,  [\base, #64]
+    \action q6,  q7,  [\base, #96]
+    \action q8,  q9,  [\base, #128]
+    \action q10, q11, [\base, #160]
+    \action q12, q13, [\base, #192]
+    \action q14, q15, [\base, #224]
+    \action q16, q17, [\base, #256]
+    \action q18, q19, [\base, #288]
+    \action q20, q21, [\base, #320]
+    \action q22, q23, [\base, #352]
+    \action q24, q25, [\base, #384]
+    \action q26, q27, [\base, #416]
+    \action q28, q29, [\base, #448]
+    \action q30, q31, [\base, #480]
+.endm
+
+.macro SAVE_SIMD base, address, status, control
+    SIMD_FRAME stp, \base
+    add     \address, \base, #512
+    mrs     \status, fpsr
+    mrs     \control, fpcr
+    stp     \status, \control, [\address]
+.endm
+
+.macro RESTORE_SIMD base, address, status, control
+    SIMD_FRAME ldp, \base
+    add     \address, \base, #512
+    ldp     \status, \control, [\address]
+    msr     fpsr, \status
+    msr     fpcr, \control
+.endm
 
 /* Save x0..x30, PC, PSTATE and (EL0) user SP into the 272-byte frame at
  * the current SP.  Clobbers x20-x22 as scratch. */
@@ -136,6 +172,8 @@ _vectors_end:
  * memcpy run off the stack. */
 .macro RESTORE_AND_ERET
     mov     x28, x0
+    add     x9, x28, #272
+    RESTORE_SIMD x9, x10, x11, x12
     ldr     x9,  [x28, #264]        /* stage user SP                      */
     ldr     x10, [x28, #248]        /* stage PC                           */
     ldr     x11, [x28, #256]        /* stage PSTATE                       */
@@ -162,13 +200,7 @@ _vectors_end:
     ldr     x29, [x28, #232]
     ldr     x30, [x28, #240]
     ldr     x28, [x28, #224]
-    /* Restore SP_EL1 to its value at exception entry: the stub reserved
-     * 272 bytes below it, so adding them back makes each EL0 excursion
-     * stack-neutral.  Without this, SP_EL1 decays 272 bytes per exception
-     * and eventually runs off the bottom of the kernel boot stack,
-     * corrupting the .bss objects that live below it (e.g. the syscall
-     * table's function pointers). */
-    add     sp, sp, #272
+    add     sp, sp, #800
     eret
 .endm
 
@@ -177,20 +209,30 @@ _vectors_end:
 vec_park:
     b       vec_park
 
-/* EL0 synchronous exception: SVC (EC=0x15) goes to the syscall path;
- * anything else is fatal.  The Rust dispatcher reads ESR_EL1 itself. */
+/* EL0 synchronous exception: the Rust dispatcher reads ESR_EL1. */
 vec_el0_sync:
-    sub     sp, sp, #272
+    sub     sp, sp, #800
     SAVE_FRAME_FROM_EL0
+    add     x20, sp, #272
+    SAVE_SIMD x20, x21, x22, x23
     mov     x0, sp
     bl      aarch64_el0_sync_handler
     RESTORE_AND_ERET
 
 vec_el0_irq:
-    sub     sp, sp, #272
+    sub     sp, sp, #800
     SAVE_FRAME_FROM_EL0
+    add     x20, sp, #272
+    SAVE_SIMD x20, x21, x22, x23
     mov     x0, sp
     bl      aarch64_irq_handler
+    RESTORE_AND_ERET
+
+    .global aarch64_resume_frame
+aarch64_resume_frame:
+    adrp    x1, _bootstack_top
+    add     x1, x1, :lo12:_bootstack_top
+    sub     sp, x1, #800
     RESTORE_AND_ERET
 
 /* Kernel-mode IRQ (EL1): a light ack-and-return.  The stub must preserve
@@ -199,7 +241,7 @@ vec_el0_irq:
  * scratch registers live in x8).  ELR is restored last. */
     .balign 16
 vec_el1_irq:
-    sub     sp, sp, #256
+    sub     sp, sp, #784
     stp     x0, x1, [sp, #0]
     stp     x2, x3, [sp, #16]
     stp     x4, x5, [sp, #32]
@@ -213,7 +255,11 @@ vec_el1_irq:
     stp     x30, x29, [sp, #152]
     mrs     x29, elr_el1
     str     x29, [sp, #168]
+    add     x9, sp, #256
+    SAVE_SIMD x9, x10, x11, x12
     bl      aarch64_irq_el1_handler
+    add     x9, sp, #256
+    RESTORE_SIMD x9, x10, x11, x12
     ldp     x0, x1, [sp]
     ldp     x2, x3, [sp, #16]
     ldp     x4, x5, [sp, #32]
@@ -227,7 +273,7 @@ vec_el1_irq:
     ldr     x18, [sp, #168]         /* ELR via scratch (x18 reloaded next) */
     msr     elr_el1, x18
     ldr     x18, [sp, #144]
-    add     sp, sp, #256
+    add     sp, sp, #784
     eret
 
 /* Kernel-mode sync/data abort: fatal.  Pass ESR, FAR and ELR straight

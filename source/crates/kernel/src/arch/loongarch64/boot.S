@@ -190,7 +190,6 @@ _user_trap:
     ld.d    $t0,  $sp, 248
     csrwr   $t0, 0x6                   /* ERA := saved PC */
     ld.d    $t0,  $sp, 256
-    andi    $t0, $t0, 0xffb            /* clear PRMD.PIE (bit 2) */
     ori     $t0, $t0, 0x3              /* PRMD.PPLV = 3 (return to PLV3) */
     csrwr   $t0, 0x1                   /* PRMD */
 

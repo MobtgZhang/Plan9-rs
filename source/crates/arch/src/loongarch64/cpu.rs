@@ -216,5 +216,5 @@ pub fn timer_frequency() -> u64 {
         // QEMU virt: constant 100 MHz timer.
         return 100_000_000;
     }
-    (base & 0xFFFF) * mul / div
+    u64::from(base as u32) * mul / div
 }

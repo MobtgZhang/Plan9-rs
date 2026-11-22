@@ -26,8 +26,8 @@ const REG_STATUS_A: u8 = 0x0A;
 const REG_STATUS_B: u8 = 0x0B;
 const REG_CENTURY: u8 = 0x32;
 
-const STATUS_B_BCD: u8 = 0x02; // 1 = BCD encoded
-const STATUS_B_24H: u8 = 0x02 << 2; // 1 = 24-hour mode
+const STATUS_B_BINARY: u8 = 0x04;
+const STATUS_B_24H: u8 = 0x02;
 
 const PORT_INDEX: u16 = 0x70;
 const PORT_DATA: u16 = 0x71;
@@ -82,7 +82,12 @@ fn read_time() -> Option<RtcTime> {
     }
 
     let status_b = rtc_read(REG_STATUS_B);
-    let bcd = status_b & STATUS_B_BCD == 0;
+    let bcd = status_b & STATUS_B_BINARY == 0;
+    let hour_12h = status_b & STATUS_B_24H == 0;
+    let pm = hour_12h && cur[2] & 0x80 != 0;
+    if hour_12h {
+        cur[2] &= 0x7f;
+    }
 
     let mut vals = [0u32; 6];
     for i in 0..6 {
@@ -91,12 +96,7 @@ fn read_time() -> Option<RtcTime> {
 
     // Hour: bit 7 marks PM in 12-hour mode.
     let mut hour = vals[2];
-    if status_b & STATUS_B_24H == 0 {
-        let pm = hour & 0x80 != 0;
-        hour &= 0x7F;
-        if bcd {
-            hour = bcd_to_bin(hour as u8) as u32;
-        }
+    if hour_12h {
         if pm && hour < 12 {
             hour += 12;
         } else if !pm && hour == 12 {
@@ -134,8 +134,7 @@ fn days_from_civil(y: u32, m: u32, d: u32) -> i64 {
 
 /// Seconds since the Unix epoch, read from the CMOS RTC.
 ///
-/// Returns `None` on non-x86 targets (no port I/O) or when the RTC
-/// reports an invalid date.
+/// On targets without a CMOS RTC, use the boot epoch and elapsed seconds.
 pub fn now_unix() -> Option<i64> {
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -143,7 +142,7 @@ pub fn now_unix() -> Option<i64> {
         // generic timer (boot epoch, 2026-01-01) so `date` and file
         // timestamps stay monotonic and plausible.
         let boot_epoch: i64 = 1767225600; // 2026-01-01T00:00:00Z
-        Some(boot_epoch + crate::plan9_arch::hal::timer::ms_since_boot() as i64)
+        Some(boot_epoch + (crate::plan9_arch::hal::timer::ms_since_boot() / 1000) as i64)
     }
     #[cfg(target_arch = "x86_64")]
     {

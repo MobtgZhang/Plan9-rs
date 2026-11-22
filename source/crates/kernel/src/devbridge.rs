@@ -2,7 +2,7 @@
 
 //! Bridge Device Implementation
 //!
-//! Implements the Plan 9 bridge device (#l) for Ethernet bridging.
+//! Implements the bridge device (#B) for Ethernet bridging.
 //!
 //! ## Overview
 //!
@@ -185,7 +185,7 @@ impl BridgeDev {
     pub fn new() -> Self {
         Self {
             name: "bridge",
-            dev_char: 'l',
+            dev_char: 'B',
             bridges: Spinlock::new(Vec::new()),
         }
     }

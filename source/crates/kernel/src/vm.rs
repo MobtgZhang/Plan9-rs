@@ -1455,6 +1455,8 @@ impl UserPageTable {
 const PHYS_MAP_9000: u64 = 0xFFFF_9000_0000_0000; // MMIO window (UC)
 const PHYS_MAP_8800: u64 = 0xFFFF_8800_0000_0000; // phys_to_virt window (UC)
 const PHYS_MAP_LIMIT: u64 = 512 << 30;            // PDPT covers 512 GiB
+#[cfg(target_arch = "x86_64")]
+const MMIO_MAP_LIMIT: u64 = 2 * PHYS_MAP_LIMIT;
 
 /// Physical address of the kernel-owned PML4, installed on the first
 /// `map_phys_range` call.  0 until then.
@@ -1513,6 +1515,10 @@ unsafe fn ensure_kernel_page_table() -> u64 {
         Some(p) => p.as_u64(),
         None => return 0,
     };
+    let pdpt_mmio_high = match alloc_frame_zeroed() {
+        Some(p) => p.as_u64(),
+        None => return 0,
+    };
 
     // PML4[0]: full 512 GiB identity map (huge pages, RW, WB) so that
     // direct physical writes (alloc_frame_zeroed zeroing, module access,
@@ -1542,15 +1548,20 @@ unsafe fn ensure_kernel_page_table() -> u64 {
             (pdpt_mmio as *mut u64).add(i),
             ((i as u64) << 30) | 0x93u64,
         );
+        core::ptr::write_volatile(
+            (pdpt_mmio_high as *mut u64).add(i),
+            (PHYS_MAP_LIMIT + ((i as u64) << 30)) | 0x93u64,
+        );
     }
     core::ptr::write_volatile((pml4 as *mut u64).add(PML4_IDX_9000), pdpt_mmio | 0x3u64);
+    core::ptr::write_volatile((pml4 as *mut u64).add(PML4_IDX_9000 + 1), pdpt_mmio_high | 0x3u64);
 
     // Copy the firmware's remaining PML4 entries (GOP framebuffer window,
     // any firmware-reserved higher mappings).  Reading the firmware PML4
     // is fine: it is identity-mapped in the low 1 GiB and we only read.
     let old_cr3 = crate::plan9_arch::hal::mmu::cr3_read().as_u64() & 0x000F_FFFF_FFFF_F000;
     for i in 0..512usize {
-        if i == 0 || i == PML4_IDX_8800 || i == PML4_IDX_9000 {
+        if i == 0 || i == PML4_IDX_8800 || (PML4_IDX_9000..=PML4_IDX_9000 + 1).contains(&i) {
             continue;
         }
         let v = core::ptr::read_volatile((old_cr3 as *const u64).add(i));
@@ -1575,7 +1586,7 @@ unsafe fn ensure_kernel_page_table() -> u64 {
 ///
 /// x86_64: with the kernel-owned page table (see `ensure_kernel_page_table`)
 /// the phys-map windows are direct 1 GiB huge-page translations, so this is a
-/// pure address computation for any physical address below 512 GiB.
+/// pure address computation for any physical address below 1 TiB.
 ///
 /// aarch64/riscv64/loongarch64: the kernel's TTBR1/PGD direct-map window
 /// (`PHYS_MEMORY_VIRT`) covers physical RAM, and the firmware hands us the
@@ -1601,8 +1612,8 @@ pub unsafe fn map_phys_range(phys: u64, size: u64) -> *mut u8 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if phys_aligned >= PHYS_MAP_LIMIT || end > PHYS_MAP_LIMIT {
-            serial::put_bytes(b"[map_phys_range] FAILED: phys outside 512GiB window\n");
+        if phys_aligned >= MMIO_MAP_LIMIT || end > MMIO_MAP_LIMIT {
+            serial::put_bytes(b"[map_phys_range] FAILED: phys outside 1TiB window\n");
             return core::ptr::null_mut();
         }
 

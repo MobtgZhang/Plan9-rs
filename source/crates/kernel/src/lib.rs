@@ -59,6 +59,7 @@ pub mod vkey;
 // Devices
 pub mod cons;
 pub mod dev;
+mod devenv;
 pub mod devpipe;
 pub mod devsd;
 pub mod devfs;
@@ -69,12 +70,20 @@ pub mod devkb;
 pub mod devdraw;
 pub mod devaudio;
 pub mod devmnt;
+pub mod devfd;
 pub mod devtls;
 pub mod devbridge;
 pub mod devusb;
 pub mod devsrv;
 pub mod netfs;
+mod netlookup;
+mod netmux;
 pub mod netdrv;
+mod etherport;
+mod netstack;
+mod nettrace;
+mod rudp;
+mod esp;
 
 // Graphics
 pub mod vga;

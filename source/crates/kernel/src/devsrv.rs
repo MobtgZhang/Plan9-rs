@@ -1,288 +1,243 @@
-//! Srv Device - Service Device
-//!
-//! The srv device provides access to kernel services through the file system.
-//! It allows processes to open service connections and interact with them.
-//!
-//! Reference: Plan 9 sys/src/9/port/devsrv.c
+use alloc::{boxed::Box, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 
-// use alloc::sync::Arc;
-use alloc::string::String;
-use alloc::vec::Vec;
-use alloc::format;
-use alloc::boxed::Box;
-
-use crate::dev::{Dev, Chan, Qid, DirEntry, qidtype, Error as DevError, devtype};
+use crate::dev::{self, Chan, Dev, DirEntry, Error, Qid, qidtype};
 use crate::plan9_common::sync::Spinlock;
-// use crate::block::Block;
 
-// Type alias for convenience - using different name to avoid conflict
-type DevResult<T> = core::result::Result<T, DevError>;
+static SERVICES: Spinlock<Vec<Service>> = Spinlock::new(Vec::new());
+static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
 
-// ============================================================================
-// Srv Device Structure
-// ============================================================================
-
-/// Srv device
-pub struct SrvDev {
-    /// Device state
-    state: Spinlock<SrvState>,
+struct Service {
+    path: u64,
+    name: Vec<u8>,
+    owner: u32,
+    group: u32,
+    perm: u32,
+    channel: Option<Box<dyn crate::proc::Chan>>,
 }
 
-/// Service entry
-#[derive(Clone)]
-pub struct SrvEntry {
-    /// Service name
-    name: String,
-    /// Service description
-    description: String,
-    /// Whether service is active
-    active: bool,
-}
-
-/// Srv device state
-#[derive(Clone)]
-struct SrvState {
-    /// Registered services
-    services: Vec<SrvEntry>,
-    /// Next service ID
-    next_id: u32,
-}
+pub struct SrvDev;
 
 impl SrvDev {
-    /// Create a new srv device
     pub fn new() -> Self {
-        Self {
-            state: Spinlock::new(SrvState {
-                services: Vec::new(),
-                next_id: 1,
-            }),
-        }
-    }
-
-    /// Register a service
-    pub fn register_service(&self, name: &str, description: &str) -> u32 {
-        let mut state = self.state.lock();
-        let id = state.next_id;
-        state.next_id += 1;
-        state.services.push(SrvEntry {
-            name: String::from(name),
-            description: String::from(description),
-            active: true,
-        });
-        id
-    }
-
-    /// Unregister a service
-    pub fn unregister_service(&self, name: &str) -> bool {
-        let mut state = self.state.lock();
-        if let Some(pos) = state.services.iter().position(|s| s.name == name) {
-            state.services.remove(pos);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Get a service by name
-    pub fn get_service(&self, name: &str) -> Option<SrvEntry> {
-        let state = self.state.lock();
-        state.services.iter().find(|s| s.name == name).cloned()
-    }
-
-    /// List all services
-    pub fn list_services(&self) -> Vec<String> {
-        let state = self.state.lock();
-        state.services.iter().map(|s| s.name.clone()).collect()
+        Self
     }
 }
 
-impl Clone for SrvDev {
-    fn clone(&self) -> Self {
-        // Note: Cloning SrvDev creates a new handle to the same underlying state
-        // We just wrap the same Spinlock in a new struct
-        Self {
-            state: Spinlock::new(self.state.lock().clone()),
+pub(crate) fn is_service(chan: &Chan) -> bool {
+    chan.qid.path != 0 && dev::devs().find_by_char('s') == Some(chan.dev)
+}
+
+pub(crate) fn directory_records(device: usize) -> Result<Vec<u8>, Error> {
+    let services = SERVICES.lock();
+    let mut records = Vec::new();
+    for service in services.iter() {
+        records.extend(crate::devmnt::encode_stat(&service.stat(device), 's')?);
+    }
+    Ok(records)
+}
+
+impl Service {
+    fn stat(&self, device: usize) -> DirEntry {
+        DirEntry { dev: device, qid: Qid::new(self.path, 0, 0), mode: self.perm, atime: 0, mtime: 0,
+            length: 0, name: self.name.clone(), uid: self.owner, gid: self.group }
+    }
+}
+
+pub(crate) fn service_id(path: &[u8]) -> Result<Option<usize>, crate::vfs::VfsError> {
+    let chan = crate::vfs::namec(path, crate::vfs::NamecMode::Walk, 0, 0)?;
+    open_service(&chan, 0).map_err(crate::vfs::VfsError::from_dev_error)
+        .map(|file| file.open_id())
+}
+
+pub(crate) fn open_service(chan: &Chan, mode: u8) -> Result<Box<dyn crate::proc::Chan>, Error> {
+    if mode & !3 != 0 {
+        return Err(Error::Eperm);
+    }
+    let caller = crate::proc::curproc().ok_or(Error::Eperm)?;
+    let (published, required) = {
+        let services = SERVICES.lock();
+        let service = services.iter().find(|entry| entry.path == chan.qid.path)
+            .ok_or(Error::Enoent)?;
+        let access = match mode {
+            0 => 4,
+            1 => 2,
+            2 => 6,
+            _ => return Err(Error::Eperm),
+        };
+        let shift = if caller.uid == service.owner { 6 }
+            else if caller.gid == service.group || caller.groups.contains(&service.group) { 3 }
+            else { 0 };
+        if caller.uid != 0 && (service.perm >> shift) & access != access {
+            return Err(Error::Eperm);
         }
+        (service.channel.as_ref().ok_or(Error::Enoent)?.dup(), mode)
+    };
+    let actual = published.access_mode();
+    if actual != 2 && actual != required {
+        return Err(Error::Eperm);
     }
+    Ok(published)
 }
-
-impl Default for SrvDev {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ============================================================================
-// Dev Implementation
-// ============================================================================
 
 impl Dev for SrvDev {
-    fn attach(&mut self, _spec: Option<&str>) -> Result<Chan, DevError> {
-        Ok(Chan::new(
-            devtype::MNT,
-            Qid::new(0, 0, qidtype::DIR),
-            0,
-        ))
+    fn attach(&mut self, _spec: Option<&str>) -> Result<Chan, Error> {
+        Ok(Chan::new(dev::devtype::SRV, Qid::new(0, 0, qidtype::DIR), 0))
     }
 
-    fn walk(&mut self, chan: &mut Chan, name: &str) -> Result<Option<Qid>, DevError> {
-        let state = self.state.lock();
-        
-        // Check if service exists
-        if let Some(_service) = state.services.iter().find(|s| s.name == name) {
-            chan.qid = Qid::new(
-                0,
-                0,
-                0,
-            );
-            Ok(Some(chan.qid))
-        } else {
-            Err(DevError::Enoent)
+    fn walk(&mut self, chan: &mut Chan, name: &str) -> Result<Option<Qid>, Error> {
+        if name == ".." {
+            chan.qid = Qid::new(0, 0, qidtype::DIR);
+        } else if name != "." {
+            if chan.qid.path != 0 {
+                return Err(Error::Enotdir);
+            }
+            let services = SERVICES.lock();
+            let service = services.iter().find(|entry| entry.name == name.as_bytes())
+                .ok_or(Error::Enoent)?;
+            chan.qid = Qid::new(service.path, 0, 0);
         }
+        Ok(Some(chan.qid))
     }
 
-    fn open(&mut self, chan: &mut Chan, mode: u8) -> Result<(), DevError> {
-        chan.mode = mode;
+    fn open(&mut self, chan: &mut Chan, mode: u8) -> Result<(), Error> {
+        if chan.qid.path != 0 {
+            return Err(Error::Eexists);
+        }
+        if mode != 0 {
+            return Err(Error::Eisdir);
+        }
         Ok(())
     }
 
-    fn create(&mut self, _chan: &mut Chan, _name: &str, _mode: u8, _perm: u32) -> Result<(), DevError> {
-        Err(DevError::Eperm)
-    }
-
-    fn close(&mut self, _chan: &mut Chan) {
-    }
-
-    fn read(&mut self, _chan: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, DevError> {
-        let state = self.state.lock();
-
-        let mut total = 0;
-
-        for (i, service) in state.services.iter().enumerate() {
-            if (i as u64) < offset {
-                continue;
-            }
-
-            let entry = format!("{}\n", service.name);
-            let entry_bytes = entry.as_bytes();
-
-            if total + entry_bytes.len() > buf.len() {
-                break;
-            }
-
-            buf[total..total + entry_bytes.len()].copy_from_slice(entry_bytes);
-            total += entry_bytes.len();
+    fn create(&mut self, chan: &mut Chan, name: &str, mode: u8, perm: u32) -> Result<(), Error> {
+        if chan.qid.path != 0 || mode & 3 != 1 || perm & 0x8000_0000 != 0 || name.is_empty() {
+            return Err(Error::Eperm);
         }
-
-        Ok(total)
+        let caller = crate::proc::curproc().ok_or(Error::Eperm)?;
+        let mut services = SERVICES.lock();
+        if services.iter().any(|entry| entry.name == name.as_bytes()) {
+            return Err(Error::Eexists);
+        }
+        let path = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+        services.push(Service {
+            path, name: name.as_bytes().to_vec(), owner: caller.uid, group: caller.gid,
+            perm: perm & 0o777, channel: None,
+        });
+        chan.qid = Qid::new(path, 0, 0);
+        chan.mode = mode;
+        chan.flag |= dev::CREATED_OPEN;
+        Ok(())
     }
 
-    fn write(&mut self, _chan: &mut Chan, _buf: &[u8], _offset: u64) -> Result<usize, DevError> {
-        Err(DevError::Eperm)
+    fn close(&mut self, chan: &mut Chan) {
+        if chan.mode & 0x40 != 0 {
+            let removed = {
+                let mut services = SERVICES.lock();
+                services.iter().position(|entry| entry.path == chan.qid.path && entry.name != b"boot")
+                    .map(|index| services.remove(index))
+            };
+            drop(removed);
+        }
     }
 
-    fn stat(&mut self, chan: &mut Chan) -> Result<DirEntry, DevError> {
-        Ok(DirEntry {
-            dev: devtype::MNT,
-            qid: chan.qid,
-            mode: 0o0555 | 0o40000,
-            atime: 0,
-            mtime: 0,
-            length: 0,
-            name: b"srv".to_vec(),
-            uid: 0,
-            gid: 0,
-})
+    fn read(&mut self, chan: &mut Chan, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        if chan.qid.path != 0 {
+            return Err(Error::Eperm);
+        }
+        let mut listing = Vec::new();
+        for entry in SERVICES.lock().iter() {
+            listing.extend_from_slice(&entry.name);
+            listing.push(b'\n');
+        }
+        Ok(dev::read_bytes(&listing, buf, offset))
     }
 
-    fn wstat(&mut self, _chan: &mut Chan, _dir: &DirEntry) -> Result<(), DevError> {
-        Err(DevError::Eperm)
+    fn write(&mut self, chan: &mut Chan, buf: &[u8], offset: u64) -> Result<usize, Error> {
+        if chan.flag & dev::CREATED_OPEN == 0 || offset != 0 || buf.len() >= 32 {
+            return Err(Error::Eperm);
+        }
+        let fd = core::str::from_utf8(buf).map_err(|_| Error::Einval)?.trim()
+            .parse::<i32>().map_err(|_| Error::Einval)?;
+        let file = crate::vfs::fd_channel(fd).ok_or(Error::Ebadfd)?;
+        if file.dev() == chan.dev {
+            return Err(Error::Eperm);
+        }
+        if let Some(raw) = file.dev_chan() {
+            if raw.mode & 0x60 != 0 || raw.qid.type_ & 8 != 0 {
+                return Err(Error::Eperm);
+            }
+        }
+        let mut services = SERVICES.lock();
+        let service = services.iter_mut().find(|entry| entry.path == chan.qid.path)
+            .ok_or(Error::Enoent)?;
+        if service.channel.is_some() {
+            return Err(Error::Eexists);
+        }
+        service.channel = Some(file);
+        Ok(buf.len())
     }
 
-    fn remove(&mut self, _chan: &mut Chan) -> Result<(), DevError> {
-        Err(DevError::Eperm)
+    fn stat(&mut self, chan: &mut Chan) -> Result<DirEntry, Error> {
+        let services = SERVICES.lock();
+        if chan.qid.path == 0 {
+            Ok(DirEntry { dev: chan.dev, qid: chan.qid, mode: 0x8000_0000 | 0o777, atime: 0, mtime: 0,
+                length: 0, name: b"srv".to_vec(), uid: 0, gid: 0 })
+        } else {
+            let entry = services.iter().find(|entry| entry.path == chan.qid.path)
+                .ok_or(Error::Enoent)?;
+            Ok(entry.stat(chan.dev))
+        }
     }
 
-    fn dev_char(&self) -> char {
-        's'
+    fn wstat(&mut self, chan: &mut Chan, entry: &DirEntry) -> Result<(), Error> {
+        let caller = crate::proc::curproc().ok_or(Error::Eperm)?;
+        let mut services = SERVICES.lock();
+        let index = services.iter().position(|service| service.path == chan.qid.path)
+            .ok_or(Error::Enoent)?;
+        let service = &services[index];
+        if caller.uid != 0 && caller.uid != service.owner {
+            return Err(Error::Eperm);
+        }
+        if entry.name.is_empty() || entry.name == b"." || entry.name == b".."
+            || entry.name.contains(&b'/') || entry.name.contains(&0)
+        {
+            return Err(Error::Einval);
+        }
+        if entry.name != service.name {
+            if service.name == b"boot" {
+                return Err(Error::Eperm);
+            }
+            if services.iter().any(|other| other.name == entry.name) {
+                return Err(Error::Eexists);
+            }
+        }
+        let service = &mut services[index];
+        service.name.clone_from(&entry.name);
+        service.owner = entry.uid;
+        service.group = entry.gid;
+        service.perm = entry.mode & 0o777;
+        Ok(())
     }
 
-    fn name(&self) -> &'static str {
-        "srv"
-    }
-}
-
-// ============================================================================
-// Global Srv Device Instance
-// ============================================================================
-
-use core::sync::atomic::{AtomicPtr, Ordering};
-
-static SRV_DEVICE: AtomicPtr<SrvDev> = AtomicPtr::new(core::ptr::null_mut());
-
-/// Initialize the srv device
-pub fn init_srv() {
-    let dev = Box::new(SrvDev::new());
-    
-    // Register default services
-    dev.register_service("cons", "Console service");
-    dev.register_service("fs", "File system service");
-    dev.register_service("auth", "Authentication service");
-    
-    let ptr = Box::into_raw(dev);
-    SRV_DEVICE.store(ptr, Ordering::SeqCst);
-}
-
-/// Get the srv device
-pub fn srv_device() -> &'static SrvDev {
-    unsafe { &*SRV_DEVICE.load(Ordering::SeqCst) }
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_srv_creation() {
-        let srv = SrvDev::new();
-        assert!(srv.list_services().is_empty());
+    fn remove(&mut self, chan: &mut Chan) -> Result<(), Error> {
+        let caller = crate::proc::curproc().ok_or(Error::Eperm)?;
+        let removed = {
+            let mut services = SERVICES.lock();
+            let index = services.iter().position(|entry| entry.path == chan.qid.path)
+                .ok_or(Error::Enoent)?;
+            let entry = &services[index];
+            if entry.name == b"boot" || caller.uid != 0 && caller.uid != entry.owner
+                && (entry.owner == 0 || entry.perm & 7 != 7)
+            {
+                return Err(Error::Eperm);
+            }
+            services.remove(index)
+        };
+        drop(removed);
+        Ok(())
     }
 
-    #[test]
-    fn test_register_service() {
-        let srv = SrvDev::new();
-        let id = srv.register_service("test", "Test service");
-        assert_eq!(id, 1);
-        
-        let services = srv.list_services();
-        assert_eq!(services.len(), 1);
-        assert_eq!(services[0], "test");
-    }
-
-    #[test]
-    fn test_unregister_service() {
-        let srv = SrvDev::new();
-        srv.register_service("test", "Test service");
-        
-        assert!(srv.unregister_service("test"));
-        assert!(srv.list_services().is_empty());
-        
-        assert!(!srv.unregister_service("nonexistent"));
-    }
-
-    #[test]
-    fn test_get_service() {
-        let srv = SrvDev::new();
-        srv.register_service("test", "Test service");
-        
-        let service = srv.get_service("test");
-        assert!(service.is_some());
-        assert_eq!(service.unwrap().description, "Test service");
-        
-        assert!(srv.get_service("nonexistent").is_none());
-    }
+    fn dev_char(&self) -> char { 's' }
+    fn name(&self) -> &'static str { "srv" }
 }

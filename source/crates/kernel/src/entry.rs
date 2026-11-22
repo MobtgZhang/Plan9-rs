@@ -769,7 +769,7 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
 
     // Wire the E1000 NIC into the kernel TCP path before /net is mounted.
     serial::put_bytes(b"[kstart] netdrv::init\n");
-    crate::netdrv::init();
+    crate::netstack::init();
 
     // Step 4 — devices, root file system, and namespace mounts.
     // These allocate Boxes/Vectors, so they must run after heap_init().
@@ -854,6 +854,19 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
         unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
     }
 
+    #[cfg(target_arch = "riscv64")]
+    {
+        plan9_arch::riscv64::timer::set_oneshot(1);
+        unsafe { plan9_arch::riscv64::cpu::enable_timer_interrupts() };
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    {
+        plan9_arch::loongarch64::timer::init_timer();
+        plan9_arch::loongarch64::timer::clear_interrupt();
+        plan9_arch::loongarch64::timer::set_oneshot(1);
+    }
+
     // Step 5 — load init and switch to user mode.
     // Bring the other CPUs online first: they park until the scheduler is
     // made multi-CPU, but bring-up is the hard part of SMP.
@@ -876,6 +889,11 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     if let Some(proc) = crate::proc::curproc_mut() {
         proc.mmupdb = init_image.pml4;
         proc.set_text(b"init");
+        proc.exec_image = crate::vfs::open(b"/boot/init", 0).ok();
+        if let Some(group) = &proc.egrp {
+            group.values.set_boot_value("cputype", crate::devenv::CPU_TYPE);
+            group.values.set_boot_value("objtype", crate::devenv::CPU_TYPE);
+        }
         // Publish the segment layout so /proc/1/mem and status report the
         // real text/data/stack ranges.
         for (i, (tag, base, top)) in init_loader::take_user_segments().iter().enumerate() {
@@ -974,13 +992,19 @@ fn install_rootfs(boot: &BootInfo) {
 fn mount_standard_devices() {
     let mounts: &[(&[u8], &[u8], &[u8])] = &[
         (b"#c", b"/dev/console", b"cons"),
-        (b"#d", b"/dev/draw", b"draw"),
+        (b"#c", b"/dev/cons", b"cons"),
+        (b"#n", b"/dev/null", b"null"),
+        (b"#z", b"/dev/zero", b"zero"),
+        (b"#e", b"/env", b"env"),
+        (b"#i", b"/dev/draw", b"draw"),
+        (b"#d", b"/fd", b"fd"),
         (b"#m", b"/dev/mouse", b"mouse"),
         (b"#k", b"/dev/kbd", b"kbd"),
         (b"#a", b"/dev/audio", b"audio"),
-        (b"#s", b"/dev/sd", b"sd"),
+        (b"#S", b"/dev/sd", b"sd"),
         (b"#f/sd1", b"/mnt", b"fs"),
         (b"#p", b"/proc", b"proc"),
+        (b"#s", b"/srv", b"srv"),
         (b"#|", b"/dev/pipe", b"pipe"),
         (b"#U", b"/dev/uart", b"uart"),
         (b"#u", b"/dev/usb", b"usb"),

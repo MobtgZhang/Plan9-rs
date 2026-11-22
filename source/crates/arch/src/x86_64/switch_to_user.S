@@ -73,9 +73,10 @@ switch_to_user_trampoline:
  *
  * The frame layout is:
  *    0  r15      8  r14     16 r13     24 r12
- *   32  rbp     40 rbx     48 rdx     56 rsi
- *   64  rdi     72 rax     80 rip     88 cs
- *   96  rflags 104 rsp    112 ss
+ *   32  r11     40 r10     48 r9      56 r8
+ *   64  rbp     72 rdi     80 rsi     88 rdx
+ *   96  rcx    104 rbx    112 rax    120 rip
+ *  128  cs     136 rflags 144 rsp    152 ss
  *
  * Install the process address space, restore the user-visible registers,
  * point RSP at the IRET part of the frame, and iretq into ring 3.
@@ -95,12 +96,15 @@ kernel_resume_user:
     mov     8(%r11),   %r14
     mov     16(%r11),  %r13
     mov     24(%r11),  %r12
-    mov     32(%r11),  %rbp
-    mov     40(%r11),  %rbx
-    mov     48(%r11),  %rdx
-    mov     56(%r11),  %rsi
-    mov     64(%r11),  %rdi
-    mov     72(%r11),  %rax
+    mov     48(%r11),  %r9
+    mov     56(%r11),  %r8
+    mov     64(%r11),  %rbp
+    mov     72(%r11),  %rdi
+    mov     80(%r11),  %rsi
+    mov     88(%r11),  %rdx
+    mov     96(%r11),  %rcx
+    mov     104(%r11), %rbx
+    mov     112(%r11), %rax
 
     /* Load user data segments; use R10 so RAX keeps its return value. */
     mov     $0x2b, %r10
@@ -109,7 +113,8 @@ kernel_resume_user:
     mov     %r10w, %fs
     mov     %r10w, %gs
 
-    /* IRET frame starts at offset 80 inside the saved frame. */
-    lea     80(%r11), %rsp
+    lea     120(%r11), %rsp
+    mov     40(%r11), %r10
+    mov     32(%r11), %r11
     iretq
     .size   kernel_resume_user, . - kernel_resume_user

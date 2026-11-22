@@ -100,14 +100,15 @@ pub unsafe fn switch_to_user_trampoline(pml4_phys: u64, frame_ptr: u64) -> ! {
 
 /// Resume a user process after a kernel-mode syscall/trap.
 ///
-/// `frame_ptr` points to a full 272-byte trap frame saved by the vector
-/// entry code (x0..x30 at [8*i], PC at [248], PSTATE at [256], user SP
-/// at [264]); `pml4_phys` is the process root table. Equivalent to the
-/// x86 `kernel_resume_user(frame_ptr, pml4_phys)` used after a syscall.
+/// `frame_ptr` points to the full general-purpose and SIMD trap frame.
+/// `pml4_phys` is the process root table.
 ///
 /// # Safety
 /// Never returns.
 pub unsafe fn kernel_resume_user(frame_ptr: u64, pml4_phys: u64) -> ! {
+    unsafe extern "C" {
+        fn aarch64_resume_frame(frame: u64) -> !;
+    }
     write_sysreg!("TTBR0_EL1", pml4_phys);
     super::cpu::dsb_sy();
     // Same constraint as `switch_to_user_trampoline`: no ASIDs means a
@@ -117,43 +118,5 @@ pub unsafe fn kernel_resume_user(frame_ptr: u64, pml4_phys: u64) -> ! {
     // stack writes into the parent's frames.
     super::mmu::flush_tlb();
     super::cpu::isb();
-    core::arch::asm!(
-        // The frame base lives in x20; its saved value ([base+160]) is
-        // reloaded last, after every other read through the base.
-        "mov x20, x0",
-        "ldp x0, x1, [x20]",
-        "ldp x2, x3, [x20, #16]",
-        "ldp x4, x5, [x20, #32]",
-        "ldp x6, x7, [x20, #48]",
-        "ldp x8, x9, [x20, #64]",
-        "ldp x10, x11, [x20, #80]",
-        "ldp x12, x13, [x20, #96]",
-        "ldp x14, x15, [x20, #112]",
-        "ldp x16, x17, [x20, #128]",
-        "ldp x18, x19, [x20, #144]",
-        "ldr x21, [x20, #168]",
-        // Stage user SP/PC/PSTATE and install them into the system
-        // registers *immediately* — eret is the only consumer, and doing
-        // the msr's up front frees x22/x23/x24 for the user-value reload
-        // below.  (The staging registers are user-visible callee-saved
-        // registers; leaving SP/PC/PSTATE in them destroyed the user's
-        // own x22/x23/x24 on every syscall return — the same bug
-        // RESTORE_AND_ERET in boot.S already fixed for the trap path.)
-        "ldr x22, [x20, #264]",  // user SP
-        "ldr x23, [x20, #248]",  // PC
-        "ldr x24, [x20, #256]",  // PSTATE
-        "msr sp_el0, x22",
-        "msr elr_el1, x23",
-        "msr spsr_el1, x24",
-        "ldp x22, x23, [x20, #176]",  // the user's own x22/x23
-        "ldr x24, [x20, #192]",       // the user's own x24
-        "ldp x25, x26, [x20, #200]",
-        "ldp x27, x28, [x20, #216]",
-        "ldr x29, [x20, #232]",
-        "ldr x30, [x20, #240]",
-        "ldr x20, [x20, #160]",  // x20 last (base no longer needed)
-        "eret",
-        in("x0") frame_ptr,
-        options(noreturn, nostack)
-    );
+    aarch64_resume_frame(frame_ptr)
 }

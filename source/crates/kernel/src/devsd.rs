@@ -379,7 +379,7 @@ impl SdDev {
         
         Self {
             name: "sd",
-            dev_char: 's',
+            dev_char: 'S',
             units: core::cell::UnsafeCell::new(units),
             next_unit: AtomicUsize::new(0),
         }
@@ -426,7 +426,7 @@ impl SdDev {
     /// concrete `SdDev` so the filesystem device reads from the same units
     /// that `init()` populated with AHCI backends.
     pub fn get_global() -> &'static SdDev {
-        if let Some(idx) = crate::dev::devs().find_by_char('s') {
+        if let Some(idx) = crate::dev::devs().find_by_char('S') {
             if let Some(dev) = crate::dev::devs().get(idx) {
                 if let Some(sd) = dev.as_any().downcast_ref::<SdDev>() {
                     return sd;

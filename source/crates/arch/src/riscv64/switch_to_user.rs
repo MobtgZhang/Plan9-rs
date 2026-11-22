@@ -3,7 +3,7 @@
 //!
 //! The kernel runs in S-mode; user code in U-mode. `sret` returns:
 //!   * sepc    = user entry point
-//!   * sstatus = SPP=0 (U-mode), SPIE=1 (interrupts enabled), SIE=0
+//!   * sstatus = SPP=0 (U-mode), SPIE=0, SIE=0
 //!   * sp      = user stack pointer
 //!
 //! The user root table (satp) is switched before the `sret`; the kernel
@@ -14,10 +14,8 @@
 extern crate plan9_common;
 
 /// Initial `sstatus` for user entry: SPP=0 (U-mode), SPIE=0, i.e. 0.
-/// SPIE must be clear: `sret` copies SPIE into SIE, and with the trap
-/// handler reserved for exceptions we keep the S-mode interrupt enable
-/// off in user mode — `ecall` exceptions are not gated by SIE, so
-/// syscalls still reach the kernel.  (Bit 5 = SPIE.)
+/// `sret` copies SPIE into SIE. The supervisor timer can interrupt U-mode
+/// even when SIE is clear, while S-mode can run with interrupts masked.
 pub const USER_SSTATUS_INIT: u64 = 0;
 
 /// Selectors kept for API parity with the x86_64 module.
