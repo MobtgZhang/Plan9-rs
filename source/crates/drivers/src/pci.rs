@@ -115,6 +115,15 @@ pub struct PciBarIo {
 // PCI Access Functions
 // ============================================================================
 
+pub fn mmio_address(physical: u64) -> u64 {
+    #[cfg(target_arch = "riscv64")]
+    return crate::plan9_arch::hal::mmu::paging_phys_to_virt(physical);
+    #[cfg(target_arch = "loongarch64")]
+    return crate::plan9_arch::hal::mmu::mmio_phys_to_virt(physical);
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+    physical
+}
+
 /// Read PCI configuration dword
 #[cfg(any(
     target_arch = "aarch64",
@@ -126,9 +135,7 @@ pub fn pci_config_read(addr: PciConfigAddr) -> u32 {
     // ECAM window.  QEMU aarch64 virt exposes the Enhanced Configuration
     // Access at VIRT_PCIE_ECAM = 0x40_1000_0000, QEMU riscv64 virt at
     // 0x3000_0000 and QEMU loongarch64 virt at 0x2000_0000 (4 KiB per
-    // function slot each); the kernel identity-maps the containing block
-    // (on loongarch64 via the DMW0 direct-map window at PLV0), so
-    // VA = PA.
+    // function slot each).
     #[cfg(target_arch = "aarch64")]
     const ECAM: u64 = 0x40_1000_0000;
     #[cfg(target_arch = "riscv64")]
@@ -141,7 +148,7 @@ pub fn pci_config_read(addr: PciConfigAddr) -> u32 {
     let func = ((a >> 8) & 0x07) as u64;
     let off  = (a & 0xFC) as u64;
     let p = ECAM + (bus << 20) + (dev << 15) + (func << 12) + off;
-    unsafe { core::ptr::read_volatile(p as *const u32) }
+    unsafe { core::ptr::read_volatile(mmio_address(p) as *const u32) }
 }
 
 /// Read PCI configuration dword
@@ -177,7 +184,7 @@ pub fn pci_config_write(addr: PciConfigAddr, val: u32) {
     let func = ((a >> 8) & 0x07) as u64;
     let off  = (a & 0xFC) as u64;
     let p = ECAM + (bus << 20) + (dev << 15) + (func << 12) + off;
-    unsafe { core::ptr::write_volatile(p as *mut u32, val) }
+    unsafe { core::ptr::write_volatile(mmio_address(p) as *mut u32, val) }
 }
 
 /// Write PCI configuration dword
@@ -332,18 +339,6 @@ pub struct PciDeviceIter {
 
 impl PciDeviceIter {
     pub fn new() -> Self {
-        // The loongarch64 virt ECAM base is not wired up yet (a config
-        // read through an unmapped window would fault), so publish an
-        // empty PCI bus for now — the boot path does not depend on PCI
-        // devices there.
-        #[cfg(target_arch = "loongarch64")]
-        return Self {
-            current_bus: 0,
-            current_dev: 0,
-            current_func: 0,
-            done: true,
-        };
-        #[cfg(not(target_arch = "loongarch64"))]
         Self {
             current_bus: 0,
             current_dev: 0,
