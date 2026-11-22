@@ -40,7 +40,7 @@ ISO_FILE     := $(BUILD_DIR)/plan9.iso
 # Cargo commands should run from source/ where the workspace is.
 CARGO_CMD = cd $(SOURCE_DIR) && $(CARGO)
 
-.PHONY: all build-tool kernel init esp rootfs iso check-all clean run run-console run-serial boot-smoke help
+.PHONY: all build-tool kernel init esp rootfs iso check-all clean run run-console run-serial boot-smoke net-smoke mount-smoke help
 
 # =============================================================================
 # Build targets (delegate to build-tool)
@@ -91,19 +91,23 @@ UEFI_PFLASH = -drive if=pflash,format=raw,readonly=on,file="$(UEFI_FW)" \
 UEFI_ARGS = $(if $(UEFI_VARS),$(UEFI_PFLASH),-bios "$(UEFI_FW)")
 
 QEMU_UEFI_KEYBOARD = -device qemu-xhci -device usb-kbd
-QEMU_MACHINE_aarch64 = -M virt -cpu cortex-a72 -device ramfb $(QEMU_UEFI_KEYBOARD) -device virtio-keyboard-device
+QEMU_MACHINE_aarch64 = -M virt,highmem-mmio=off -cpu cortex-a72 -device ramfb $(QEMU_UEFI_KEYBOARD) -device virtio-keyboard-device
 QEMU_MACHINE_riscv64 = -M virt -device VGA $(QEMU_UEFI_KEYBOARD) -device virtio-keyboard-device
 QEMU_MACHINE_loongarch64 = -M virt -cpu la464 -device VGA $(QEMU_UEFI_KEYBOARD) -device virtio-keyboard-pci
+QEMU_NIC ?= e1000
 QEMU_CMD = qemu-system-$(ARCH) $(QEMU_MACHINE_$(ARCH)) -m $(MEM) $(UEFI_ARGS) \
+	-netdev user,id=net0$(QEMU_NET_OPTIONS) -device $(QEMU_NIC),netdev=net0 $(QEMU_EXTRA_NETWORK) \
 	-cdrom "$(ISO_FILE)" -monitor none
 
 run: QEMU_OUTPUT = -display gtk
 run-console: QEMU_OUTPUT = -display none -serial stdio
 run-serial: QEMU_OUTPUT = -display none -serial file:"$(BUILD_DIR)/serial.log"
-boot-smoke: QEMU_OUTPUT = -display none -serial stdio
+boot-smoke net-smoke mount-smoke: QEMU_OUTPUT = -display none -serial stdio
 boot-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" "$(ARCH)" "$(BUILD_DIR)/smoke-serial.log" --
+net-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --network "$(ARCH)" "$(BUILD_DIR)/net-serial.log" --
+mount-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --mount "$(ARCH)" "$(BUILD_DIR)/mount-serial.log" --
 
-run run-console run-serial boot-smoke: iso
+run run-console run-serial boot-smoke net-smoke mount-smoke: iso
 	@test -f "$(UEFI_FW)" || { echo "No UEFI firmware for $(ARCH); set UEFI_FW_$(ARCH)." >&2; exit 1; }
 	@if [ "$(ARCH)" = "riscv64" ] || [ -n "$(UEFI_VARS)" ]; then \
 		test -f "$(UEFI_VARS)" || { echo "No UEFI variables image for $(ARCH); set UEFI_VARS_$(ARCH)." >&2; exit 1; }; \
@@ -133,6 +137,8 @@ help:
 	@echo "  run-console  - Launch QEMU with an interactive serial console"
 	@echo "  run-serial   - Launch QEMU with serial output to build/<arch>/serial.log"
 	@echo "  boot-smoke   - Test the GOP menu, graphical keyboard and shell"
+	@echo "  net-smoke    - Test DHCP, ICMP, TCP and UDP in QEMU"
+	@echo "  mount-smoke  - Test authenticated 9P mounts and remote file operations in QEMU"
 	@echo ""
 	@echo "Variables:"
 	@echo "  ARCH=x86_64|aarch64|riscv64|loongarch64"

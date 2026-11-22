@@ -239,6 +239,7 @@ impl Builder {
             "clear", "env", "basename", "dirname", "true", "false", "cmp", "diff",
             "nl", "more", "rmdir", "ln", "uptime", "who", "expr", "fortune",
             "units", "dc", "ed", "yes", "tty", "uname", "printf",
+            "ping", "netcat", "ipconfig", "snoopy", "traceroute", "bind", "mount", "unmount",
         ] {
             let src = release.join(name);
             if !src.exists() {
@@ -247,6 +248,22 @@ impl Builder {
             std::fs::copy(&src, bin_dir.join(name))?;
             installed.push(name.to_string());
         }
+        let ip_bin_dir = bin_dir.join("ip");
+        std::fs::create_dir_all(&ip_bin_dir)?;
+        for name in ["ping", "ipconfig", "traceroute"] {
+            std::fs::copy(release.join(name), ip_bin_dir.join(name))?;
+            installed.push(format!("ip/{name}"));
+        }
+        let ndb_bin_dir = bin_dir.join("ndb");
+        std::fs::create_dir_all(&ndb_bin_dir)?;
+        for name in ["csquery", "dnsquery"] {
+            std::fs::copy(release.join(name), ndb_bin_dir.join(name))?;
+            installed.push(format!("ndb/{name}"));
+        }
+        let aux_bin_dir = bin_dir.join("aux");
+        std::fs::create_dir_all(&aux_bin_dir)?;
+        std::fs::copy(release.join("procsmoke"), aux_bin_dir.join("procsmoke"))?;
+        installed.push("aux/procsmoke".to_string());
         // Plan 9 keeps the shell in /rc/bin.
         std::fs::copy(release.join("rc"), rc_bin_dir.join("rc"))?;
         installed.push("rc@/rc/bin".to_string());
@@ -450,11 +467,11 @@ impl Builder {
 
         // Create standard Plan 9 directory structure
         let plan9_dirs = [
-            "bin", "boot", "cfg", "dev", "etc", "home", "home/glenda", "proc",
-            "tmp", "usr", "adm", "env", "fd", "mnt", "n", "net", "rc", "rc/bin",
+            "bin", "boot", "cfg", "dev", "etc", "home", "proc",
+            "tmp", "usr", "adm", "env", "fd", "mnt", "n", "net", "rc", "rc/bin", "rc/lib",
             "srv", "lib", "lib/modules", "lib/modules/dev",
             "lib/modules/fs", "lib/modules/ipc", "lib/modules/net",
-            "usr/glenda",
+            "usr/glenda/lib", "usr/root/lib",
         ];
 
         for dir in &plan9_dirs {
@@ -462,6 +479,11 @@ impl Builder {
             std::fs::create_dir_all(&path)?;
         }
         std::fs::create_dir_all(self.rootfs_dir().join("lib").join("fonts"))?;
+
+        let rootfs_source = self.source_dir.join("rootfs");
+        for path in ["rc/lib/rcmain", "rc/bin/termrc", "usr/root/lib/profile", "usr/glenda/lib/profile"] {
+            std::fs::copy(rootfs_source.join(path), self.rootfs_dir().join(path))?;
+        }
 
         // Touch stamp file
         std::fs::write(self.stamp_file("rootfs-stamp"), "")?;
@@ -693,7 +715,16 @@ impl Builder {
         // Build a FAT16 ESP image holding the boot loader, kernel, init and rootfs.
         // xorriso's -e needs a real FAT El Torito boot image, not a directory.
         let esp_img = tmp_dir.path().join("esp.img");
-        std::fs::File::create(&esp_img)?.set_len(24 * 1024 * 1024)?;
+        let mut payload_size = 0;
+        for path in [self.boot_efi(), self.kernel_boot_elf(), self.rootfs_cpio()] {
+            payload_size += std::fs::metadata(path)?.len();
+        }
+        if self.init_boot_elf().exists() {
+            payload_size += std::fs::metadata(self.init_boot_elf())?.len();
+        }
+        const MIB: u64 = 1024 * 1024;
+        let esp_size = (payload_size.div_ceil(MIB) + 2).max(24) * MIB;
+        std::fs::File::create(&esp_img)?.set_len(esp_size)?;
         let mkfs = Command::new("mkfs.vfat")
             .arg("-F")
             .arg("16")
