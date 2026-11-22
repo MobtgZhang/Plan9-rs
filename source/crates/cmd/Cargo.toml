@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Plan 9 user-space commands, ported to Rust and built for the bare-metal x86_64 kernel"
 
+[dependencies]
+linked_list_allocator = "0.10.6"
+
 [lib]
 name = "cmd"
 path = "src/lib.rs"

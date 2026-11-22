@@ -39,12 +39,13 @@ pub mod lineedit;
 pub mod ls;
 pub mod mkdir;
 pub mod mv;
+pub mod namespace;
+pub mod network;
 pub mod passwd;
 pub mod passwd_cmd;
 pub mod printf;
 pub mod ps;
 pub mod pwd;
-pub mod rc;
 pub mod rm;
 pub mod seq;
 pub mod sleep;
@@ -348,17 +349,77 @@ pub fn list_dir(path: &str, buf: &mut [u8]) -> i64 {
     syscall::list(p.as_ptr(), buf.as_mut_ptr(), buf.len())
 }
 
+pub struct DirReader {
+    fd: i64,
+    buf: [u8; 1024],
+    end: usize,
+    pos: usize,
+}
+
+impl DirReader {
+    pub fn new(fd: i64) -> Self {
+        Self { fd, buf: [0; 1024], end: 0, pos: 0 }
+    }
+
+    pub fn next_name(&mut self) -> Option<&[u8]> {
+        if self.pos == self.end {
+            let count = syscall::read(self.fd, self.buf.as_mut_ptr(), self.buf.len());
+            if count <= 0 {
+                return None;
+            }
+            self.end = count as usize;
+            self.pos = 0;
+        }
+        let (size, _) = self.buf.get(self.pos..self.end)?.split_first_chunk::<2>()?;
+        let end = self.pos + 2 + u16::from_le_bytes(*size) as usize;
+        let name = stat_name(self.buf.get(self.pos..self.end)?.get(..end - self.pos)?)?;
+        self.pos = end;
+        Some(name)
+    }
+}
+
 /// `stat` text for `path`: "name mode length qid\n".
 pub fn stat_text(path: &str, buf: &mut [u8]) -> Option<usize> {
-    let mut p = [0u8; 256];
-    let n = path.len().min(255);
-    p[..n].copy_from_slice(path.as_bytes());
-    let rc = syscall::stat(p.as_ptr(), buf.as_mut_ptr(), buf.len());
-    if rc < 0 {
-        None
-    } else {
-        Some(rc as usize)
+    use core::fmt::Write;
+
+    struct Output<'a> {
+        bytes: &'a mut [u8],
+        count: usize,
     }
+
+    impl Write for Output<'_> {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let count = text.len().min(self.bytes.len() - self.count);
+            self.bytes[self.count..self.count + count].copy_from_slice(&text.as_bytes()[..count]);
+            self.count += count;
+            Ok(())
+        }
+    }
+
+    let mut path_bytes = [0u8; 256];
+    path_bytes.get_mut(..path.len())?.copy_from_slice(path.as_bytes());
+    if path.len() == path_bytes.len() {
+        return None;
+    }
+    let mut record = [0u8; 1024];
+    let count = usize::try_from(syscall::stat(path_bytes.as_ptr(), record.as_mut_ptr(), record.len())).ok()?;
+    let record = record.get(..count)?;
+    let name = core::str::from_utf8(stat_name(record)?).ok()?;
+    let mode = u32::from_le_bytes(record[21..25].try_into().ok()?);
+    let length = u64::from_le_bytes(record[33..41].try_into().ok()?);
+    let qid = u64::from_le_bytes(record[13..21].try_into().ok()?);
+    let mut output = Output { bytes: buf, count: 0 };
+    writeln!(output, "{name} {mode} {length} {qid}").ok()?;
+    Some(output.count)
+}
+
+pub fn stat_name(record: &[u8]) -> Option<&[u8]> {
+    let size = u16::from_le_bytes(record.get(..2)?.try_into().ok()?) as usize;
+    if size + 2 != record.len() {
+        return None;
+    }
+    let length = u16::from_le_bytes(record.get(41..43)?.try_into().ok()?) as usize;
+    record.get(43..43 + length)
 }
 
 // ---------------------------------------------------------------------------

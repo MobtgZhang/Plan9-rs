@@ -119,7 +119,7 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
         },
     };
 
-    // Default home directory: /home/<name>.
+    // Default home directory: /usr/<name>.
     let mut home_buf = [0u8; 128];
     let home: &[u8] = match home_arg {
         Some(h) => {
@@ -129,7 +129,7 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
         }
         None => {
             let mut n = 0usize;
-            for &b in b"/home/" {
+            for &b in b"/usr/" {
                 home_buf[n] = b;
                 n += 1;
             }
@@ -414,7 +414,7 @@ fn write_profile(home: &[u8]) {
     file[m..m + 8].copy_from_slice(b"/profile");
     let fd = crate::syscall::create3(file.as_ptr(), crate::syscall::OWRITE, 0o644);
     if fd >= 0 {
-        let text = b"# Plan 9 profile, created by useradd\npath=(. /bin /rc/bin)\n";
+        let text = b"path=(. /bin)\n";
         crate::syscall::write_all(fd, text);
         crate::syscall::close(fd);
     }

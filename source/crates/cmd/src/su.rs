@@ -53,11 +53,16 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
         crate::outln("su: authentication failed");
         return 1;
     }
+    if crate::syscall::rfork(crate::syscall::RFCENVG) < 0 {
+        crate::outln("su: cannot create login environment");
+        return 1;
+    }
 
     // Replace this process with a fresh shell so the previous identity is
     // gone for good.
     let rc = crate::syscall::make_cstr("/rc/bin/rc");
-    let argv: [*const u8; 2] = [rc.as_ptr(), core::ptr::null()];
+    let login = crate::syscall::make_cstr("-l");
+    let argv = [rc.as_ptr(), login.as_ptr(), core::ptr::null()];
     let _ = crate::syscall::exec(rc.as_ptr(), argv.as_ptr());
     crate::outln("su: cannot start shell");
     1

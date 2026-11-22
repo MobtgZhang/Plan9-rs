@@ -43,11 +43,11 @@ fn main() -> ! {
     // whenever it terminates — there is no built-in fallback shell.
     loop {
         let (_n, path_buf) = cstr("/rc/bin/rc");
-        let argv_arr: [*const u8; 2] = [path_buf.as_ptr(), core::ptr::null()];
+        let argv_arr = [path_buf.as_ptr(), b"-l\0".as_ptr(), core::ptr::null()];
         let pid = fork();
         if pid == 0 {
             // Child: exec the rc script.
-            let r = exec(path_buf.as_ptr(), argv_arr.as_ptr(), 1);
+            let r = exec(path_buf.as_ptr(), argv_arr.as_ptr(), 2);
             // exec failed: report the kernel error code, then exit so
             // init's loop respawns rc.
             print("[init] exec rc failed r=");

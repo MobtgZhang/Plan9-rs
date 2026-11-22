@@ -4,6 +4,8 @@
 //! `-l` (long form with mode, length and name) and `-d` (directory
 //! itself, not its contents).
 
+const DMDIR: u64 = 0x8000_0000;
+
 pub fn main(argc: usize, argv: *const *const u8) -> i32 {
     let mut long = false;
     let mut dir_only = false;
@@ -62,7 +64,7 @@ fn list_one(path: &str, long: bool) -> bool {
     let is_dir = match &st {
         Some(n) => {
             let parts = split4(&sb[..*n]);
-            u64_bytes(parts[1]).unwrap_or(0) & 0x4000_0000 != 0
+            u64_bytes(parts[1]).unwrap_or(0) & DMDIR != 0
         }
         None => false,
     };
@@ -166,7 +168,7 @@ fn print_entry(path: &str, long: bool) {
     let parts: [&[u8]; 4] = split4(text);
     let mode = u64_bytes(parts[1]).unwrap_or(0);
     let length = u64_bytes(parts[2]).unwrap_or(0);
-    let is_dir = mode & 0x4000_0000 != 0;
+    let is_dir = mode & DMDIR != 0;
 
     let mut out = String8::new();
     out.push(if is_dir { b'd' } else { b'-' });

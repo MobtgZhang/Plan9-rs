@@ -493,14 +493,27 @@ fn stat_file(path: &str) {
         return;
     }
     let (_, p) = cstr(path);
-    let mut buf = [0u8; 256];
-    let rc = syscall::stat(p.as_ptr(), buf.as_mut_ptr(), buf.len());
-    if rc < 0 {
+    let mut record = [0u8; 1024];
+    let count = syscall::stat(p.as_ptr(), record.as_mut_ptr(), record.len());
+    if count < 49 || count as usize > record.len() {
         outln("stat: failed");
-    } else {
-        out(&buf[..rc as usize]);
-        out(b"\n");
+        return;
     }
+    let length = u16::from_le_bytes(record[41..43].try_into().unwrap()) as usize;
+    if 43 + length + 6 > count as usize {
+        outln("stat: invalid record");
+        return;
+    }
+    out(&record[43..43 + length]);
+    let mut decimal = [0; 20];
+    let mode = u32::from_le_bytes(record[21..25].try_into().unwrap());
+    let size = u64::from_le_bytes(record[33..41].try_into().unwrap());
+    let qid = u64::from_le_bytes(record[13..21].try_into().unwrap());
+    for value in [mode as u64, size, qid] {
+        out(b" ");
+        out_str(format_u64(value, &mut decimal));
+    }
+    out(b"\n");
 }
 
 fn printf_simple(fmt: &str) {

@@ -11,6 +11,7 @@
 
 use core::arch::asm;
 
+pub const SYS_RFORK: usize = 0;
 pub const SYS_EXITS: usize = 2;
 pub const SYS_OPEN: usize = 3;
 pub const SYS_CREATE: usize = 4;
@@ -24,11 +25,19 @@ pub const SYS_PREAD: usize = 11;
 pub const SYS_PWRITE: usize = 12;
 pub const SYS_REMOVE: usize = 13;
 pub const SYS_STAT: usize = 18;
+pub const SYS_FSTAT: usize = 19;
+pub const SYS_NOTIFY: usize = 14;
+pub const SYS_NOTED: usize = 15;
+pub const SYS_MOUNT: usize = 22;
+pub const SYS_UNMOUNT: usize = 23;
+pub const SYS_BIND: usize = 36;
 pub const SYS_CHDIR: usize = 37;
 pub const SYS_BRK: usize = 38;
 pub const SYS_FORK: usize = 40;
 pub const SYS_EXEC: usize = 1;
 pub const SYS_YIELD: usize = 33;
+pub const SYS_ALARM: usize = 34;
+pub const SYS_AWAIT: usize = 35;
 pub const SYS_SLEEP: usize = 29;
 
 pub const SYS_LIST: usize = 48;
@@ -47,12 +56,17 @@ pub const SYS_CHOWN: usize = 60;
 pub const SYS_ACL: usize = 61;
 pub const SYS_AUTH: usize = 62;
 pub const SYS_LOGIN: usize = 63;
+pub const SYS_FAUTH: usize = 64;
+pub const SYS_EXITS_TEXT: usize = 65;
+pub const SYS_WAIT_STATUS: usize = 66;
+pub const EINTR: i64 = -13;
 
 /// Open mode bits (Plan 9): OREAD=0, OWRITE=1, ORDWR=2, OEXEC=3.
 pub const OREAD: u32 = 0;
 pub const OWRITE: u32 = 1;
 pub const ORDWR: u32 = 2;
 pub const OEXEC: u32 = 3;
+pub const OCEXEC: u32 = 0x20;
 
 /// Plan 9 create-permission bit: create a directory instead of a file.
 pub const DMDIR: u32 = 0x8000_0000;
@@ -289,6 +303,11 @@ pub unsafe fn syscall3(n: usize, a0: u64, a1: u64, a2: u64) -> i64 {
 
 #[inline(always)]
 pub unsafe fn syscall4(n: usize, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    syscall5(n, a0, a1, a2, a3, 0)
+}
+
+#[inline(always)]
+unsafe fn syscall5(n: usize, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
     #[cfg(target_arch = "x86_64")]
     {
         let n64 = n as u64;
@@ -300,8 +319,8 @@ pub unsafe fn syscall4(n: usize, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
             in("rsi") a1,
             in("rdx") a2,
             in("r10") a3,
+            in("r8") a4,
             out("rcx") _,
-            out("r8") _,
             out("r9") _,
             out("r11") _,
             options(nostack, preserves_flags),
@@ -318,6 +337,7 @@ pub unsafe fn syscall4(n: usize, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
             in("x1") a1,
             in("x2") a2,
             in("x3") a3,
+            in("x4") a4,
             options(nostack, preserves_flags),
         );
         r as i64
@@ -332,6 +352,7 @@ pub unsafe fn syscall4(n: usize, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
             in("a1") a1,
             in("a2") a2,
             in("a3") a3,
+            in("a4") a4,
             options(nostack, preserves_flags),
         );
         r as i64
@@ -346,6 +367,7 @@ pub unsafe fn syscall4(n: usize, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
             in("$a1") a1,
             in("$a2") a2,
             in("$a3") a3,
+            in("$a4") a4,
             options(nostack, preserves_flags),
         );
         r as i64
@@ -369,7 +391,7 @@ pub fn exit(code: i32) -> ! {
 
 /// Write `len` bytes at `buf` to fd `fd`.
 pub fn write(fd: i64, buf: *const u8, len: usize) -> i64 {
-    unsafe { syscall3(SYS_WRITE, fd as u64, buf as u64, len as u64) }
+    retry_io(|| unsafe { syscall3(SYS_WRITE, fd as u64, buf as u64, len as u64) })
 }
 
 /// Write the whole slice, retrying on short writes.
@@ -385,7 +407,18 @@ pub fn write_all(fd: i64, bytes: &[u8]) {
 }
 
 pub fn read(fd: i64, buf: *mut u8, len: usize) -> i64 {
-    unsafe { syscall3(SYS_READ, fd as u64, buf as u64, len as u64) }
+    retry_io(|| unsafe { syscall3(SYS_READ, fd as u64, buf as u64, len as u64) })
+}
+
+fn retry_io(mut operation: impl FnMut() -> i64) -> i64 {
+    const EAGAIN: i64 = -14;
+    loop {
+        let result = operation();
+        if result != EAGAIN {
+            return result;
+        }
+        yield_cpu();
+    }
 }
 
 pub fn open(path: *const u8, flags: u32) -> i64 {
@@ -420,8 +453,43 @@ pub fn fork() -> i64 {
     unsafe { syscall0(SYS_FORK) }
 }
 
+pub const RFENVG: u32 = 1 << 1;
+pub const RFFDG: u32 = 1 << 2;
+pub const RFNOTEG: u32 = 1 << 3;
+pub const RFPROC: u32 = 1 << 4;
+pub const RFNOWAIT: u32 = 1 << 6;
+pub const RFCNAMEG: u32 = 1 << 10;
+pub const RFCENVG: u32 = 1 << 11;
+pub const RFCFDG: u32 = 1 << 12;
+pub const RFNOMNT: u32 = 1 << 14;
+
+pub fn rfork(flags: u32) -> i64 {
+    unsafe { syscall1(SYS_RFORK, u64::from(flags)) }
+}
+
 pub fn wait(pid: i32) -> i64 {
     unsafe { syscall1(SYS_WAIT, pid as u64) }
+}
+
+pub fn wait_status(pid: i32, output: &mut [u8]) -> i64 {
+    unsafe { syscall3(SYS_WAIT_STATUS, pid as u64, output.as_mut_ptr() as u64, output.len() as u64) }
+}
+
+pub fn await_child(output: &mut [u8]) -> i64 {
+    unsafe { syscall2(SYS_AWAIT, output.as_mut_ptr() as u64, output.len() as u64) }
+}
+
+pub fn alarm(ms: u64) -> i64 {
+    unsafe { syscall1(SYS_ALARM, ms) }
+}
+
+pub fn exits(message: &str) -> ! {
+    let mut length = message.len().min(255);
+    while !message.is_char_boundary(length) {
+        length -= 1;
+    }
+    unsafe { syscall2(SYS_EXITS_TEXT, message.as_ptr() as u64, length as u64) };
+    exit(1)
 }
 
 pub fn getpid() -> i64 {
@@ -447,6 +515,10 @@ pub fn stat(path: *const u8, buf: *mut u8, cap: usize) -> i64 {
     unsafe { syscall3(SYS_STAT, path as u64, buf as u64, cap as u64) }
 }
 
+pub fn fstat(fd: i64, output: &mut [u8]) -> i64 {
+    unsafe { syscall3(SYS_FSTAT, fd as u64, output.as_mut_ptr() as u64, output.len() as u64) }
+}
+
 pub fn brk(addr: usize) -> i64 {
     unsafe { syscall1(SYS_BRK, addr as u64) }
 }
@@ -456,11 +528,35 @@ pub fn exec(path: *const u8, argv: *const *const u8) -> i64 {
 }
 
 pub fn dup(fd: i64) -> i64 {
-    unsafe { syscall1(SYS_DUP, fd as u64) }
+    dup2(fd, -1)
 }
 
 pub fn chdir(path: *const u8) -> i64 {
     unsafe { syscall1(SYS_CHDIR, path as u64) }
+}
+
+pub fn mount(fd: i64, auth_fd: i64, target: *const u8, flags: u32, spec: *const u8) -> i64 {
+    unsafe { syscall5(SYS_MOUNT, fd as u64, auth_fd as u64, target as u64, flags as u64, spec as u64) }
+}
+
+pub fn fauth(fd: i64, spec: *const u8) -> i64 {
+    unsafe { syscall2(SYS_FAUTH, fd as u64, spec as u64) }
+}
+
+pub fn bind(source: *const u8, target: *const u8, flags: u32) -> i64 {
+    unsafe { syscall3(SYS_BIND, source as u64, target as u64, flags as u64) }
+}
+
+pub fn unmount(source: *const u8, target: *const u8) -> i64 {
+    unsafe { syscall2(SYS_UNMOUNT, source as u64, target as u64) }
+}
+
+pub fn notify(handler: Option<extern "C" fn(*mut u8, *const u8)>) -> i64 {
+    unsafe { syscall1(SYS_NOTIFY, handler.map_or(0, |function| function as u64)) }
+}
+
+pub fn noted(action: u64) -> i64 {
+    unsafe { syscall1(SYS_NOTED, action) }
 }
 
 pub fn seek(fd: i64, offset: i64, whence: u8) -> i64 {

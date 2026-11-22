@@ -26,39 +26,39 @@ pub fn main(_argc: usize, _argv: *const *const u8) -> i32 {
 }
 
 fn print_one(pid: &str) {
-    // /proc/<pid>/status text: "PID\t..\nState\t..\nSegments\t..\nMemBytes\t..\n"
     let mut path = crate::ls::String8::new();
     path.push_str("/proc/");
     path.push_str(pid);
     path.push_str("/status");
     let mut sb = [0u8; 512];
-    let got = crate::stat_text(path.as_str(), &mut sb);
-    if got.is_none() {
+    let fd = crate::open_read(path.as_str());
+    if fd < 0 {
         return;
     }
-    let text = core::str::from_utf8(&sb[..got.unwrap()]).unwrap_or("");
-    let mut state = "?";
-    let mut mem = 0u64;
-    for field in text.split('\n') {
-        let mut it = field.split('\t');
-        if let Some(k) = it.next() {
-            match k {
-                "State" => state = it.next().unwrap_or("?"),
-                "MemBytes" => mem = it.next().and_then(crate::parse_u64).unwrap_or(0),
-                _ => {}
-            }
-        }
+    let count = crate::syscall::read(fd, sb.as_mut_ptr(), sb.len());
+    crate::syscall::close(fd);
+    if count <= 0 {
+        return;
     }
+    if count < 176 {
+        return;
+    }
+    let field = |start, end| core::str::from_utf8(&sb[start..end]).unwrap_or("?").trim_end();
+    let name = field(0, 27);
+    let user = field(28, 55);
+    let state = field(56, 67);
+    let mem = crate::parse_u64(field(140, 151).trim_start()).unwrap_or(0);
     let mut mb = [0u8; 16];
     let mems = crate::utoa(mem, &mut mb);
-    crate::out_str("glenda ");
+    pad(user, 6);
+    crate::out(b" ");
     pad(pid, 5);
     crate::out_str(" ");
     pad(state, 6);
     crate::out_str(" ");
     pad(mems, 6);
     crate::out_str(" ");
-    crate::out_str(pid);
+    crate::out_str(name);
     crate::out(b"\n");
 }
 
