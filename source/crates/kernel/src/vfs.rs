@@ -8,13 +8,16 @@
 //! The device table is owned by `crate::dev`; this module only borrows
 //! devices through the small helpers exported there.
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::chan::Qid;
 use crate::dev::{self, Chan, DirEntry, Error as DevError, devs_mut};
 use crate::plan9_common::sync::{Mutex, Spinlock};
+use crate::proc::Chan as _;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
@@ -35,6 +38,7 @@ pub const ROOTDEV: char = '/';
 
 const OCEXEC: u32 = 0x20;
 const OEXCL: u32 = 0x1000;
+const OTRUNC: u32 = 0x10;
 
 /// Mount flags (Plan 9 semantics)
 pub const MBEFORE: u32 = 0x01;
@@ -302,6 +306,7 @@ pub enum VfsError {
     Enomem,
     Ebadfd,
     Eio,
+    Eintr,
     Einval,
     Eisdir,
     Enotdir,
@@ -320,6 +325,7 @@ impl VfsError {
             VfsError::Enomem => -2,
             VfsError::Ebadfd => -4,
             VfsError::Eio => -3,
+            VfsError::Eintr => crate::syscall::Error::Eintr.to_isize(),
             VfsError::Einval => -10,
             VfsError::Eisdir => -9,
             VfsError::Enotdir => -8,
@@ -338,6 +344,7 @@ impl VfsError {
             DevError::Enomem => VfsError::Enomem,
             DevError::Ebadfd => VfsError::Ebadfd,
             DevError::Eio => VfsError::Eio,
+            DevError::Eintr => VfsError::Eintr,
             DevError::Einval => VfsError::Einval,
             DevError::Enotdir => VfsError::Enotdir,
             DevError::Eisdir => VfsError::Eisdir,
@@ -404,6 +411,44 @@ pub fn namec(
     _omode: u32,
     _perm: u32,
 ) -> Result<Chan, VfsError> {
+    let mut lookup = PathLookup::new(path)?;
+    lookup.for_create = matches!(amode, NamecMode::Create(..));
+    let mut chan = lookup.progress(false, false)?.ok_or(VfsError::Eio)?;
+    match amode {
+        NamecMode::Create(mode, perm) => {
+            if let Some(name) = lookup.missing_name {
+                create_on(&mut chan, &name, mode, perm)?;
+            } else if mode & OEXCL != 0 {
+                return Err(VfsError::Eexists);
+            }
+        }
+        NamecMode::Remove => remove_on(&mut chan)?,
+        _ => {}
+    }
+    Ok(chan)
+}
+
+fn create_on(chan: &mut Chan, name: &[u8], mode: u32, perm: u32) -> Result<(), VfsError> {
+    let path = chan.namespace_path.take();
+    let name = core::str::from_utf8(name).map_err(|_| VfsError::Einval)?;
+    chan.create(name, mode as u8, perm)?;
+    chan.namespace_path = path;
+    Ok(())
+}
+
+fn remove_on(chan: &mut Chan) -> Result<(), VfsError> {
+    let device = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
+    device.remove(chan).map_err(VfsError::from_dev_error)
+}
+
+fn append_component(path: &mut Vec<u8>, component: &[u8]) {
+    if path.as_slice() != b"/" {
+        path.push(b'/');
+    }
+    path.extend_from_slice(component);
+}
+
+fn path_start(path: &[u8]) -> Result<(Chan, Option<Vec<u8>>, Option<&[u8]>), VfsError> {
     if path.is_empty() {
         return Err(VfsError::Einval);
     }
@@ -413,7 +458,7 @@ pub fn namec(
 
     let (start, mut rest) = parse_path_start(path);
 
-    let (mut chan, mut current_path) = match start {
+    let (chan, current_path) = match start {
         PathStart::Root => {
             (namespace_root()?, Some(b"/".to_vec()))
         }
@@ -437,101 +482,115 @@ pub fn namec(
         }
     };
 
-    let components = rest.map(parse_path).unwrap_or_default();
-    let mut union = current_path.as_deref().and_then(namespace_mounts);
-    let mut created = false;
+    Ok((chan, current_path, rest))
+}
 
-    for (index, comp) in components.iter().copied().enumerate() {
-        if comp.is_empty() || comp == b"." {
-            continue;
-        }
+pub(crate) struct PathLookup {
+    components: VecDeque<Vec<u8>>,
+    path: Option<Vec<u8>>,
+    current: Option<Chan>,
+    component: Option<(Vec<u8>, alloc::vec::IntoIter<Chan>)>,
+    pending: Option<(Chan, crate::devmnt::PendingWalk)>,
+    for_create: bool,
+    create_parent: Option<Chan>,
+    missing_name: Option<Vec<u8>>,
+}
 
-        if chan.qid.type_ & dev::qidtype::DIR == 0 {
-            return Err(VfsError::Enoent);
-        }
-        if comp == b".." {
-            if let Some(path) = &mut current_path {
-                *path = parent_path(path).unwrap_or_else(|| b"/".to_vec());
-                chan = namec(path, NamecMode::Walk, 0, 0)?;
-                union = namespace_mounts(path);
-            } else {
-                chan.walk_to("..")?.ok_or(VfsError::Enoent)?;
-            }
-            continue;
-        }
+impl PathLookup {
+    pub(crate) fn new(path: &[u8]) -> Result<Self, VfsError> {
+        let (current, path, rest) = path_start(path)?;
+        let components = rest.map(parse_path).unwrap_or_default().into_iter().map(<[u8]>::to_vec).collect();
+        Ok(Self { components, path, current: Some(current), component: None, pending: None,
+            for_create: false, create_parent: None, missing_name: None })
+    }
 
-        if let Some(path) = &mut current_path {
-            if path.as_slice() != b"/" {
-                path.push(b'/');
-            }
-            path.extend_from_slice(comp);
-            if let Some(root) = find_mount(path) {
-                chan = root;
-                union = namespace_mounts(path);
-                continue;
-            }
-        }
-
-        let name = core::str::from_utf8(comp).map_err(|_| VfsError::Einval)?;
-        if let Some(entries) = union.take() {
-            let mut found = None;
-            for entry in &entries {
-                let mut candidate = entry.root.dup();
+    pub(crate) fn progress(&mut self, asynchronous: bool, interrupted: bool) -> Result<Option<Chan>, VfsError> {
+        loop {
+            if let Some((name, candidates)) = &mut self.component {
+                let name = core::str::from_utf8(name).map_err(|_| VfsError::Einval)?;
+                if let Some((candidate, walk)) = &mut self.pending {
+                    match walk.progress(candidate, Some(name), interrupted).map_err(VfsError::from_dev_error) {
+                        Ok(false) => return Ok(None),
+                        Ok(true) => {
+                            self.current = self.pending.take().map(|(chan, _)| chan);
+                            self.component = None;
+                        }
+                        Err(VfsError::Enoent) => self.pending = None,
+                        Err(error) => return Err(error),
+                    }
+                    continue;
+                }
+                let Some(mut candidate) = candidates.next() else {
+                    if !self.for_create || !self.components.is_empty() || name == ".." {
+                        return Err(VfsError::Enoent);
+                    }
+                    let mut parent = self.create_parent.take().ok_or(VfsError::Eperm)?;
+                    parent.namespace_path = self.path.take();
+                    self.missing_name = Some(name.as_bytes().to_vec());
+                    return Ok(Some(parent));
+                };
+                if let Some(walk) = asynchronous.then(|| crate::devmnt::PendingWalk::new(&candidate)).flatten() {
+                    self.pending = Some((candidate, walk));
+                    continue;
+                }
                 match candidate.walk_to(name) {
                     Ok(Some(_)) => {
-                        found = Some(candidate);
-                        break;
+                        self.current = Some(candidate);
+                        self.component = None;
                     }
                     Ok(None) | Err(VfsError::Enoent) => {}
                     Err(error) => return Err(error),
                 }
+                continue;
             }
-            if let Some(candidate) = found {
-                chan = candidate;
-            } else if let NamecMode::Create(mode, perm) = amode {
-                if index + 1 != components.len() {
-                    return Err(VfsError::Enoent);
-                }
-                chan = entries.into_iter().find(|entry| entry.create)
-                    .ok_or(VfsError::Eperm)?.root;
-                let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
-                dev.create(&mut chan, name, mode as u8, perm).map_err(VfsError::from_dev_error)?;
-                created = true;
-            } else {
+
+            let mut current = self.current.take().ok_or(VfsError::Eio)?;
+            let Some(component) = self.components.pop_front() else {
+                current.namespace_path = self.path.take();
+                return Ok(Some(current));
+            };
+            if component == b"." {
+                self.current = Some(current);
+                continue;
+            }
+            if current.qid.type_ & dev::qidtype::DIR == 0 {
                 return Err(VfsError::Enoent);
             }
-            continue;
-        }
-        let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
-        match dev.walk(&mut chan, name) {
-            Ok(Some(_)) => {}
-            Ok(None) | Err(DevError::Enoent) => {
-                match amode {
-                    NamecMode::Create(mode, perm) if index + 1 == components.len() => {
-                        dev.create(&mut chan, name, mode as u8, perm)
-                            .map_err(VfsError::from_dev_error)?;
-                        created = true;
-                    }
-                    _ => return Err(VfsError::Enoent),
+            if let Some(path) = self.path.as_ref().filter(|_| component == b"..") {
+                let parent = parent_path(path).unwrap_or_else(|| b"/".to_vec());
+                for part in parse_path(&parent).into_iter().rev() {
+                    self.components.push_front(part.to_vec());
+                }
+                self.path = Some(b"/".to_vec());
+                self.current = Some(namespace_root()?);
+                continue;
+            }
+            let mounts = self.path.as_deref().and_then(namespace_mounts);
+            if let Some(path) = &mut self.path {
+                append_component(path, &component);
+                if let Some(root) = find_mount(path) {
+                    self.current = Some(root);
+                    continue;
                 }
             }
-            Err(e) => return Err(VfsError::from_dev_error(e)),
+            let can_create = self.for_create && self.components.is_empty();
+            let candidates = match mounts {
+                Some(entries) => {
+                    if can_create {
+                        self.create_parent = entries.iter().find(|entry| entry.create).map(|entry| entry.root.dup());
+                    }
+                    entries.into_iter().map(|entry| entry.root).collect()
+                }
+                None => {
+                    if can_create {
+                        self.create_parent = Some(current.dup());
+                    }
+                    vec![current]
+                }
+            };
+            self.component = Some((component, candidates.into_iter()));
         }
     }
-
-    if matches!(amode, NamecMode::Create(mode, _) if mode & OEXCL != 0) && !created {
-        return Err(VfsError::Eexists);
-    }
-    if let NamecMode::Remove = amode {
-        if let Some(dev) = devs_mut().get_mut(chan.dev) {
-            dev.remove(&mut chan).map_err(VfsError::from_dev_error)?;
-        } else {
-            return Err(VfsError::Enoent);
-        }
-    }
-
-    chan.namespace_path = current_path;
-    Ok(chan)
 }
 
 fn namespace_root() -> Result<Chan, VfsError> {
@@ -898,86 +957,293 @@ pub(crate) fn fd_channel(fd: i32) -> Option<alloc::boxed::Box<dyn crate::proc::C
     fgrp().and_then(|f| f.get_channel(fd))
 }
 
-pub(crate) enum OpenResult {
-    Descriptor(i32),
-    Pending(crate::devmnt::PendingOpen),
+pub(crate) enum PathOperation {
+    Open(u32),
+    Create { mode: u32, perm: u32 },
+    Remove,
+    Stat { address: u64, size: usize },
+    Wstat(Vec<u8>),
+    List { address: u64, size: usize },
+    Chdir(Vec<u8>),
+    Bind { target: Vec<u8>, flags: u32 },
+    Unmount(Option<Vec<u8>>),
 }
 
-pub(crate) fn sys_open(path: &[u8], mode: u32) -> Result<OpenResult, VfsError> {
-    let close_on_exec = mode & OCEXEC != 0;
-    let mode = mode & !OCEXEC;
-    let chan = namec(path, NamecMode::Open(mode), mode, 0)?;
-    if let Some(image) = crate::procfs::open_exec_image(&chan, mode) {
-        return alloc_device_channel(image.map_err(VfsError::from_dev_error)?, close_on_exec).map(OpenResult::Descriptor);
+pub(crate) struct PendingPath {
+    operation: PathOperation,
+    lookup: Option<PathLookup>,
+    resolved: Option<Chan>,
+    mutation: Option<crate::devmnt::PendingOpen>,
+    opening: Option<DirectoryOpens>,
+    metadata: Option<crate::devmnt::PendingIo>,
+    listing: Option<ListNames>,
+}
+
+impl PendingPath {
+    pub(crate) fn new(path: &[u8], operation: PathOperation) -> Result<Self, VfsError> {
+        let mut lookup = PathLookup::new(path)?;
+        lookup.for_create = matches!(operation, PathOperation::Create { .. });
+        Ok(Self { operation, lookup: Some(lookup), resolved: None, mutation: None,
+            opening: None, metadata: None, listing: None })
     }
-    if crate::devfd::is_descriptor(&chan) {
-        return alloc_channel(crate::devfd::reopen(&chan, mode).map_err(VfsError::from_dev_error)?, close_on_exec)
-            .map(OpenResult::Descriptor);
-    }
-    if crate::devsrv::is_service(&chan) {
-        let published = crate::devsrv::open_service(&chan, mode as u8)
-            .map_err(VfsError::from_dev_error)?;
-        return alloc_channel(published, close_on_exec).map(OpenResult::Descriptor);
-    }
-    if chan.qid.type_ & dev::qidtype::DIR != 0 && mode == 0 {
-        if let Some(entries) = chan.namespace_path.as_deref().and_then(namespace_mounts) {
-            if entries.len() > 1 {
-                let directories = open_union(entries);
-                if directories.is_empty() {
-                    return Err(VfsError::Eperm);
+
+    pub(crate) fn progress(&mut self, proc: &mut crate::proc::Proc) -> crate::syscall::Result<Option<usize>> {
+        use crate::syscall::{self, Error};
+
+        while let Some(lookup) = &mut self.lookup {
+            let Some(mut chan) = lookup.progress(true, proc.has_pending_signals())? else { return Ok(None) };
+            let missing_name = lookup.missing_name.take();
+            self.lookup = None;
+            match &self.operation {
+                PathOperation::Create { mode, perm } => {
+                    use crate::devmnt::{FidOperation, PendingOpen};
+
+                    let clean_mode = *mode & !(OCEXEC | OEXCL);
+                    let close_on_exec = mode & OCEXEC != 0;
+                    let directory = perm & 0x8000_0000 != 0;
+                    let operation = if let Some(name) = &missing_name {
+                        FidOperation::Create { mode: clean_mode as u8, perm: *perm, name: name.clone() }
+                    } else {
+                        if mode & OEXCL != 0 {
+                            return Err(VfsError::Eexists.into());
+                        }
+                        let remote_mode = if directory { clean_mode } else { clean_mode | OTRUNC };
+                        FidOperation::Open(remote_mode as u8)
+                    };
+                    match PendingOpen::start_operation(chan, operation) {
+                        Ok(pending) => self.mutation = Some(pending),
+                        Err(mut local) => {
+                            if let Some(name) = &missing_name {
+                                create_on(&mut local, name, clean_mode, *perm)?;
+                            }
+                            return finish_local_create(local, clean_mode, directory, close_on_exec)
+                                .map(|fd| Some(fd as usize)).map_err(Into::into);
+                        }
+                    }
                 }
-                return alloc_channel(alloc::boxed::Box::new(
-                    UnionDirectory { directories, index: 0, offset: 0 },
-                ), close_on_exec).map(OpenResult::Descriptor);
+                PathOperation::Remove => {
+                    match crate::devmnt::PendingOpen::start_operation(chan, crate::devmnt::FidOperation::Remove) {
+                        Ok(pending) => self.mutation = Some(pending),
+                        Err(mut local) => {
+                            remove_on(&mut local)?;
+                            let _ = dev::dev_close(&mut local);
+                            return Ok(Some(0));
+                        }
+                    }
+                }
+                PathOperation::Chdir(path) => {
+                    syscall::change_directory(proc, chan, path)?;
+                    return Ok(Some(0));
+                }
+                PathOperation::Bind { target, flags } => {
+                    if let Some(source) = self.resolved.take() {
+                        bind(source, chan, *flags).map_err(|_| Error::Eio)?;
+                        return Ok(Some(0));
+                    }
+                    self.resolved = Some(chan);
+                    self.lookup = Some(PathLookup::new(target)?);
+                }
+                PathOperation::Unmount(source) => {
+                    if let Some(source) = source {
+                        if let Some(target) = self.resolved.take() {
+                            let transport = if crate::devsrv::is_service(&chan) {
+                                crate::devsrv::open_service(&chan, 0)?.open_id()
+                            } else {
+                                None
+                            };
+                            unmount_namespace(target, Some((chan, transport)))?;
+                            return Ok(Some(0));
+                        }
+                        self.resolved = Some(chan);
+                        self.lookup = Some(PathLookup::new(source)?);
+                    } else {
+                        unmount_namespace(chan, None)?;
+                        return Ok(Some(0));
+                    }
+                }
+                PathOperation::Open(mode) => {
+                    let clean_mode = mode & !OCEXEC;
+                    let close_on_exec = mode & OCEXEC != 0;
+                    if let Some(fd) = open_special(&chan, clean_mode, close_on_exec)? {
+                        return Ok(Some(fd as usize));
+                    }
+                    self.opening = Some(DirectoryOpens::new(chan, clean_mode as u8, clean_mode == 0));
+                }
+                PathOperation::List { .. } => {
+                    if chan.qid.type_ & dev::qidtype::DIR == 0 {
+                        return Err(Error::Enotdir);
+                    }
+                    self.opening = Some(DirectoryOpens::new(chan, 0, true));
+                }
+                PathOperation::Stat { address, size } => {
+                    self.metadata = crate::devmnt::PendingIo::stat(&chan, *address, *size, true);
+                    if self.metadata.is_none() {
+                        let result = crate::devmnt::stat_record(&mut chan, true);
+                        let _ = dev::dev_close(&mut chan);
+                        return syscall::copy_stat_to_proc(proc, *address, *size, &result?).map(Some);
+                    }
+                }
+                PathOperation::Wstat(stat) => {
+                    self.metadata = crate::devmnt::PendingIo::wstat(&chan, stat)?;
+                    if self.metadata.is_none() {
+                        crate::devmnt::wstat(&mut chan, stat)?;
+                        return Ok(Some(stat.len()));
+                    }
+                }
+            }
+        }
+        if let Some(mutation) = &mut self.mutation {
+            let Some(chan) = mutation.open_channel(proc.has_pending_signals())? else { return Ok(None) };
+            return match self.operation {
+                PathOperation::Create { mode, .. } => {
+                    let group = proc.fgrp.as_deref().ok_or(Error::Eperm)?;
+                    Ok(Some(alloc_device_channel_in(group, chan, mode & OCEXEC != 0)? as usize))
+                }
+                PathOperation::Remove => Ok(Some(0)),
+                _ => Err(Error::Eio),
+            };
+        }
+        if let Some(metadata) = &mut self.metadata {
+            return metadata.poll(proc).transpose();
+        }
+        if let Some(opening) = &mut self.opening {
+            let Some(mut opened) = opening.progress(proc.has_pending_signals())? else { return Ok(None) };
+            let union = opening.union;
+            self.opening = None;
+            if let PathOperation::Open(mode) = self.operation {
+                let channel: alloc::boxed::Box<dyn crate::proc::Chan> = if union {
+                    alloc::boxed::Box::new(UnionDirectory::new(opened))
+                } else {
+                    alloc::boxed::Box::new(opened.pop().ok_or(Error::Eio)?)
+                };
+                let group = proc.fgrp.as_deref().ok_or(Error::Eperm)?;
+                return Ok(Some(alloc_channel_in(group, channel, mode & OCEXEC != 0)? as usize));
+            }
+            self.listing = Some(ListNames { directories: opened.into_iter(), pending: None, copied: 0 });
+        }
+        if let (Some(listing), PathOperation::List { address, size }) = (&mut self.listing, &self.operation) {
+            return listing.progress(proc, *address, *size);
+        }
+        Err(Error::Eio)
+    }
+}
+
+fn open_special(chan: &Chan, mode: u32, close_on_exec: bool) -> Result<Option<i32>, VfsError> {
+    if let Some(image) = crate::procfs::open_exec_image(chan, mode) {
+        return alloc_device_channel(image.map_err(VfsError::from_dev_error)?, close_on_exec).map(Some);
+    }
+    if crate::devfd::is_descriptor(chan) {
+        return alloc_channel(crate::devfd::reopen(chan, mode).map_err(VfsError::from_dev_error)?, close_on_exec)
+            .map(Some);
+    }
+    if crate::devsrv::is_service(chan) {
+        let published = crate::devsrv::open_service(chan, mode as u8)
+            .map_err(VfsError::from_dev_error)?;
+        return alloc_channel(published, close_on_exec).map(Some);
+    }
+    Ok(None)
+}
+
+struct DirectoryOpens {
+    channels: alloc::vec::IntoIter<Chan>,
+    opened: Vec<DevChanAdapter>,
+    active: Option<crate::devmnt::PendingOpen>,
+    mode: u8,
+    union: bool,
+}
+
+impl DirectoryOpens {
+    fn new(chan: Chan, mode: u8, expand_union: bool) -> Self {
+        let entries = if expand_union && chan.qid.type_ & dev::qidtype::DIR != 0 {
+            chan.namespace_path.as_deref().and_then(namespace_mounts).filter(|entries| entries.len() > 1)
+        } else {
+            None
+        };
+        let union = entries.is_some();
+        let channels = entries.map_or_else(|| vec![chan], |entries| entries.into_iter().map(|entry| entry.root).collect());
+        Self { channels: channels.into_iter(), opened: Vec::new(), active: None, mode, union }
+    }
+
+    fn progress(&mut self, interrupted: bool) -> Result<Option<Vec<DevChanAdapter>>, VfsError> {
+        loop {
+            let result = if let Some(active) = &mut self.active {
+                let result = active.open_channel(interrupted).map_err(VfsError::from_dev_error);
+                if matches!(result, Ok(None)) {
+                    return Ok(None);
+                }
+                self.active = None;
+                result
+            } else if let Some(chan) = self.channels.next() {
+                match crate::devmnt::PendingOpen::start(chan, self.mode) {
+                    Ok(pending) => {
+                        self.active = Some(pending);
+                        continue;
+                    }
+                    Err(mut chan) => chan.open(self.mode).map(|()| Some(chan)),
+                }
+            } else if self.opened.is_empty() {
+                return Err(VfsError::Eperm);
+            } else {
+                return Ok(Some(core::mem::take(&mut self.opened)));
+            };
+            match result {
+                Ok(Some(chan)) => self.opened.push(DevChanAdapter::new(chan)),
+                Err(error) if matches!(error, VfsError::Eintr) || !self.union => return Err(error),
+                _ => {}
             }
         }
     }
-    match crate::devmnt::PendingOpen::start(chan, mode as u8, close_on_exec) {
-        Ok(pending) => Ok(OpenResult::Pending(pending)),
-        Err(mut chan) => {
-            chan.open(mode as u8)?;
-            alloc_device_channel(chan, close_on_exec).map(OpenResult::Descriptor)
+}
+
+impl Drop for DirectoryOpens {
+    fn drop(&mut self) {
+        for opened in &mut self.opened {
+            crate::proc::Chan::close(opened);
         }
     }
 }
 
-fn open_union(entries: Vec<MountEntry>) -> Vec<DevChanAdapter> {
-    entries.into_iter().filter_map(|mut entry| {
-        entry.root.open(0).ok()?;
-        Some(DevChanAdapter::new(entry.root))
-    }).collect()
+struct ListNames {
+    directories: alloc::vec::IntoIter<DevChanAdapter>,
+    pending: Option<crate::devmnt::PendingIo>,
+    copied: usize,
 }
 
-pub(crate) fn open_name_directories(path: &[u8]) -> Result<Vec<DevChanAdapter>, VfsError> {
-    let mut chan = namec(path, NamecMode::Walk, 0, 0)?;
-    if chan.qid.type_ & dev::qidtype::DIR == 0 {
-        return Err(VfsError::Enotdir);
-    }
-    let directories = match chan.namespace_path.as_deref().and_then(namespace_mounts) {
-        Some(entries) if entries.len() > 1 => open_union(entries),
-        _ => {
-            chan.open(0)?;
-            alloc::vec![DevChanAdapter::new(chan)]
+impl ListNames {
+    fn progress(&mut self, proc: &mut crate::proc::Proc, address: u64, size: usize) -> crate::syscall::Result<Option<usize>> {
+        while self.copied < size {
+            if let Some(pending) = &mut self.pending {
+                let Some(count) = pending.poll(proc).transpose()? else { return Ok(None) };
+                self.pending = None;
+                self.copied += count;
+            } else if let Some(mut directory) = self.directories.next() {
+                let remaining = size - self.copied;
+                let destination = address + self.copied as u64;
+                self.pending = directory.pending_names(destination, remaining);
+                if self.pending.is_none() {
+                    let mut output = Vec::new();
+                    output.try_reserve_exact(remaining).map_err(|_| VfsError::Enomem)?;
+                    output.resize(remaining, 0);
+                    let result = directory.read_names(&mut output);
+                    crate::proc::Chan::close(&mut directory);
+                    let count = result?;
+                    crate::syscall::put_user_bytes(proc, destination, &output[..count])?;
+                    self.copied += count;
+                }
+            } else {
+                break;
+            }
         }
-    };
-    if directories.is_empty() {
-        return Err(VfsError::Eperm);
+        Ok(Some(self.copied))
     }
-    Ok(directories)
 }
 
-pub(crate) fn list_names(mut directories: Vec<DevChanAdapter>, output: &mut [u8]) -> Result<usize, VfsError> {
-    let mut count = 0;
-    let result = directories.iter_mut().try_for_each(|dir| {
-        if count < output.len() {
-            count += dir.read_names(&mut output[count..]).map_err(|_| VfsError::Eio)?;
+impl Drop for ListNames {
+    fn drop(&mut self) {
+        for mut directory in self.directories.by_ref() {
+            crate::proc::Chan::close(&mut directory);
         }
-        Ok(())
-    });
-    for dir in &mut directories {
-        crate::proc::Chan::close(dir);
     }
-    result.map(|()| count)
 }
 
 fn alloc_channel(chan: alloc::boxed::Box<dyn crate::proc::Chan>, close_on_exec: bool) -> Result<i32, VfsError> {
@@ -989,57 +1255,150 @@ fn alloc_channel_in(group: &crate::proc::Fgrp, chan: alloc::boxed::Box<dyn crate
     if fd < 0 { Err(VfsError::Enomem) } else { Ok(fd) }
 }
 
-struct UnionDirectory {
+struct UnionCursor {
     directories: Vec<DevChanAdapter>,
     index: usize,
     offset: u64,
+    busy: bool,
+}
+
+impl Drop for UnionCursor {
+    fn drop(&mut self) {
+        for directory in &mut self.directories {
+            directory.close();
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct PendingUnionRead {
+    cursor: Arc<Spinlock<UnionCursor>>,
+    address: u64,
+    size: usize,
+    claimed: bool,
+    active: Option<crate::devmnt::PendingData>,
+}
+
+impl PendingUnionRead {
+    pub(crate) fn progress(&mut self, proc: &crate::proc::Proc) -> crate::syscall::Result<Option<usize>> {
+        use crate::syscall::{self, Error};
+
+        if !self.claimed {
+            if proc.has_pending_signals() {
+                return Err(Error::Eintr);
+            }
+            let mut cursor = self.cursor.lock();
+            if cursor.busy {
+                return Ok(None);
+            }
+            cursor.busy = true;
+            self.claimed = true;
+        }
+        loop {
+            if let Some(active) = &mut self.active {
+                let Some(count) = active.poll(proc).transpose()? else { return Ok(None) };
+                self.active = None;
+                let mut cursor = self.cursor.lock();
+                if count != 0 {
+                    let index = cursor.index;
+                    cursor.directories[index].chan.offset += count as u64;
+                    cursor.offset += count as u64;
+                    return Ok(Some(count));
+                }
+                cursor.index += 1;
+                continue;
+            }
+            if proc.has_pending_signals() {
+                return Err(Error::Eintr);
+            }
+            let mut cursor = self.cursor.lock();
+            let index = cursor.index;
+            let Some(directory) = cursor.directories.get_mut(index) else { return Ok(Some(0)) };
+            if let Ok(pending) = crate::devmnt::PendingData::start(directory.dup(), self.address, self.size, false) {
+                self.active = Some(pending);
+                continue;
+            }
+            let mut output = vec![0; self.size.min(u16::MAX as usize + 2)];
+            let count = directory.read_directory(&mut output, true)?;
+            if count != 0 {
+                cursor.offset += count as u64;
+                syscall::put_user_bytes(proc, self.address, &output[..count])?;
+                return Ok(Some(count));
+            }
+            cursor.index += 1;
+        }
+    }
+}
+
+impl Drop for PendingUnionRead {
+    fn drop(&mut self) {
+        drop(self.active.take());
+        if self.claimed {
+            self.cursor.lock().busy = false;
+        }
+    }
+}
+
+struct UnionDirectory(Arc<Spinlock<UnionCursor>>);
+
+impl UnionDirectory {
+    fn new(directories: Vec<DevChanAdapter>) -> Self {
+        Self(Arc::new(Spinlock::new(UnionCursor { directories, index: 0, offset: 0, busy: false })))
+    }
 }
 
 impl crate::proc::Chan for UnionDirectory {
+    fn pending_union_read(&self, address: u64, size: usize) -> Option<PendingUnionRead> {
+        Some(PendingUnionRead { cursor: self.0.clone(), address, size, claimed: false, active: None })
+    }
+
     fn read(&mut self, output: &mut [u8]) -> crate::proc::Result<usize> {
         if output.is_empty() {
             return Ok(0);
         }
-        while let Some(directory) = self.directories.get_mut(self.index) {
+        let mut cursor = self.0.lock();
+        if cursor.busy {
+            return Err(crate::proc::Error::Eagain);
+        }
+        loop {
+            let index = cursor.index;
+            let Some(directory) = cursor.directories.get_mut(index) else { return Ok(0) };
             let count = directory.read_directory(output, true)?;
             if count > 0 {
-                self.offset += count as u64;
+                cursor.offset += count as u64;
                 return Ok(count);
             }
-            self.index += 1;
+            cursor.index += 1;
         }
-        Ok(0)
     }
 
     fn write(&mut self, _input: &[u8]) -> crate::proc::Result<usize> {
         Err(crate::proc::Error::Eperm)
     }
 
-    fn close(&mut self) {
-        for directory in &mut self.directories {
-            directory.close();
-        }
-    }
+    fn close(&mut self) {}
 
-    fn dev(&self) -> usize { self.directories[0].dev() }
-    fn stat(&mut self) -> crate::proc::Result<DirEntry> { self.directories[0].stat() }
-    fn dev_chan(&self) -> Option<Chan> { self.directories[0].dev_chan() }
+    fn dev(&self) -> usize { self.0.lock().directories[0].dev() }
+    fn stat(&mut self) -> crate::proc::Result<DirEntry> { self.0.lock().directories[0].stat() }
+    fn dev_chan(&self) -> Option<Chan> { self.0.lock().directories[0].dev_chan() }
     fn access_mode(&self) -> u8 { 0 }
-    fn offset(&self) -> u64 { self.offset }
+    fn offset(&self) -> u64 { self.0.lock().offset }
 
     fn set_offset(&mut self, offset: u64) {
-        if offset == 0 {
-            self.offset = 0;
-            self.index = 0;
-            for directory in &mut self.directories {
-                directory.set_offset(0);
-            }
-        }
+        let _ = self.seek(offset as i64, 0);
     }
 
     fn seek(&mut self, offset: i64, whence: u8) -> crate::proc::Result<i64> {
         if whence == 0 && offset == 0 {
-            self.set_offset(0);
+            let mut cursor = self.0.lock();
+            if cursor.busy {
+                return Err(crate::proc::Error::Eagain);
+            }
+            cursor.offset = 0;
+            cursor.index = 0;
+            for directory in &mut cursor.directories {
+                directory.set_offset(0);
+            }
             Ok(0)
         } else {
             Err(crate::proc::Error::Einval)
@@ -1047,18 +1406,12 @@ impl crate::proc::Chan for UnionDirectory {
     }
 
     fn dup(&self) -> alloc::boxed::Box<dyn crate::proc::Chan> {
-        let directories = self.directories.iter().map(|directory| DevChanAdapter {
-            chan: directory.chan.dup(), directory_records: directory.directory_records.clone(),
-        }).collect();
-        alloc::boxed::Box::new(Self { directories, index: self.index, offset: self.offset })
+        alloc::boxed::Box::new(Self(self.0.clone()))
     }
 }
 
-pub fn sys_create(path: &[u8], mode: u32, perm: u32) -> Result<i32, VfsError> {
-    let close_on_exec = mode & OCEXEC != 0;
-    let mode = mode & !OCEXEC;
-    let mut chan = namec(path, NamecMode::Create(mode, perm), mode, perm)?;
-    if perm & 0x8000_0000 == 0 && crate::devfd::is_descriptor(&chan) {
+fn finish_local_create(mut chan: Chan, mode: u32, directory: bool, close_on_exec: bool) -> Result<i32, VfsError> {
+    if !directory && crate::devfd::is_descriptor(&chan) {
         return alloc_channel(crate::devfd::reopen(&chan, mode).map_err(VfsError::from_dev_error)?, close_on_exec);
     }
     if chan.flag & dev::CREATED_OPEN != 0 {
@@ -1072,7 +1425,7 @@ pub fn sys_create(path: &[u8], mode: u32, perm: u32) -> Result<i32, VfsError> {
     // here rather than in the device's create hook.  Directories are
     // never truncated — a DMDIR create would otherwise fail here after
     // the directory had already been created.
-    if perm & 0x8000_0000 == 0 { // DMDIR: directories are never truncated
+    if !directory {
         crate::dev::dev_truncate(&mut chan).map_err(VfsError::from_dev_error)?;
     }
     alloc_device_channel(chan, close_on_exec)
@@ -1213,18 +1566,8 @@ pub(crate) fn replace_mount(source: Chan, target: Chan, flags: u32) -> Result<()
     Ok(())
 }
 
-pub(crate) fn unmount_namespace(target: Chan, source: Option<&[u8]>) -> Result<(), VfsError> {
+fn unmount_namespace(target: Chan, candidate: Option<(Chan, Option<usize>)>) -> Result<(), VfsError> {
     let path = target.namespace_path.ok_or(VfsError::Einval)?;
-    let candidate = if let Some(source) = source {
-        let chan = namec(source, NamecMode::Walk, 0, 0)?;
-        if crate::devsrv::is_service(&chan) {
-            Some((chan, crate::devsrv::service_id(source)?))
-        } else {
-            Some((chan, None))
-        }
-    } else {
-        None
-    };
     let removed = {
         let mut mounts = namespace().ok_or(VfsError::Eperm)?.mounts.lock();
         let mounted = mounts.get_mut(&path).ok_or(VfsError::Enoent)?;

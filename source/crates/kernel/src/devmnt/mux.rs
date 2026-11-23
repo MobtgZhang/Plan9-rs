@@ -3,7 +3,7 @@ use alloc::{collections::{BTreeMap, VecDeque}, vec::Vec};
 use crate::dev::Error;
 use crate::netstack::{self, Protocol};
 
-use super::{NOTAG, RERROR, RFLUSH, TCLUNK, TFLUSH, reply_result};
+use super::{NOTAG, RERROR, RFLUSH, TCLUNK, TFLUSH, TREMOVE, reply_result};
 
 struct Frame {
     bytes: Vec<u8>,
@@ -17,6 +17,12 @@ struct Request {
     abandoned: bool,
     cleanup_fid: Option<u32>,
     deadline: u64,
+}
+
+impl Request {
+    fn removed_fid(&self) -> bool {
+        self.kind == TREMOVE && self.result.is_some()
+    }
 }
 
 #[derive(Default)]
@@ -105,8 +111,10 @@ impl Mux {
             request.abandoned = true;
             request.cleanup_fid = Some(fid);
         } else {
-            self.requests.remove(&tag);
-            self.clunk(fid, msize);
+            let removed = self.requests.remove(&tag).is_some_and(|request| request.removed_fid());
+            if !self.broken && !removed {
+                self.clunk(fid, msize);
+            }
         }
     }
 
@@ -160,7 +168,7 @@ impl Mux {
             }
             let request = self.requests.get_mut(&target).ok_or(Error::Eio)?;
             if request.abandoned {
-                let fid = request.cleanup_fid;
+                let fid = request.cleanup_fid.filter(|_| !request.removed_fid());
                 self.requests.remove(&target);
                 if let Some(fid) = fid {
                     self.clunk(fid, msize);

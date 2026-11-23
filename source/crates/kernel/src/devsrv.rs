@@ -44,12 +44,6 @@ impl Service {
     }
 }
 
-pub(crate) fn service_id(path: &[u8]) -> Result<Option<usize>, crate::vfs::VfsError> {
-    let chan = crate::vfs::namec(path, crate::vfs::NamecMode::Walk, 0, 0)?;
-    open_service(&chan, 0).map_err(crate::vfs::VfsError::from_dev_error)
-        .map(|file| file.open_id())
-}
-
 pub(crate) fn open_service(chan: &Chan, mode: u8) -> Result<Box<dyn crate::proc::Chan>, Error> {
     if mode & !3 != 0 {
         return Err(Error::Eperm);

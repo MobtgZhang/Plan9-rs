@@ -261,6 +261,7 @@ impl From<crate::vfs::VfsError> for Error {
             crate::vfs::VfsError::Enomem => Error::Enomem,
             crate::vfs::VfsError::Ebadfd => Error::Ebadfd,
             crate::vfs::VfsError::Eio => Error::Eio,
+            crate::vfs::VfsError::Eintr => Error::Eintr,
             crate::vfs::VfsError::Einval => Error::Einval,
             crate::vfs::VfsError::Eisdir => Error::Eisdir,
             crate::vfs::VfsError::Enotdir => Error::Enotdir,
@@ -1021,15 +1022,7 @@ fn sys_internallist(frame: &SyscallFrame) -> Result<usize> {
 
     let path = copy_cstring_from_user(path_ptr)?;
     user_buffer(curproc().ok_or(Error::Eperm)?, buf_ptr, cap, true)?;
-    let directories = crate::vfs::open_name_directories(&path)?;
-    if let [directory] = directories.as_slice() {
-        if let Some(pending) = directory.pending_names(buf_ptr, cap) {
-            drop(directories);
-            return wait_mount_io(curproc_mut().ok_or(Error::Eperm)?, pending);
-        }
-    }
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, cap) };
-    Ok(crate::vfs::list_names(directories, buf)?)
+    wait_path(&path, crate::vfs::PathOperation::List { address: buf_ptr, size: cap })
 }
 
 /// Execute a program - public interface for internal use
@@ -1998,14 +1991,7 @@ fn sys_internalopen(frame: &SyscallFrame) -> Result<usize> {
     // Copy path from user space
     let path = copy_cstring_from_user(path_ptr)?;
     
-    // Use the VFS to open the file and allocate a descriptor.
-    match crate::vfs::sys_open(&path, omode) {
-        Ok(crate::vfs::OpenResult::Descriptor(fd)) => Ok(fd as usize),
-        Ok(crate::vfs::OpenResult::Pending(pending)) => {
-            wait_mount_io(curproc_mut().ok_or(Error::Eperm)?, crate::devmnt::PendingIo::Open(pending))
-        }
-        Err(_) => Err(Error::Enoent),
-    }
+    wait_path(&path, crate::vfs::PathOperation::Open(omode))
 }
 
 /// CREATE - create file
@@ -2036,11 +2022,7 @@ fn sys_internalcreate(frame: &SyscallFrame) -> Result<usize> {
     // Copy path from user space
     let path = copy_cstring_from_user(path_ptr)?;
     
-    match crate::vfs::sys_create(&path, omode, perm) {
-        Ok(fd) if fd >= 0 => Ok(fd as usize),
-        Ok(_) => Err(Error::Enomem),
-        Err(_) => Err(Error::Ebadf),
-    }
+    wait_path(&path, crate::vfs::PathOperation::Create { mode: omode, perm })
 }
 
 /// Copy a null-terminated string from user space
@@ -2471,14 +2453,7 @@ impl crate::proc::Chan for PipeEnd {
 /// * Bytes written, or error
 fn sys_internalstat(frame: &SyscallFrame) -> Result<usize> {
     let path = copy_cstring_from_user(frame.arg(0))?;
-    let mut chan = namec(&path, crate::vfs::NamecMode::Walk, 0, 0)?;
-    if let Some(pending) = crate::devmnt::PendingIo::stat(&chan, frame.arg(1), frame.arg(2) as usize, true) {
-        drop(chan);
-        return wait_mount_stat(frame, pending);
-    }
-    let result = crate::devmnt::stat_record(&mut chan, true);
-    let _ = crate::dev::dev_close(&mut chan);
-    copy_stat_to_user(frame, &result?)
+    wait_path(&path, crate::vfs::PathOperation::Stat { address: frame.arg(1), size: frame.arg(2) as usize })
 }
 
 /// FSTAT - get file status by fd
@@ -2558,13 +2533,7 @@ fn sys_internalfstat_by_fd(_frame: &SyscallFrame) -> Result<usize> {
 fn sys_internalwstat(frame: &SyscallFrame) -> Result<usize> {
     let path = copy_cstring_from_user(frame.arg(0))?;
     let stat = copy_wstat(frame.arg(1), frame.arg(2) as usize)?;
-    let mut chan = namec(&path, crate::vfs::NamecMode::Walk, 0, 0)?;
-    if let Some(pending) = crate::devmnt::PendingIo::wstat(&chan, &stat)? {
-        drop(chan);
-        return wait_mount_io(curproc_mut().ok_or(Error::Eperm)?, pending);
-    }
-    crate::devmnt::wstat(&mut chan, &stat)?;
-    Ok(stat.len())
+    wait_path(&path, crate::vfs::PathOperation::Wstat(stat))
 }
 
 /// FWSTAT - set file status by fd
@@ -2625,14 +2594,7 @@ fn sys_internalremove(frame: &SyscallFrame) -> Result<usize> {
     // Copy path from user space
     let path = copy_cstring_from_user(path_ptr)?;
 
-    // Use VFS to remove the file
-    let amode = crate::vfs::NamecMode::Remove;
-    let mut chan = namec(&path, amode, 0, 0)?;
-
-    // Close the channel (remove is completed by namec)
-    let _ = crate::dev::dev_close(&mut chan);
-
-    Ok(0)
+    wait_path(&path, crate::vfs::PathOperation::Remove)
 }
 
 /// BRK - set break
@@ -2772,9 +2734,7 @@ fn sys_internalunmount(frame: &SyscallFrame) -> Result<usize> {
         return Err(Error::Einval);
     };
 
-    let target = namec(&old, crate::vfs::NamecMode::Walk, 0, 0)?;
-    crate::vfs::unmount_namespace(target, name.as_deref())?;
-    Ok(0)
+    wait_path(&old, crate::vfs::PathOperation::Unmount(name))
 }
 
 /// BIND - bind name to channel
@@ -2805,18 +2765,7 @@ fn sys_internalbind(frame: &SyscallFrame) -> Result<usize> {
     let source_path = copy_cstring_from_user(path_ptr)?;
     let target_path = copy_cstring_from_user(mntpt_ptr)?;
 
-    // Walk to the source path
-    let amode = crate::vfs::NamecMode::Walk;
-    let source_chan = namec(&source_path, amode, 0, 0)?;
-
-    // Walk to the target path
-    let target_chan = namec(&target_path, amode, 0, 0)?;
-
-    // Perform the bind mount via VFS
-    match crate::vfs::bind(source_chan, target_chan, flags) {
-        Ok(_) => Ok(0),
-        Err(_) => Err(Error::Eio),
-    }
+    wait_path(&source_path, crate::vfs::PathOperation::Bind { target: target_path, flags })
 }
 
 /// CHDIR - change directory
@@ -2839,26 +2788,19 @@ fn sys_internalchdir(frame: &SyscallFrame) -> Result<usize> {
         return Err(Error::Ebadf);
     }
 
-    // Copy path from user space
     let path = copy_cstring_from_user(path_ptr)?;
+    let operation = crate::vfs::PathOperation::Chdir(path.clone());
+    wait_path(&path, operation)
+}
 
-    // Use VFS to walk to the directory
-    let amode = crate::vfs::NamecMode::Walk;
-    let chan = namec(&path, amode, 0, 0)?;
-
-    // Verify it's a directory
-    // In a full implementation, we would check chan.is_directory()
-
-    // Get current process
-    let proc = curproc_mut().ok_or(Error::Ebadfd)?;
-
-    // Close old current directory if set
-    let mut old_dot = proc.dot.take();
-    if let Some(ref mut od) = old_dot {
-        od.close();
+pub(crate) fn change_directory(proc: &mut Proc, chan: crate::dev::Chan, path: &[u8]) -> Result<()> {
+    if chan.qid.type_ & crate::dev::qidtype::DIR == 0 {
+        return Err(Error::Enotdir);
     }
 
-    // Set new current directory
+    if let Some(mut old_dot) = proc.dot.take() {
+        old_dot.close();
+    }
     proc.dot = Some(Box::new(dev_to_proc_chan(chan.clone())));
 
     // Keep the process-group namespace `dot` in sync: some VFS paths
@@ -2873,9 +2815,8 @@ fn sys_internalchdir(frame: &SyscallFrame) -> Result<usize> {
     // Track the canonical textual path for `pwd`/`getcwd`.  Paths are
     // resolved lexically against the previous directory, matching what a
     // POSIX `getcwd` would report.
-    proc.cwd_path = canonicalize_cwd(&proc.cwd_path, &path);
-
-    Ok(0)
+    proc.cwd_path = chan.namespace_path.unwrap_or_else(|| canonicalize_cwd(&proc.cwd_path, path));
+    Ok(())
 }
 
 /// Resolve `arg` against `prev`, folding "." and ".." lexically.
@@ -3730,7 +3671,7 @@ fn poll_user_deadlines() {
             wake_child_wait(proc, 0);
         }
         if let Some(mut pending) = proc.mount_io.take() {
-            if let Some(result) = pending.poll(proc) {
+            if let Some(result) = crate::proc::with_syscall_proc(proc, |proc| pending.poll(proc)) {
                 drop(pending);
                 wake_child_wait(proc, match result {
                     Ok(count) => count as i64,
@@ -3750,6 +3691,11 @@ fn wait_mount_io(proc: &mut Proc, mut pending: crate::devmnt::PendingIo) -> Resu
     proc.mount_io = Some(pending);
     block_user(proc);
     resume_next(ready_user(proc.pid))
+}
+
+fn wait_path(path: &[u8], operation: crate::vfs::PathOperation) -> Result<usize> {
+    let pending = crate::vfs::PendingPath::new(path, operation)?;
+    wait_mount_io(curproc_mut().ok_or(Error::Eperm)?, crate::devmnt::PendingIo::Path(Box::new(pending)))
 }
 
 /// ALARM - alarm clock

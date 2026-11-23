@@ -1018,6 +1018,10 @@ pub trait Chan: Send + Sync {
     fn pending_close(&mut self) -> Option<crate::devmnt::PendingClose> {
         None
     }
+    #[doc(hidden)]
+    fn pending_union_read(&self, _address: u64, _size: usize) -> Option<crate::vfs::PendingUnionRead> {
+        None
+    }
     /// Get channel type
     fn dev(&self) -> usize;
     /// Get file offset
@@ -1128,6 +1132,9 @@ impl Chan for SharedChan {
     fn close(&mut self) {}
     fn pending_close(&mut self) -> Option<crate::devmnt::PendingClose> {
         alloc::sync::Arc::get_mut(&mut self.0)?.channel.lock().0.pending_close()
+    }
+    fn pending_union_read(&self, address: u64, size: usize) -> Option<crate::vfs::PendingUnionRead> {
+        self.0.channel.lock().0.pending_union_read(address, size)
     }
     fn dev(&self) -> usize {
         self.1
@@ -2673,6 +2680,22 @@ pub fn set_curproc(proc: &'static mut Proc) {
 /// Clear current process pointer
 pub fn clear_curproc() {
     CURPROC.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn with_syscall_proc<T>(proc: &mut Proc, run: impl FnOnce(&mut Proc) -> T) -> T {
+    use core::sync::atomic::Ordering;
+
+    struct Restore(*mut Proc);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURPROC.store(self.0, Ordering::Release);
+        }
+    }
+
+    let previous = Restore(CURPROC.swap(proc as *mut Proc, Ordering::AcqRel));
+    let result = run(proc);
+    drop(previous);
+    result
 }
 
 // ============================================================================

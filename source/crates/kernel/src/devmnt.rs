@@ -355,19 +355,18 @@ impl Fid {
 
     fn walk(&self, name: Option<&str>) -> Result<(Self, Option<Qid>), Error> {
         let number = self.session.fid()?;
-        let mut args = number.to_le_bytes().to_vec();
-        args.extend_from_slice(&u16::from(name.is_some()).to_le_bytes());
-        if let Some(name) = name {
-            string(&mut args, name.as_bytes())?;
-        }
-        let reply = self.call(TWALK, &args)?;
-        let mut reply = Decoder::new(&reply);
+        let reply = self.call(TWALK, &walk_args(number, name)?)?;
+        Self::walk_result(&self.session, number, name.is_some(), &reply)
+    }
+
+    fn walk_result(session: &Arc<Session>, number: u32, named: bool, reply: &[u8]) -> Result<(Self, Option<Qid>), Error> {
+        let mut reply = Decoder::new(reply);
         let count = reply.u16()?;
-        if name.is_some() && count == 0 {
+        if named && count == 0 {
             return Err(Error::Enoent);
         }
-        let fid = Self::new(self.session.clone(), number);
-        if count != u16::from(name.is_some()) {
+        let fid = Self::new(session.clone(), number);
+        if count != u16::from(named) {
             return Err(Error::Eio);
         }
         let qid = if count == 1 { Some(reply.qid()?) } else { None };
@@ -445,6 +444,15 @@ impl Fid {
         Ok(written)
     }
 
+}
+
+fn walk_args(number: u32, name: Option<&str>) -> Result<Vec<u8>, Error> {
+    let mut args = number.to_le_bytes().to_vec();
+    args.extend_from_slice(&u16::from(name.is_some()).to_le_bytes());
+    if let Some(name) = name {
+        string(&mut args, name.as_bytes())?;
+    }
+    Ok(args)
 }
 
 impl Drop for Fid {
@@ -552,11 +560,17 @@ pub(crate) enum PendingIo {
     Data(PendingData),
     Metadata(PendingMetadata),
     Close(PendingClose),
-    Open(PendingOpen),
+    Path(Box<crate::vfs::PendingPath>),
+    Union(Box<crate::vfs::PendingUnionRead>),
 }
 
 impl PendingIo {
     pub(crate) fn start(channel: Box<Transport>, address: u64, size: usize, write: bool) -> core::result::Result<Self, Box<Transport>> {
+        if !write {
+            if let Some(pending) = channel.pending_union_read(address, size) {
+                return Ok(Self::Union(Box::new(pending)));
+            }
+        }
         PendingData::start(channel, address, size, write).map(Self::Data)
     }
 
@@ -593,12 +607,13 @@ impl PendingIo {
         })))
     }
 
-    pub(crate) fn poll(&mut self, proc: &crate::proc::Proc) -> Option<crate::syscall::Result<usize>> {
+    pub(crate) fn poll(&mut self, proc: &mut crate::proc::Proc) -> Option<crate::syscall::Result<usize>> {
         match self {
             Self::Data(pending) => pending.poll(proc),
             Self::Metadata(pending) => pending.progress(proc).transpose(),
             Self::Close(pending) => pending.poll(proc),
-            Self::Open(pending) => pending.progress(proc).transpose(),
+            Self::Path(pending) => pending.progress(proc).transpose(),
+            Self::Union(pending) => pending.progress(proc).transpose(),
         }
     }
 }
@@ -682,11 +697,74 @@ impl Drop for PendingClose {
     }
 }
 
+pub(crate) struct PendingWalk {
+    source: Arc<Fid>,
+    rpc: PendingRpc,
+    number: Option<u32>,
+}
+
+impl PendingWalk {
+    pub(crate) fn new(chan: &Chan) -> Option<Self> {
+        let (source, tcp) = tcp_fid(chan)?;
+        Some(Self { source, rpc: PendingRpc::new(tcp), number: None })
+    }
+
+    pub(crate) fn progress(&mut self, chan: &mut Chan, name: Option<&str>, interrupted: bool) -> Result<bool, Error> {
+        let session = &self.source.session;
+        if self.number.is_none() {
+            if interrupted {
+                return Err(Error::Eintr);
+            }
+            if !self.source.valid.load(Ordering::Acquire) {
+                return Err(Error::Ebadfd);
+            }
+            let number = session.fid()?;
+            let mut request = self.source.number.to_le_bytes().to_vec();
+            request.extend_from_slice(&walk_args(number, name)?);
+            self.rpc.submit(session, TWALK, &request)?;
+            self.number = Some(number);
+        }
+        let Some(reply) = self.rpc.poll(session, interrupted) else { return Ok(false) };
+        let number = self.number.take().ok_or(Error::Eio)?;
+        let reply = match reply {
+            Err(Error::Eintr) => {
+                if session.state.mux.lock().submit_background(TCLUNK, &number.to_le_bytes(), session.msize) {
+                    session.schedule_background();
+                }
+                return Err(Error::Eintr);
+            }
+            result => result?,
+        };
+        let (fid, qid) = Fid::walk_result(session, number, name.is_some(), &reply)?;
+        if let Some(qid) = qid {
+            chan.qid = qid;
+        }
+        chan.aux = Some(Arc::new(fid));
+        Ok(true)
+    }
+}
+
+impl Drop for PendingWalk {
+    fn drop(&mut self) {
+        if let Some((tag, number)) = self.rpc.tag.take().zip(self.number.take()) {
+            let session = &self.source.session;
+            session.state.mux.lock().abandon_and_clunk(tag, number, session.msize);
+            session.schedule_background();
+        }
+    }
+}
+
 pub(crate) struct PendingOpen {
     chan: Option<Chan>,
     rpc: PendingRpc,
-    mode: u8,
-    close_on_exec: bool,
+    walk: Option<PendingWalk>,
+    op: FidOperation,
+}
+
+pub(crate) enum FidOperation {
+    Open(u8),
+    Create { mode: u8, perm: u32, name: Vec<u8> },
+    Remove,
 }
 
 fn unique_fid(chan: &mut Chan) -> Option<&mut Fid> {
@@ -694,37 +772,73 @@ fn unique_fid(chan: &mut Chan) -> Option<&mut Fid> {
 }
 
 impl PendingOpen {
-    pub(crate) fn start(mut chan: Chan, mode: u8, close_on_exec: bool) -> Result<Self, Chan> {
-        let Some(tcp) = unique_fid(&mut chan).and_then(|fid| fid.session.tcp) else { return Err(chan) };
-        Ok(Self { chan: Some(chan), rpc: PendingRpc::new(tcp), mode, close_on_exec })
+    pub(crate) fn start(chan: Chan, mode: u8) -> Result<Self, Chan> {
+        Self::start_operation(chan, FidOperation::Open(mode))
     }
 
-    fn progress(&mut self, proc: &crate::proc::Proc) -> crate::syscall::Result<Option<usize>> {
+    pub(crate) fn start_operation(mut chan: Chan, op: FidOperation) -> Result<Self, Chan> {
+        let (tcp, walk) = if let Some(fid) = unique_fid(&mut chan) {
+            let Some(tcp) = fid.session.tcp else { return Err(chan) };
+            (tcp, None)
+        } else {
+            let Some(walk) = PendingWalk::new(&chan) else { return Err(chan) };
+            (walk.rpc.tcp, Some(walk))
+        };
+        Ok(Self { chan: Some(chan), rpc: PendingRpc::new(tcp), walk, op })
+    }
+
+    pub(crate) fn open_channel(&mut self, interrupted: bool) -> Result<Option<Chan>, Error> {
         let chan = self.chan.as_mut().ok_or(Error::Ebadfd)?;
+        if let Some(walk) = &mut self.walk {
+            if !walk.progress(chan, None, interrupted)? {
+                return Ok(None);
+            }
+            self.walk = None;
+        }
         let fid = unique_fid(chan).ok_or(Error::Ebadfd)?;
-        let interrupted = proc.has_pending_signals();
         if self.rpc.tag.is_none() {
             if interrupted {
-                return Err(Error::Eintr.into());
+                return Err(Error::Eintr);
             }
             if !*fid.valid.get_mut() {
-                return Err(Error::Ebadfd.into());
+                return Err(Error::Ebadfd);
             }
-            let mut body = [0; 5];
-            body[..4].copy_from_slice(&fid.number.to_le_bytes());
-            body[4] = self.mode;
-            self.rpc.submit(&fid.session, TOPEN, &body)?;
+            let mut body = fid.number.to_le_bytes().to_vec();
+            let kind = match &self.op {
+                FidOperation::Open(mode) => {
+                    body.push(*mode);
+                    TOPEN
+                }
+                FidOperation::Create { mode, perm, name } => {
+                    string(&mut body, name)?;
+                    body.extend_from_slice(&perm.to_le_bytes());
+                    body.push(*mode);
+                    TCREATE
+                }
+                FidOperation::Remove => TREMOVE,
+            };
+            self.rpc.submit(&fid.session, kind, &body)?;
         }
         let Some(reply) = self.rpc.poll(&fid.session, interrupted) else { return Ok(None) };
+        let mode = match &self.op {
+            FidOperation::Open(mode) | FidOperation::Create { mode, .. } => *mode,
+            FidOperation::Remove => {
+                if !matches!(reply, Err(Error::Eintr)) {
+                    *fid.valid.get_mut() = false;
+                }
+                if !reply?.is_empty() {
+                    return Err(Error::Eio);
+                }
+                return Ok(self.chan.take());
+            }
+        };
         let (qid, iounit) = decode_open(&reply?)?;
         fid.iounit = iounit;
         chan.qid = qid;
-        chan.mode = self.mode;
-        let group = proc.fgrp.as_deref().ok_or(Error::Eperm)?;
-        let chan = self.chan.take().ok_or(Error::Ebadfd)?;
-        let fd = crate::vfs::alloc_device_channel_in(group, chan, self.close_on_exec)?;
-        Ok(Some(fd as usize))
+        chan.mode = mode;
+        Ok(self.chan.take())
     }
+
 }
 
 impl Drop for PendingOpen {
@@ -813,7 +927,7 @@ pub(crate) struct PendingData {
 }
 
 impl PendingData {
-    fn start(channel: Box<Transport>, address: u64, size: usize, write: bool) -> core::result::Result<Self, Box<Transport>> {
+    pub(crate) fn start(channel: Box<Transport>, address: u64, size: usize, write: bool) -> core::result::Result<Self, Box<Transport>> {
         let prepared = channel.io_device_chan().and_then(|raw| {
             let directory = (raw.qid.type_ & qidtype::DIR != 0).then_some(raw.dev);
             if directory.is_some() && write {
@@ -827,7 +941,7 @@ impl PendingData {
             directory, names: false, count: 0 })
     }
 
-    fn poll(&mut self, proc: &crate::proc::Proc) -> Option<crate::syscall::Result<usize>> {
+    pub(crate) fn poll(&mut self, proc: &crate::proc::Proc) -> Option<crate::syscall::Result<usize>> {
         let result = self.progress(proc);
         match result {
             Ok(false) => None,
