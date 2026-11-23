@@ -24,7 +24,7 @@ pub enum Word {
     Variable(String, Expansion, Option<Vec<Word>>),
     Indirect(Box<Word>, Expansion, Option<Vec<Word>>),
     Concat(Box<Word>, Box<Word>),
-    Substitute(Box<Command>),
+    Substitute(Option<Box<Word>>, Box<Command>),
     PipeFile(bool, Box<Command>),
 }
 
@@ -290,15 +290,20 @@ pub fn parse(source: &str, previous_if: bool) -> Result<Command, Error> {
 
 impl Parser<'_> {
     fn bump(&mut self) -> Result<Token, Error> {
-        if self.token == Token::Newline {
-            for (delimiter, contents) in self.documents.drain(..) {
-                let _ = contents.set(self.lexer.here(&delimiter)?);
-            }
-        }
         if self.token == Token::End && !self.documents.is_empty() {
             return Err(Error::Incomplete);
         }
         Ok(core::mem::replace(&mut self.token, self.lexer.next()?))
+    }
+
+    fn separator(&mut self) -> Result<(), Error> {
+        if self.depth == 0 && self.token == Token::Newline {
+            for (delimiter, contents) in self.documents.drain(..) {
+                let _ = contents.set(self.lexer.here(&delimiter)?);
+            }
+        }
+        self.bump()?;
+        Ok(())
     }
 
     fn is(&self, word: &str) -> bool {
@@ -344,7 +349,7 @@ impl Parser<'_> {
         let mut previous_if = self.depth == 0 && self.previous_if;
         loop {
             while matches!(self.token, Token::Newline | Token::Semi) {
-                self.bump()?;
+                self.separator()?;
             }
             if matches!(self.token, Token::End | Token::EndBrace | Token::Close) || (cases && self.is("case")) {
                 return Ok(Command::Sequence(commands));
@@ -356,7 +361,7 @@ impl Parser<'_> {
                     command = Command::Background(Box::new(command));
                 }
                 Token::Semi | Token::Newline => {
-                    self.bump()?;
+                    self.separator()?;
                 }
                 Token::Close | Token::EndBrace | Token::End => {}
                 _ => return Err(Error::Invalid("expected command separator")),
@@ -445,10 +450,11 @@ impl Parser<'_> {
         } else if self.is("switch") {
             self.bump()?;
             let subject = self.word()?;
-            self.skip_newlines()?;
             self.expect(Token::Brace)?;
             let mut cases = Vec::new();
-            self.skip_newlines()?;
+            while matches!(self.token, Token::Newline | Token::Semi) {
+                self.separator()?;
+            }
             while self.is("case") {
                 self.bump()?;
                 let patterns = self.words()?;
@@ -458,7 +464,9 @@ impl Parser<'_> {
                 let body = self.nested(|parser| parser.sequence(true))?;
                 cases.push(Case { patterns, body });
             }
-            if self.token == Token::EndBrace && cases.is_empty() {
+            if self.token == Token::EndBrace && (cases.is_empty() || matches!(cases.as_slice(),
+                [Case { body: Command::Sequence(commands), .. }] if commands.is_empty()))
+            {
                 return Err(Error::Invalid("case missing in switch"));
             }
             self.expect(Token::EndBrace)?;
@@ -622,7 +630,14 @@ impl Parser<'_> {
                 self.expect(Token::Close)?;
                 Word::List(words)
             }
-            Token::Backquote => Word::Substitute(Box::new(self.body(Token::Brace, Token::EndBrace)?)),
+            Token::Backquote => {
+                let separators = if self.token == Token::Brace {
+                    None
+                } else {
+                    Some(Box::new(self.word()?))
+                };
+                Word::Substitute(separators, Box::new(self.body(Token::Brace, Token::EndBrace)?))
+            }
             Token::PipeFile(read) => Word::PipeFile(read, Box::new(self.body(Token::Brace, Token::EndBrace)?)),
             _ => return Err(Error::Invalid("expected word")),
         })

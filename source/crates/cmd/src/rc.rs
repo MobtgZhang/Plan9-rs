@@ -416,12 +416,13 @@ impl Shell {
                 }
                 Ok((0..count).map(|index| left[index % left.len()].clone().concat(&right[index % right.len()])).collect())
             }
-            Word::Substitute(body) => {
+            Word::Substitute(separators, body) => {
+                let separators = match separators {
+                    Some(word) => self.arguments(core::slice::from_ref(word.as_ref()))?,
+                    None => read_env("ifs").unwrap_or_else(|| vec![String::from(" \t\n")]),
+                };
+                let separators = separators.first().map_or("", String::as_str);
                 let text = self.capture(body)?;
-                let separators = read_env("ifs").map_or_else(|| String::from(" \t\n"), |value| value.concat());
-                if separators.is_empty() {
-                    return Ok((!text.is_empty()).then(|| Value::literal(text)).into_iter().collect());
-                }
                 Ok(text.split(|character| separators.contains(character)).filter(|field| !field.is_empty())
                     .map(Value::literal).collect())
             }
