@@ -46,7 +46,7 @@ const COMMANDS: &[&str] = &[
     "dc", "diff", "dirname", "du", "echo", "ed", "env", "expr", "false", "fortune",
     "grep", "group", "head", "hostname", "id", "ipconfig", "kill", "ln", "ls",
     "mkdir", "more", "mount", "mv", "netcat", "nl", "passwd", "ping", "printf", "ps", "pwd",
-    "rc", "rm", "rmdir", "seq", "sleep", "snoopy", "sort", "stat", "su", "tail", "tee",
+    "rc", "rm", "rmdir", "seq", "sleep", "snap", "snoopy", "sort", "stat", "su", "tail", "tee",
     "test", "time", "touch", "tr", "traceroute", "true", "tty", "uname", "uniq", "units",
     "unmount", "uptime", "useradd", "usermod", "wc", "who", "whoami", "yes",
 ];
@@ -191,6 +191,9 @@ impl Shell {
                         self.condition = None;
                     }
                     status = self.execute(command);
+                    if !matches!(command, Command::If(..)) {
+                        self.condition = None;
+                    }
                 }
                 Ok(status)
             }
@@ -198,7 +201,7 @@ impl Shell {
                 let status = self.test(left);
                 Ok(if succeeded(&status) == *on_success { self.execute(right) } else { status })
             }
-            Command::Negate(body) => Ok(if succeeded(&self.test(body)) { String::from("false") } else { String::new() }),
+            Command::Negate(body) => Ok(if succeeded(&self.execute(body)) { String::from("false") } else { String::new() }),
             Command::If(condition, body) => {
                 let status = self.test(condition);
                 let matched = succeeded(&status);
@@ -212,12 +215,14 @@ impl Shell {
                 None => Err("if not without if"),
             },
             Command::While(condition, body) => {
-                let mut status = String::new();
-                while succeeded(&self.test(condition)) {
-                    status = self.execute(body);
+                loop {
+                    let status = self.test(condition);
+                    if !succeeded(&status) {
+                        break Ok(status);
+                    }
+                    self.execute(body);
                     syscall::yield_cpu();
                 }
-                Ok(status)
             }
             Command::For(name, words, body) => {
                 let values = if let Some(words) = words { self.arguments(words)? } else { self.args.clone() };
@@ -238,15 +243,16 @@ impl Shell {
             Command::Switch(subject, cases) => {
                 let text = self.match_subject(subject)?;
                 for case in cases {
-                    if self.matches(&text, &case.patterns)? {
+                    if self.expand_words(&case.patterns)?.iter().any(|pattern| matches(pattern, &text)) {
                         return Ok(self.execute(&case.body));
                     }
                 }
-                Ok(String::new())
+                Ok(self.status.clone())
             }
             Command::Match(subject, patterns) => {
+                let patterns = self.expand_words(patterns)?;
                 let text = self.match_subject(subject)?;
-                Ok(if self.matches(&text, patterns)? { String::new() } else { String::from("no match") })
+                Ok(if patterns.iter().any(|pattern| matches(pattern, &text)) { String::new() } else { String::from("no match") })
             }
             Command::Function(names, body) => {
                 for name in self.arguments(names)? {
@@ -258,7 +264,7 @@ impl Shell {
                     }
                     self.define(name, body.clone());
                 }
-                Ok(String::new())
+                Ok(self.status.clone())
             }
             Command::Simple(words) => {
                 let values = self.arguments(words)?;
@@ -268,7 +274,13 @@ impl Shell {
             Command::Redirected(redirections, body) => {
                 let mut restore = Vec::new();
                 let mut writers = Vec::new();
-                let result = self.redirect(redirections, &mut restore, &mut writers).map(|()| self.execute(body));
+                let result = self.redirect(redirections, &mut restore, &mut writers).map(|()| {
+                    if matches!(body.as_ref(), Command::Simple(words) if words.is_empty()) {
+                        self.status.clone()
+                    } else {
+                        self.execute(body)
+                    }
+                });
                 for (target, original) in restore.into_iter().rev() {
                     restore_descriptor(target, original);
                 }
@@ -296,7 +308,7 @@ impl Shell {
                     self.last_job = Some(pid);
                     self.jobs.push(pid);
                     syscall::yield_cpu();
-                    Ok(String::new())
+                    Ok(self.status.clone())
                 } else {
                     Ok(self.wait(pid))
                 }
@@ -338,7 +350,7 @@ impl Shell {
             let source = read_all(fd, SOURCE_LIMIT);
             syscall::close(fd);
             let Ok(Command::Sequence(commands)) = source.and_then(|source| {
-                syntax::parse(&source).map_err(|_| "invalid environment function")
+                syntax::parse(&source, false).map_err(|_| "invalid environment function")
             }) else { continue };
             if let [Command::Function(names, Some(body))] = commands.as_slice() {
                 if matches!(names.as_slice(), [Word::Literal(literal, _)] if literal == name) {
@@ -377,13 +389,7 @@ impl Shell {
     fn expand(&mut self, word: &Word) -> Result<Vec<Value>> {
         match word {
             Word::Literal(text, quoted) => Ok(vec![Value::new(text.clone(), *quoted)]),
-            Word::List(words) => {
-                let mut values = Vec::new();
-                for word in words {
-                    values.extend(self.expand(word)?);
-                }
-                Ok(values)
-            }
+            Word::List(words) => self.expand_words(words),
             Word::Variable(name, style, indices) => {
                 self.expand_variable(name, *style, indices.as_deref())
             }
@@ -396,8 +402,8 @@ impl Shell {
                 self.expand_variable(&name.text, *style, indices.as_deref())
             }
             Word::Concat(left, right) => {
-                let left = self.expand(left)?;
                 let right = self.expand(right)?;
+                let left = self.expand(left)?;
                 let count = left.len().max(right.len());
                 if left.is_empty() != right.is_empty() {
                     return Err("null list in concatenation");
@@ -414,7 +420,7 @@ impl Shell {
                 let text = self.capture(body)?;
                 let separators = read_env("ifs").map_or_else(|| String::from(" \t\n"), |value| value.concat());
                 if separators.is_empty() {
-                    return Ok(vec![Value::literal(text)]);
+                    return Ok((!text.is_empty()).then(|| Value::literal(text)).into_iter().collect());
                 }
                 Ok(text.split(|character| separators.contains(character)).filter(|field| !field.is_empty())
                     .map(Value::literal).collect())
@@ -427,30 +433,32 @@ impl Shell {
         let values = self.variable(name);
         let Some(indices) = indices else { return Ok(expand_values(values, style)) };
         let mut selected = Vec::new();
-        for word in indices {
-            for value in self.expand(word)? {
-                let item = value.text.as_str();
-                let (start, end) = item.split_once('-').unwrap_or((item, item));
-                let Some(first) = start.parse::<usize>().ok().and_then(|index| index.checked_sub(1)) else {
-                    continue;
-                };
-                let end = if end.is_empty() { values.len() } else { end.parse::<usize>().unwrap_or(0) };
-                if let Some(range) = values.get(first..end.min(values.len())) {
-                    selected.extend_from_slice(range);
-                }
+        for value in self.expand_words(indices)? {
+            let (start, suffix) = decimal_prefix(&value.text);
+            let Some(first) = start.checked_sub(1) else { continue };
+            let end = match suffix.strip_prefix('-') {
+                Some("") => values.len(),
+                Some(end) => decimal_prefix(end).0,
+                None => start,
+            };
+            if let Some(range) = values.get(first..end.min(values.len())) {
+                selected.extend_from_slice(range);
             }
         }
         Ok(expand_values(selected, style))
     }
 
-    fn arguments(&mut self, words: &[Word]) -> Result<Vec<String>> {
-        let mut arguments = Vec::new();
-        for word in words {
-            for value in self.expand(word)? {
-                arguments.extend(glob(value));
-            }
+    fn expand_words(&mut self, words: &[Word]) -> Result<Vec<Value>> {
+        let mut values = Vec::new();
+        for word in words.iter().rev() {
+            values.extend(self.expand(word)?.into_iter().rev());
         }
-        Ok(arguments)
+        values.reverse();
+        Ok(values)
+    }
+
+    fn arguments(&mut self, words: &[Word]) -> Result<Vec<String>> {
+        Ok(self.expand_words(words)?.into_iter().flat_map(glob).collect())
     }
 
     fn single(&mut self, word: &Word) -> Result<String> {
@@ -487,17 +495,6 @@ impl Shell {
         Ok(values.join(" "))
     }
 
-    fn matches(&mut self, subject: &str, words: &[Word]) -> Result<bool> {
-        for word in words {
-            for pattern in self.expand(word)? {
-                if matches(&pattern, subject) {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-
     fn assign(&mut self, pairs: &[(Word, Word)], body: &Command) -> Result<String> {
         let persistent = matches!(body, Command::Simple(words) if words.is_empty());
         let mut restore = Vec::new();
@@ -510,7 +507,7 @@ impl Shell {
                 }
                 self.set(&name, &values)?;
             }
-            Ok(if persistent { String::new() } else { self.execute(body) })
+            Ok(if persistent { self.status.clone() } else { self.execute(body) })
         })();
         for (name, old) in restore.into_iter().rev() {
             self.restore_variable(&name, old);
@@ -890,7 +887,7 @@ impl Shell {
 
     fn execute_input(&mut self, source: &[u8]) -> Result<Option<String>> {
         let source = core::str::from_utf8(source).map_err(|_| "invalid UTF-8 input")?;
-        match syntax::parse(source) {
+        match syntax::parse(source, self.condition.is_some()) {
             Ok(command) => {
                 if self.flag(b'r') {
                     syscall::write_all(2, format!("{command:?}\n").as_bytes());
@@ -959,6 +956,16 @@ fn report(error: &str) {
 
 fn quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', "''"))
+}
+
+fn decimal_prefix(text: &str) -> (usize, &str) {
+    let mut number = 0usize;
+    let mut digits = 0;
+    for digit in text.bytes().take_while(u8::is_ascii_digit) {
+        number = number.saturating_mul(10).saturating_add(usize::from(digit - b'0'));
+        digits += 1;
+    }
+    (number, &text[digits..])
 }
 
 fn expand_values(values: Vec<String>, style: Expansion) -> Vec<Value> {
@@ -1129,7 +1136,7 @@ fn glob(value: Value) -> Vec<String> {
                     core::str::from_utf8(listing.get(..count)?).ok()
                 }) {
                     for name in listing.lines() {
-                        if name.starts_with('.') && !component.starts_with('.') { continue; }
+                        if matches!(name, "." | "..") && !component.starts_with('.') { continue; }
                         if matches(&pattern, name) {
                             found.push(format!("{prefix}{name}"));
                         }
@@ -1205,8 +1212,8 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
         }
     }
     let login = shell.flag(b'l');
-    if login && syscall::rfork(syscall::RFENVG) < 0 {
-        report("cannot copy login environment");
+    if syscall::rfork(syscall::RFENVG) < 0 {
+        report("cannot copy shell environment");
         return 1;
     }
     shell.import_functions();
@@ -1281,7 +1288,7 @@ pub fn main(argc: usize, argv: *const *const u8) -> i32 {
         if shell.flag(b'v') {
             syscall::write_all(2, format!("{text}\n").as_bytes());
         }
-        match syntax::parse(&source) {
+        match syntax::parse(&source, shell.condition.is_some()) {
             Err(Error::Incomplete) => continue,
             Err(Error::Invalid(error)) => { report(error); shell.status = String::from(error); }
             Ok(command) => {

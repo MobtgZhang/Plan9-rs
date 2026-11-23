@@ -100,6 +100,7 @@ fn open_service(source: &str) -> i64 {
 }
 
 const RPC_MAX: usize = 4096;
+const RPC_WRITE: &[u8] = b"write ";
 
 fn authenticate_mount(auth: i64, keys: &str) -> bool {
     let rpc = syscall::open(b"/mnt/factotum/rpc\0".as_ptr(), 2);
@@ -112,7 +113,7 @@ fn authenticate_mount(auth: i64, keys: &str) -> bool {
 }
 
 fn proxy_mount_auth(auth: i64, rpc: i64, keys: &str) -> Option<()> {
-    let mut request = [0; RPC_MAX];
+    let mut request = [0; RPC_MAX + RPC_WRITE.len()];
     let mut response = [0; RPC_MAX];
     let start = b"start proto=p9any role=client";
     let length = start.len() + 1 + keys.len();
@@ -128,17 +129,16 @@ fn proxy_mount_auth(auth: i64, rpc: i64, keys: &str) -> Option<()> {
                 let (status, info) = rpc_exchange(rpc, b"authinfo", &mut response)?;
                 return (status == b"ok" && valid_auth_info(info)).then_some(());
             }
-            (b"ok", data) if syscall::write(auth, data.as_ptr(), data.len()) == data.len() as i64 => {}
+            (b"ok", data) if data.is_empty() || syscall::write(auth, data.as_ptr(), data.len()) == data.len() as i64 => {}
             (b"phase", _) => {
-                let prefix = b"write ";
-                request[..prefix.len()].copy_from_slice(prefix);
-                let mut length = prefix.len();
+                request[..RPC_WRITE.len()].copy_from_slice(RPC_WRITE);
+                let mut length = RPC_WRITE.len();
                 loop {
                     match rpc_exchange(rpc, &request[..length], &mut response)? {
                         (b"ok", _) => break,
                         (b"toosmall", size) => {
                             let end = core::str::from_utf8(size).ok()?.trim().parse::<usize>().ok()?
-                                .checked_add(prefix.len())?;
+                                .checked_add(RPC_WRITE.len())?;
                             let output = request.get_mut(length..end)?;
                             if output.is_empty() {
                                 return None;

@@ -28,6 +28,16 @@ pub enum Word {
     PipeFile(bool, Box<Command>),
 }
 
+impl Word {
+    fn joins_adjacent(&self) -> bool {
+        match self {
+            Self::Literal(..) | Self::Variable(_, _, None) => true,
+            Self::Indirect(name, _, None) => name.joins_adjacent(),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Redirect {
     File(i64, FileMode, Word),
@@ -260,14 +270,16 @@ struct Parser<'a> {
     lexer: Lexer<'a>,
     token: Token,
     depth: usize,
+    previous_if: bool,
     documents: Vec<(String, Rc<OnceCell<String>>)>,
 }
 
-pub fn parse(source: &str) -> Result<Command, Error> {
+pub fn parse(source: &str, previous_if: bool) -> Result<Command, Error> {
     let mut parser = Parser {
         lexer: Lexer { source, separated: true },
         token: Token::End,
         depth: 0,
+        previous_if,
         documents: Vec::new(),
     };
     parser.bump()?;
@@ -329,6 +341,7 @@ impl Parser<'_> {
 
     fn sequence(&mut self, cases: bool) -> Result<Command, Error> {
         let mut commands = Vec::new();
+        let mut previous_if = self.depth == 0 && self.previous_if;
         loop {
             while matches!(self.token, Token::Newline | Token::Semi) {
                 self.bump()?;
@@ -336,7 +349,7 @@ impl Parser<'_> {
             if matches!(self.token, Token::End | Token::EndBrace | Token::Close) || (cases && self.is("case")) {
                 return Ok(Command::Sequence(commands));
             }
-            let mut command = self.command(1)?;
+            let mut command = self.command_after_if(1, previous_if)?;
             match self.token {
                 Token::Background => {
                     self.bump()?;
@@ -348,13 +361,18 @@ impl Parser<'_> {
                 Token::Close | Token::EndBrace | Token::End => {}
                 _ => return Err(Error::Invalid("expected command separator")),
             }
+            previous_if = matches!(command, Command::If(..));
             commands.push(command);
         }
     }
 
     fn command(&mut self, min: u8) -> Result<Command, Error> {
+        self.command_after_if(min, false)
+    }
+
+    fn command_after_if(&mut self, min: u8, previous_if: bool) -> Result<Command, Error> {
         self.nested(|parser| {
-            let left = parser.prefix()?;
+            let left = parser.prefix(previous_if)?;
             parser.continue_command(left, min)
         })
     }
@@ -386,7 +404,7 @@ impl Parser<'_> {
         Ok(command)
     }
 
-    fn prefix(&mut self) -> Result<Command, Error> {
+    fn prefix(&mut self, previous_if: bool) -> Result<Command, Error> {
         let command = if matches!(self.token, Token::File(..) | Token::Dup(..)) {
             let redirects = self.redirects()?;
             return Ok(Self::redirected(redirects, self.command(2)?));
@@ -395,6 +413,9 @@ impl Parser<'_> {
         } else if self.is("if") {
             self.bump()?;
             if self.is("not") {
+                if !previous_if {
+                    return Err(Error::Invalid("if not without if"));
+                }
                 self.bump()?;
                 self.continuation()?;
                 return Ok(Command::Otherwise(Box::new(self.command(1)?)));
@@ -436,6 +457,9 @@ impl Parser<'_> {
                 }
                 let body = self.nested(|parser| parser.sequence(true))?;
                 cases.push(Case { patterns, body });
+            }
+            if self.token == Token::EndBrace && cases.is_empty() {
+                return Err(Error::Invalid("case missing in switch"));
             }
             self.expect(Token::EndBrace)?;
             Command::Switch(subject, cases)
@@ -557,14 +581,25 @@ impl Parser<'_> {
         }
         self.nested(|parser| {
             let mut word = parser.atom()?;
-            while parser.token == Token::Concat || (!parser.lexer.separated && parser.starts_word()) {
+            let mut joins_adjacent = word.joins_adjacent();
+            loop {
                 if parser.token == Token::Concat {
                     parser.bump()?;
+                } else if joins_adjacent && !parser.lexer.separated {
+                    match parser.token {
+                        Token::Open => return Err(Error::Invalid("unexpected ( after word")),
+                        Token::Literal(..) | Token::Variable(..) | Token::Backquote => {}
+                        _ => break,
+                    }
+                } else {
+                    break;
                 }
                 if !parser.starts_word() {
                     return Err(parser.fail("expected word after ^"));
                 }
-                word = Word::Concat(Box::new(word), Box::new(parser.atom()?));
+                let right = parser.atom()?;
+                joins_adjacent = right.joins_adjacent();
+                word = Word::Concat(Box::new(word), Box::new(right));
             }
             Ok(word)
         })
@@ -578,9 +613,10 @@ impl Parser<'_> {
                     return Err(self.fail("missing variable name"));
                 }
                 let name = self.nested(|parser| parser.atom())?;
-                Word::Indirect(Box::new(name), style, self.subscripts()?)
+                let indices = if name.joins_adjacent() { self.subscripts(style)? } else { None };
+                Word::Indirect(Box::new(name), style, indices)
             }
-            Token::Variable(name, style) => Word::Variable(name, style, self.subscripts()?),
+            Token::Variable(name, style) => Word::Variable(name, style, self.subscripts(style)?),
             Token::Open => {
                 let words = self.words()?;
                 self.expect(Token::Close)?;
@@ -592,9 +628,12 @@ impl Parser<'_> {
         })
     }
 
-    fn subscripts(&mut self) -> Result<Option<Vec<Word>>, Error> {
+    fn subscripts(&mut self, style: Expansion) -> Result<Option<Vec<Word>>, Error> {
         if self.token != Token::Open || self.lexer.separated {
             return Ok(None);
+        }
+        if style != Expansion::List {
+            return Err(Error::Invalid("subscripts require list expansion"));
         }
         self.bump()?;
         let indices = self.words()?;
