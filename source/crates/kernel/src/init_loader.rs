@@ -753,7 +753,7 @@ pub unsafe fn copy_user_mappings(parent_pml4: u64, child_pml4: PhysAddr) -> Opti
 pub unsafe fn copy_user_mappings(parent_pml4: u64, child_pml4: PhysAddr) -> Option<()> {
     let page_size = PAGESIZE as usize;
 
-    for root_idx in 0..512usize {
+    for root_idx in 0..256usize {
         let root_e = read_pte(parent_pml4, root_idx);
         if root_e & PTE_PRESENT == 0 || is_block_desc(root_e) {
             continue;
@@ -771,7 +771,8 @@ pub unsafe fn copy_user_mappings(parent_pml4: u64, child_pml4: PhysAddr) -> Opti
 
             for leaf_idx in 0..512usize {
                 let pte = read_pte(leaf_table, leaf_idx);
-                if pte & PTE_PRESENT == 0 {
+                const RSV_U: u64 = 1 << 4;
+                if pte & PTE_PRESENT == 0 || pte & RSV_U == 0 {
                     continue;
                 }
 
@@ -786,11 +787,7 @@ pub unsafe fn copy_user_mappings(parent_pml4: u64, child_pml4: PhysAddr) -> Opti
                 // leaf descriptor: V|R|W|X|U|A|D (bits 0-4, 6, 7).
                 const RSV_W: u64 = 1 << 2;
                 const RSV_X: u64 = 1 << 3;
-                const RSV_U: u64 = 1 << 4;
-                let mut flags: u64 = 1; // PRESENT
-                if pte & RSV_U != 0 {
-                    flags |= 1 << 2; // USER
-                }
+                let mut flags: u64 = PTE_PRESENT | PTE_USER;
                 if pte & RSV_W != 0 {
                     flags |= 1 << 1; // WRITABLE
                 } else {

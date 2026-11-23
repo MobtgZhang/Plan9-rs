@@ -34,7 +34,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{ AtomicBool, AtomicUsize, Ordering };
 /// Maximum number of SD units
-const SD_MAX_UNITS: usize = 8;
+pub(crate) const SD_MAX_UNITS: usize = 8;
 /// Maximum partitions per unit
 const SD_MAX_PARTS: usize = 16;
 /// Block size
@@ -86,10 +86,18 @@ pub trait StorageBackend: Send + Sync {
     fn read_sectors(&self, lba: u64, count: usize, buf: &mut [u8]) -> SdResult<usize>;
     
     /// Write sectors to the device
-    fn write_sectors(&mut self, lba: u64, count: usize, buf: &[u8]) -> SdResult<usize>;
+    fn write_sectors(&self, lba: u64, count: usize, buf: &[u8]) -> SdResult<usize>;
     
     /// Flush any pending writes
-    fn flush(&mut self) -> SdResult<()>;
+    fn flush(&self) -> SdResult<()>;
+
+    fn supports_checkpoint(&self) -> bool { false }
+
+    fn panic_write(&self, _lba: u64, _buf: &[u8]) -> SdResult<()> { Err(SdError::NotOnline) }
+
+    unsafe fn panic_write_page(&self, _lba: u64, _phys: u64) -> SdResult<()> { Err(SdError::NotOnline) }
+
+    fn panic_flush(&self) -> SdResult<()> { Err(SdError::NotOnline) }
     
     /// Get device capacity in sectors
     fn capacity(&self) -> u64;
@@ -113,6 +121,7 @@ mod sd_qid {
     
     /// Top-level directory
     pub const QTOPDIR: u64 = 0;
+    pub const QUNIT: u64 = 0x10000;
     /// Unit directory (shift by this to get unit-specific qids)
     pub const UNIT_SHIFT: u64 = 8;
     /// Partition bits
@@ -135,7 +144,7 @@ mod sd_qid {
     
     /// Create unit directory qid
     pub fn unit_dir(unit: usize) -> u64 {
-        ((unit as u64) << UNIT_SHIFT) | QTOPDIR
+        ((unit as u64) << UNIT_SHIFT) | QUNIT
     }
     
     /// Create control file qid
@@ -327,9 +336,7 @@ impl SdUnit {
         let backend = self.backend.lock();
         
         if let Some(be) = backend.as_ref() {
-            // Use raw pointer to call methods since Arc<dyn> doesn't allow mut deref
-            let be_ptr = be.as_ref() as *const dyn StorageBackend as *mut dyn StorageBackend;
-            unsafe { (*be_ptr).write_sectors(lba, buf.len() / self.block_size, buf) }
+            be.write_sectors(lba, buf.len() / self.block_size, buf)
         } else {
             Err(SdError::NoDevice)
         }
@@ -345,11 +352,18 @@ impl SdUnit {
         let backend = self.backend.lock();
         
         if let Some(be) = backend.as_ref() {
-            let be_ptr = be.as_ref() as *const dyn StorageBackend as *mut dyn StorageBackend;
-            unsafe { (*be_ptr).flush() }
+            be.flush()
         } else {
             Err(SdError::NoDevice)
         }
+    }
+
+    pub(crate) fn supports_checkpoint(&self) -> bool {
+        self.backend.lock().as_ref().is_some_and(|backend| backend.supports_checkpoint())
+    }
+
+    pub(crate) fn try_backend(&self) -> Option<Arc<dyn StorageBackend>> {
+        self.backend.try_lock()?.clone()
     }
 }
 
@@ -481,8 +495,9 @@ impl Dev for SdDev {
         if name == ".." {
             // Going up from unit directory
             let unit = sd_qid::unit(qid.path);
-            if unit > 0 {
-                ch.qid = Qid::new(sd_qid::unit_dir(0), 0, qidtype::DIR);
+            if qid.path != sd_qid::QTOPDIR {
+                let parent = if sd_qid::is_dir(qid.path) { sd_qid::QTOPDIR } else { sd_qid::unit_dir(unit) };
+                ch.qid = Qid::new(parent, 0, qidtype::DIR);
             }
             return Ok(Some(ch.qid));
         }
@@ -492,7 +507,7 @@ impl Dev for SdDev {
         
         if sd_qid::is_dir(qid.path) {
             // At top level or unit level
-            if unit == 0 {
+            if qid.path == sd_qid::QTOPDIR {
                 // At top level - look for sdN
                 if let Some(num) = parse_sd_name(name) {
                     if num < SD_MAX_UNITS && unsafe { (*self.units.get())[num].is_some() } {
@@ -553,6 +568,9 @@ impl Dev for SdDev {
     }
 
     fn open(&mut self, ch: &mut Chan, mode: u8) -> Result<(), DevError> {
+        if !sd_qid::is_dir(ch.qid.path) && crate::proc::curproc().is_some_and(|process| process.uid != 0) {
+            return Err(DevError::Eperm);
+        }
         ch.mode = mode;
         Ok(())
     }
@@ -575,7 +593,7 @@ impl Dev for SdDev {
         let unit_ref = self.get_unit(unit).ok_or(DevError::Enoent)?;
         
         // Check if unit is online
-        if !unit_ref.online.load(Ordering::SeqCst) {
+        if qid.path != sd_qid::QTOPDIR && !unit_ref.online.load(Ordering::SeqCst) {
             return Err(DevError::Eio);
         }
         
@@ -683,6 +701,9 @@ impl Dev for SdDev {
     }
 
     fn write(&mut self, ch: &mut Chan, buf: &[u8], offset: u64) -> Result<usize, DevError> {
+        if crate::proc::curproc().is_some_and(|process| process.uid != 0) {
+            return Err(DevError::Eperm);
+        }
         let qid = ch.qid;
         let unit = sd_qid::unit(qid.path);
         
@@ -698,7 +719,10 @@ impl Dev for SdDev {
                 let cmd_str = String::from_utf8_lossy(buf);
                 
                 // Parse command
-                if cmd_str.starts_with("part ") {
+                if cmd_str.trim() == "rootsync" {
+                    crate::rootdisk::sync(unit_ref)?;
+                    return Ok(buf.len());
+                } else if cmd_str.starts_with("part ") {
                     // part name start end
                     let parts: Vec<&str> = cmd_str.trim().split_whitespace().collect();
                     if parts.len() >= 4 {
@@ -768,15 +792,15 @@ impl Dev for SdDev {
         let unit = sd_qid::unit(qid.path);
         
         let (name, mode, _qtype) = if sd_qid::is_dir(qid.path) {
-            if unit == 0 {
+            if qid.path == sd_qid::QTOPDIR {
                 ("sd".as_bytes().to_vec(), 0o555 | 0o40000, qidtype::DIR)
             } else {
                 (format!("sd{}", unit).into_bytes(), 0o555 | 0o40000, qidtype::DIR)
             }
         } else {
             match qid.path & 0xF {
-                sd_qid::QCTL => (b"ctl".to_vec(), 0o666, 0),
-                sd_qid::QRAW => (b"raw".to_vec(), 0o666, 0),
+                sd_qid::QCTL => (b"ctl".to_vec(), 0o600, 0),
+                sd_qid::QRAW => (b"raw".to_vec(), 0o600, 0),
                 _ => {
                     let part_num = sd_qid::part(qid.path);
                     if part_num > 0 {
@@ -793,7 +817,7 @@ impl Dev for SdDev {
             }
         };
         
-        let length = if !sd_qid::is_dir(qid.path) && unit > 0 {
+        let length = if qid.path & 0xf == sd_qid::QRAW || qid.path & 0xf == sd_qid::QPART {
             let unit_ref = self.get_unit(unit).ok_or(DevError::Enoent)?;
             let part_num = sd_qid::part(qid.path);
             if part_num > 0 {

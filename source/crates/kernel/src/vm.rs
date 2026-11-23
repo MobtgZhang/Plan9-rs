@@ -1608,7 +1608,10 @@ pub unsafe fn map_phys_range(phys: u64, size: u64) -> *mut u8 {
 
     let page_size: u64 = 1u64 << PAGE_SHIFT;
     let phys_aligned = phys & !(page_size - 1);
-    let end = (phys + size + page_size - 1) & !(page_size - 1);
+    let Some(end) = phys.checked_add(size).and_then(|end| end.checked_add(page_size - 1)) else {
+        return core::ptr::null_mut();
+    };
+    let end = end & !(page_size - 1);
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -1637,6 +1640,10 @@ pub unsafe fn map_phys_range(phys: u64, size: u64) -> *mut u8 {
         // riscv64/loongarch64 map their RAM similarly).  Firmware
         // framebuffers and PCI MMIO below that bound are reachable.
         if end > (4u64 << 30) {
+            #[cfg(target_arch = "riscv64")]
+            if crate::plan9_arch::riscv64::map_boot_mmio(phys_aligned.max(4u64 << 30), end) {
+                return phys_to_virt(PhysAddr::new(phys)).as_u64() as *mut u8;
+            }
             serial::put_bytes(b"[map_phys_range] FAILED: phys outside direct map\n");
             return core::ptr::null_mut();
         }

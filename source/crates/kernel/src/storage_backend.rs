@@ -11,9 +11,10 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{fence, Ordering};
+use plan9_common::{sync::Spinlock, types::PhysAddr};
 
 use crate::devsd::{SdError, SdResult, StorageBackend};
 use crate::dev::{PciDeviceInfo};
@@ -71,7 +72,7 @@ impl StorageBackend for AtaBackend {
         Ok(done * block)
     }
 
-    fn write_sectors(&mut self, lba: u64, count: usize, buf: &[u8]) -> SdResult<usize> {
+    fn write_sectors(&self, lba: u64, count: usize, buf: &[u8]) -> SdResult<usize> {
         let block = self.block_size;
         let bytes = count * block;
         if buf.len() < bytes {
@@ -99,7 +100,7 @@ impl StorageBackend for AtaBackend {
         Ok(done * block)
     }
 
-    fn flush(&mut self) -> SdResult<()> {
+    fn flush(&self) -> SdResult<()> {
         Ok(())
     }
 
@@ -181,7 +182,7 @@ impl StorageBackend for AhciBackend {
         Ok(done * block)
     }
 
-    fn write_sectors(&mut self, lba: u64, count: usize, buf: &[u8]) -> SdResult<usize> {
+    fn write_sectors(&self, lba: u64, count: usize, buf: &[u8]) -> SdResult<usize> {
         let block = 512usize;
         if buf.len() < count * block {
             return Err(SdError::Invalid);
@@ -213,7 +214,7 @@ impl StorageBackend for AhciBackend {
         Ok(done * block)
     }
 
-    fn flush(&mut self) -> SdResult<()> {
+    fn flush(&self) -> SdResult<()> {
         if let Some(port) = self.port() {
             match port.flush_cache_phys() {
                 Ok(()) => Ok(()),
@@ -261,12 +262,43 @@ struct NvmeController {
     io_cq: u64,
     io_sq_tail: u32,
     io_cq_head: u32,
+    admin_phase: bool,
+    io_phase: bool,
+    stride: usize,
+    bounce: u64,
+    online: bool,
     next_cid: u16,
     sectors: u64,
     block_size: usize,
 }
 
 impl NvmeController {
+    fn write(&mut self, lba: u64, count: usize, buffer: &[u8]) -> SdResult<usize> {
+        let bytes = self.transfer_size(lba, count, buffer.len())?;
+        let per_page = 4096 / self.block_size;
+        for (index, chunk) in buffer[..bytes].chunks(4096).enumerate() {
+            unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), Self::dma(self.bounce), chunk.len()) };
+            if !self.submit_io(0x01, lba + (index * per_page) as u64, chunk.len() / self.block_size, self.bounce) {
+                return Err(SdError::IoError);
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn transfer_size(&self, lba: u64, count: usize, length: usize) -> SdResult<usize> {
+        if !self.online {
+            return Err(SdError::NotOnline);
+        }
+        if lba.checked_add(count as u64).is_none_or(|end| end > self.sectors) {
+            return Err(SdError::Invalid);
+        }
+        self.block_size.checked_mul(count).filter(|bytes| *bytes <= length).ok_or(SdError::Invalid)
+    }
+
+    fn dma(address: u64) -> *mut u8 {
+        crate::frame_alloc::phys_to_virt(PhysAddr::new(address)).as_u64() as *mut u8
+    }
+
     fn read32(&self, off: usize) -> u32 {
         unsafe { core::ptr::read_volatile((self.base + off) as *const u32) }
     }
@@ -291,15 +323,21 @@ impl NvmeController {
             io_cq: 0,
             io_sq_tail: 0,
             io_cq_head: 0,
+            admin_phase: true,
+            io_phase: true,
+            stride: 0,
+            bounce: 0,
+            online: true,
             next_cid: 1,
             sectors: 0,
             block_size: 512,
         };
 
         let cap = c.read64(0x0);
-        if cap == 0 {
+        if cap == 0 || cap & 0xffff < 3 || (cap >> 48) & 0xf != 0 {
             return None;
         }
+        c.stride = 4 << ((cap >> 32) & 0xf);
 
         // Reset controller.
         c.write32(0x14, 0);
@@ -307,6 +345,9 @@ impl NvmeController {
             if c.read32(0x1C) & 1 == 0 {
                 break;
             }
+        }
+        if c.read32(0x1c) & 1 != 0 {
+            return None;
         }
 
         let asq = crate::frame_alloc::frame_alloc_zeroed().map(|p| p.as_u64());
@@ -318,12 +359,12 @@ impl NvmeController {
         c.acq = acq.unwrap();
 
         // Admin queue size: 4 entries => AQA value 3.
-        c.write32(0x24, 3);
+        c.write32(0x24, (3 << 16) | 3);
         c.write64(0x28, c.asq);
         c.write64(0x30, c.acq);
 
         // Enable controller.
-        c.write32(0x14, 1);
+        c.write32(0x14, (4 << 20) | (6 << 16) | 1);
         for _ in 0..10000 {
             if c.read32(0x1C) & 1 != 0 {
                 break;
@@ -341,34 +382,26 @@ impl NvmeController {
             return None;
         }
         let ns_ptr = ns_buf.unwrap();
-        let ns_data = unsafe {
-            core::slice::from_raw_parts(ns_ptr as *const u8, 4096)
-        };
-        // Clear the buffer before issuing the command.
-        unsafe {
-            core::ptr::write_bytes(ns_ptr as *mut u8, 0, 4096);
-        }
-
         if !c.submit_admin(0x06, 1, ns_ptr, 0, 0) {
             return None;
         }
+        let ns_data = unsafe { core::slice::from_raw_parts(Self::dma(ns_ptr), 4096) };
 
         let nsze = u64::from_le_bytes([
             ns_data[0], ns_data[1], ns_data[2], ns_data[3],
             ns_data[4], ns_data[5], ns_data[6], ns_data[7],
         ]);
         c.sectors = nsze;
-        if ns_data[25] != 0 {
-            let flbas = ns_data[26] as usize;
-            let lbaf_off = 128 + flbas * 8;
-            if lbaf_off + 3 < 4096 {
-                let ds = ns_data[lbaf_off + 2];
-                c.block_size = 1usize << ds;
-            }
-        }
-        if c.sectors == 0 {
+        let format = usize::from((ns_data[26] & 0xf) | ((ns_data[26] & 0x60) >> 1));
+        let offset = 128 + format * 4;
+        let block_shift = ns_data[offset + 2];
+        if c.sectors == 0 || format > usize::from(ns_data[25])
+            || ns_data[offset..offset + 2] != [0, 0] || !(9..=12).contains(&block_shift)
+        {
             return None;
         }
+        c.block_size = 1 << block_shift;
+        c.bounce = ns_ptr;
 
         // Create one I/O completion and submission queue pair.
         let io_sq = crate::frame_alloc::frame_alloc_zeroed().map(|p| p.as_u64());
@@ -380,10 +413,10 @@ impl NvmeController {
         c.io_cq = io_cq.unwrap();
 
         // QID 1, queue size 4.
-        if !c.submit_admin(0x05, 0, c.io_cq, 1, 3) {
+        if !c.submit_admin(0x05, 0, c.io_cq, (3 << 16) | 1, 1) {
             return None;
         }
-        if !c.submit_admin(0x01, 0, c.io_sq, 1, 3) {
+        if !c.submit_admin(0x01, 0, c.io_sq, (3 << 16) | 1, (1 << 16) | 1) {
             return None;
         }
 
@@ -395,9 +428,6 @@ impl NvmeController {
         self.next_cid = self.next_cid.wrapping_add(1);
 
         let cmd = self.asq + (self.sq_tail as u64) * 64;
-        unsafe {
-            core::ptr::write_bytes(cmd as *mut u8, 0, 64);
-        }
         let words: [u32; 16] = [
             opcode | ((cid as u32) << 16),
             nsid,
@@ -418,42 +448,24 @@ impl NvmeController {
         ];
         for (i, w) in words.iter().enumerate() {
             unsafe {
-                core::ptr::write_volatile((cmd + (i as u64) * 4) as *mut u32, *w);
+                Self::dma(cmd).cast::<u32>().add(i).write_volatile(w.to_le());
             }
         }
 
         self.sq_tail = (self.sq_tail + 1) & 3;
+        fence(Ordering::SeqCst);
         self.write32(0x1000, self.sq_tail);
-
-        for _ in 0..100000 {
-            let cq = self.acq + (self.cq_head as u64) * 16;
-            let status = unsafe { core::ptr::read_volatile((cq + 12) as *const u16) };
-            if status & 0x000F != 0 {
-                return false;
-            }
-            // Phase bit alternates as the completion queue wraps.
-            let phase = unsafe { core::ptr::read_volatile((cq + 14) as *const u16) };
-            if phase & 1 == 1 {
-                self.cq_head = (self.cq_head + 1) & 3;
-                self.write32(0x1004, self.cq_head);
-                return true;
-            }
-            // Give the controller a moment to post a completion.
-            for _ in 0..1000 {
-                core::hint::spin_loop();
-            }
-        }
-        false
+        self.complete(false, cid)
     }
 
     fn submit_io(&mut self, opcode: u32, lba: u64, count: usize, buf_ptr: u64) -> bool {
+        if !self.online {
+            return false;
+        }
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
 
         let cmd = self.io_sq + (self.io_sq_tail as u64) * 64;
-        unsafe {
-            core::ptr::write_bytes(cmd as *mut u8, 0, 64);
-        }
         let nlb = (count as u32).saturating_sub(1);
         let words: [u32; 16] = [
             opcode | ((cid as u32) << 16),
@@ -475,100 +487,107 @@ impl NvmeController {
         ];
         for (i, w) in words.iter().enumerate() {
             unsafe {
-                core::ptr::write_volatile((cmd + (i as u64) * 4) as *mut u32, *w);
+                Self::dma(cmd).cast::<u32>().add(i).write_volatile(w.to_le());
             }
         }
 
         self.io_sq_tail = (self.io_sq_tail + 1) & 3;
-        self.write32(0x1002, self.io_sq_tail);
+        fence(Ordering::SeqCst);
+        self.write32(0x1000 + 2 * self.stride, self.io_sq_tail);
+        self.complete(true, cid)
+    }
 
-        for _ in 0..100000 {
-            let cq = self.io_cq + (self.io_cq_head as u64) * 16;
-            let status = unsafe { core::ptr::read_volatile((cq + 12) as *const u16) };
-            if status & 0x000F != 0 {
-                return false;
+    fn complete(&mut self, io: bool, cid: u16) -> bool {
+        let (queue, head, phase, doorbell) = if io {
+            (self.io_cq, &mut self.io_cq_head, &mut self.io_phase, 3)
+        } else {
+            (self.acq, &mut self.cq_head, &mut self.admin_phase, 1)
+        };
+        let entry = Self::dma(queue + u64::from(*head) * 16);
+        for _ in 0..1_000_000 {
+            let result = u32::from_le(unsafe { entry.add(12).cast::<u32>().read_volatile() });
+            let status = (result >> 16) as u16;
+            if (status & 1 != 0) == *phase {
+                fence(Ordering::SeqCst);
+                *head = (*head + 1) & 3;
+                if *head == 0 {
+                    *phase = !*phase;
+                }
+                let next_head = *head;
+                self.write32(0x1000 + doorbell * self.stride, next_head);
+                self.online &= result as u16 == cid;
+                return self.online && status & 0x0ffe == 0;
             }
-            let phase = unsafe { core::ptr::read_volatile((cq + 14) as *const u16) };
-            if phase & 1 == 1 {
-                self.io_cq_head = (self.io_cq_head + 1) & 3;
-                self.write32(0x1003, self.io_cq_head);
-                return true;
-            }
-            for _ in 0..1000 {
-                core::hint::spin_loop();
-            }
+            core::hint::spin_loop();
         }
+        self.online = false;
         false
     }
 }
 
 pub struct NvmeBackend {
-    ctrl: *mut NvmeController,
+    ctrl: Spinlock<NvmeController>,
     model: [u8; 40],
     serial: [u8; 20],
 }
 
-unsafe impl Send for NvmeBackend {}
-unsafe impl Sync for NvmeBackend {}
-
-impl NvmeBackend {
-    fn cap(&self) -> u64 {
-        unsafe { (*self.ctrl).sectors }
-    }
-    fn block(&self) -> usize {
-        unsafe { (*self.ctrl).block_size }
-    }
-}
-
 impl StorageBackend for NvmeBackend {
     fn read_sectors(&self, lba: u64, count: usize, buf: &mut [u8]) -> SdResult<usize> {
-        let block = self.block();
-        let mut done = 0usize;
-        let mut left = count;
-        while left > 0 {
-            let offset = done * block;
-            let ptr = buf[offset..offset + block].as_ptr() as u64;
-            if unsafe { (*self.ctrl).submit_io(0x01, lba + done as u64, 1, ptr) } {
-                done += 1;
-            } else {
+        let mut ctrl = self.ctrl.lock();
+        let block = ctrl.block_size;
+        let bytes = ctrl.transfer_size(lba, count, buf.len())?;
+        let bounce = ctrl.bounce;
+        let per_page = 4096 / block;
+        for (index, chunk) in buf[..bytes].chunks_mut(4096).enumerate() {
+            if !ctrl.submit_io(0x02, lba + (index * per_page) as u64, chunk.len() / block, bounce) {
                 return Err(SdError::IoError);
             }
-            left -= 1;
+            chunk.copy_from_slice(unsafe { core::slice::from_raw_parts(NvmeController::dma(bounce), chunk.len()) });
         }
-        Ok(done * block)
+        Ok(bytes)
     }
 
-    fn write_sectors(&mut self, lba: u64, count: usize, buf: &[u8]) -> SdResult<usize> {
-        let block = self.block();
-        let mut done = 0usize;
-        let mut left = count;
-        while left > 0 {
-            let offset = done * block;
-            let ptr = buf[offset..offset + block].as_ptr() as u64;
-            if unsafe { (*self.ctrl).submit_io(0x02, lba + done as u64, 1, ptr) } {
-                done += 1;
-            } else {
-                return Err(SdError::IoError);
-            }
-            left -= 1;
-        }
-        Ok(done * block)
+    fn write_sectors(&self, lba: u64, count: usize, buf: &[u8]) -> SdResult<usize> {
+        self.ctrl.lock().write(lba, count, buf)
     }
 
-    fn flush(&mut self) -> SdResult<()> {
-        Ok(())
+    fn flush(&self) -> SdResult<()> {
+        self.ctrl.lock().submit_io(0x00, 0, 0, 0).then_some(()).ok_or(SdError::IoError)
     }
 
     fn capacity(&self) -> u64 {
-        self.cap()
+        self.ctrl.lock().sectors
     }
 
     fn block_size(&self) -> usize {
-        self.block()
+        self.ctrl.lock().block_size
     }
 
     fn is_online(&self) -> bool {
-        self.cap() > 0
+        self.ctrl.lock().online
+    }
+
+    fn supports_checkpoint(&self) -> bool { true }
+
+    fn panic_write(&self, lba: u64, buf: &[u8]) -> SdResult<()> {
+        let mut ctrl = self.ctrl.try_lock().ok_or(SdError::NotOnline)?;
+        let count = buf.len() / ctrl.block_size;
+        if ctrl.write(lba, count, buf)? != buf.len() {
+            return Err(SdError::Invalid);
+        }
+        Ok(())
+    }
+
+    unsafe fn panic_write_page(&self, lba: u64, phys: u64) -> SdResult<()> {
+        let mut ctrl = self.ctrl.try_lock().ok_or(SdError::NotOnline)?;
+        let count = 4096 / ctrl.block_size;
+        ctrl.transfer_size(lba, count, 4096)?;
+        ctrl.submit_io(0x01, lba, count, phys).then_some(()).ok_or(SdError::IoError)
+    }
+
+    fn panic_flush(&self) -> SdResult<()> {
+        let mut ctrl = self.ctrl.try_lock().ok_or(SdError::NotOnline)?;
+        ctrl.submit_io(0x00, 0, 0, 0).then_some(()).ok_or(SdError::IoError)
     }
 
     fn model(&self) -> [u8; 40] {
@@ -807,13 +826,36 @@ fn controller_ptr_ports(controller: *mut plan9_drivers::ahci::AhciController) ->
 }
 
 pub fn probe_nvme(device: &PciDeviceInfo) -> Option<Arc<dyn StorageBackend>> {
-    // NVMe is class 0x01 (mass storage), subclass 0x08 (NVM), prog_if 0x02.
-    let base = read_bar(device.bus, device.dev, device.func)?;
-    let ctrl = Box::new(NvmeController::init(base as usize)?);
-    let ptr = Box::into_raw(ctrl);
+    use plan9_drivers::pci::{pci_config_read, pci_config_write_word, PciConfigAddr};
+
+    let config = |register| PciConfigAddr::new(device.bus, device.dev, device.func, register);
+    let low = pci_config_read(config(0x10));
+    if low == u32::MAX || low & 1 != 0 {
+        return None;
+    }
+    let mut base = u64::from(low & !0xf);
+    if low & 6 == 4 {
+        base |= u64::from(pci_config_read(config(0x14))) << 32;
+    }
+    if base == 0 {
+        return None;
+    }
+    let registers = unsafe { crate::vm::map_phys_range(base, 0x1000) };
+    if registers.is_null() {
+        return None;
+    }
+    let command = pci_config_read(config(4)) as u16;
+    pci_config_write_word(device.bus, device.dev, device.func, 4, command | 6);
+    let cap = unsafe { registers.cast::<u64>().read_volatile() };
+    let size = 0x1000 + (16 << ((cap >> 32) & 0xf));
+    let registers = unsafe { crate::vm::map_phys_range(base, size) };
+    if registers.is_null() {
+        return None;
+    }
+    let ctrl = Spinlock::new(NvmeController::init(registers as usize)?);
     let model = [0u8; 40];
     let serial = [0u8; 20];
-    Some(Arc::new(NvmeBackend { ctrl: ptr, model, serial }))
+    Some(Arc::new(NvmeBackend { ctrl, model, serial }))
 }
 
 /// Probe all storage devices on the PCI bus and return the backends.

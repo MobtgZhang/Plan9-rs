@@ -117,8 +117,8 @@ fn permitted(node: &RamNode, who: &Caller, bits: u32) -> bool {
 }
 
 pub struct RootFsDev {
-    nodes: Spinlock<Vec<RamNode>>,
-    next_id: Mutex<u64>,
+    pub(super) nodes: Spinlock<Vec<RamNode>>,
+    pub(super) next_id: Mutex<u64>,
 }
 
 impl RootFsDev {

@@ -52,6 +52,8 @@ pub mod procfs;
 
 // Root filesystem and boot archive
 pub mod rootfs;
+mod rootdisk;
+mod crashdump;
 pub mod cpio;
 pub mod upasswd;
 pub mod keymap;

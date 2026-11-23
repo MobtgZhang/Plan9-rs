@@ -257,3 +257,25 @@ pub fn copy_kernel_half(dst_root: u64, src_root: u64) {
         }
     }
 }
+
+pub unsafe fn map_boot_mmio(start: u64, end: u64) -> bool {
+    use plan9_common::types::{PhysAddr, VirtAddr};
+
+    let root = &raw mut BOOT_ROOT as u64;
+    if start < (4u64 << 30) || start >= end || end > (1u64 << 38)
+        || start % paging::PAGESIZE as u64 != 0 || end % paging::PAGESIZE as u64 != 0
+        || mmu::cr3_read().as_u64() != root
+    {
+        return false;
+    }
+    let flags = paging::PteFlags::new((1 << 0) | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 7));
+    for physical in (start..end).step_by(paging::PAGESIZE) {
+        if paging::map_page(PhysAddr::new(root), VirtAddr::new(paging_phys_to_virt(physical)),
+            PhysAddr::new(physical), flags).is_err()
+        {
+            return false;
+        }
+    }
+    mmu::flush_tlb();
+    true
+}

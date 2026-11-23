@@ -170,19 +170,22 @@ pub struct BootInfo {
     pub modules: BootModules,
 }
 
-/// Heapless, bounded memory map (max 32 entries) used by `BootInfo`.
+/// Heapless, bounded memory map used by `BootInfo`.
 #[derive(Debug, Clone, Copy)]
 pub struct BootMemoryMap {
-    pub entries: [Option<MemoryRegion>; 32],
+    pub entries: [Option<MemoryRegion>; 192],
     pub count: u16,
+    pub truncated: bool,
 }
 
 impl BootMemoryMap {
-    pub const fn new() -> Self { Self { entries: [None; 32], count: 0 } }
+    pub const fn new() -> Self { Self { entries: [None; 192], count: 0, truncated: false } }
     pub fn push(&mut self, r: MemoryRegion) {
         if (self.count as usize) < self.entries.len() {
             self.entries[self.count as usize] = Some(r);
             self.count += 1;
+        } else {
+            self.truncated = true;
         }
     }
     pub fn len(&self) -> usize { self.count as usize }
@@ -756,6 +759,8 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     // GRUB modules, and the main boot heap before frames are handed out.
     serial::put_bytes(b"[kstart] frame_init_from_bootinfo\n");
     unsafe { frame_alloc::frame_init_from_bootinfo(&boot_info); }
+    #[cfg(target_arch = "riscv64")]
+    plan9_arch::hal::register_frame_allocator(|| frame_alloc::frame_alloc().map(|frame| frame.as_u64()));
 
     // Step 3 — main kernel heap, above the kernel image and inside the
     // identity-mapped boot window.
@@ -789,6 +794,7 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
 
     serial::put_bytes(b"[kstart] rootfs setup\n");
     install_rootfs(&boot_info);
+    crate::crashdump::arm(&boot_info);
     mount_standard_devices();
 
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64"))]
@@ -944,6 +950,7 @@ fn install_rootfs(boot: &BootInfo) {
 
     let rootfs = dev.as_any().downcast_ref::<crate::rootfs::RootFsDev>();
     if let Some(rf) = rootfs {
+        let recovered = crate::rootdisk::recover(rf);
         let mut found = false;
         for i in 0..boot.modules.count as usize {
             if let Some(m) = boot.modules.entries[i].as_ref() {
@@ -954,7 +961,7 @@ fn install_rootfs(boot: &BootInfo) {
                         core::slice::from_raw_parts(m.start as *const u8, size)
                     };
                     let _font_loaded = crate::font::load_font_from_cpio(bytes);
-                    let count = rf.import_cpio(bytes);
+                    let count = if recovered { 0 } else { rf.import_cpio(bytes) };
                     serial::put_bytes(b"[kstart] rootfs imported entries=");
                     serial::put_hex_u32(count as u32);
                     serial::put_bytes(b"\n");
@@ -1154,10 +1161,19 @@ fn panic_smoke() {
     }
 }
 
-struct PanicConsole;
+struct PanicConsole {
+    diagnostic: [u8; crate::crashdump::DIAGNOSTIC_LIMIT],
+    len: usize,
+}
 
 impl core::fmt::Write for PanicConsole {
     fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let mut count = text.len().min(self.diagnostic.len() - self.len);
+        while !text.is_char_boundary(count) {
+            count -= 1;
+        }
+        self.diagnostic[self.len..self.len + count].copy_from_slice(&text.as_bytes()[..count]);
+        self.len += count;
         for byte in text.bytes() {
             #[cfg(target_arch = "x86_64")]
             serial::putc(byte);
@@ -1176,9 +1192,14 @@ fn panic(info: &PanicInfo) -> ! {
     if PANICKING.swap(true, Ordering::AcqRel) {
         hlt_loop();
     }
-    let mut console = PanicConsole;
+    let mut console = PanicConsole { diagnostic: [0; crate::crashdump::DIAGNOSTIC_LIMIT], len: 0 };
     let _ = writeln!(console, "PANIC: {info}");
     panic_backtrace(&mut console);
+    match crate::crashdump::capture(&console.diagnostic[..console.len]) {
+        Ok(true) => { let _ = writeln!(console, "Saved kernel memory dump."); }
+        Err(_) => { let _ = writeln!(console, "Kernel memory dump failed."); }
+        Ok(false) => {}
+    }
     if REBOOT_ON_PANIC.load(Ordering::Relaxed) {
         let _ = writeln!(console, "CPU server: attempting reboot");
         let start = plan9_arch::hal::timer::ms_since_boot();
