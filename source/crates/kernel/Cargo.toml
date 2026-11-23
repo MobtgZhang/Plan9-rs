@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
+[features]
+panic-smoke = []
+
 [dependencies]
 plan9-common = { path = "../common", features = ["alloc"] }
 plan9-arch = { path = "../arch" }

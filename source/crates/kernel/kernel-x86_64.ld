@@ -58,12 +58,14 @@ SECTIONS
      * --------------------------------------------------------------------- */
     .text : ALIGN(4K)
     {
+        _text_start = .;
         *(.text._start)                   /* MUST be first: GRUB multiboot2 entry */
         *(.text._start_low)
         *(.text._start_init)
         *(.text._start_gdt)
         *(.text.reload_segments)
         *(.text .text.*)
+        _text_end = .;
     } :text
 
     /* -----------------------------------------------------------------------

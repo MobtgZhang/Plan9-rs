@@ -708,18 +708,12 @@ impl Scheduler {
                 // crate's `goto_context` longjmp).
                 crate::plan9_arch::hal::context::goto_context(&ctx);
             }
-        } else if let Some(frame) = next.user_frame.as_ref() {
+        } else if next.user_frame.is_some() {
             // First run (or a non-blocked user process): resume its ring-3
             // frame directly.
             let pml4 = next.mmupdb.as_u64();
             if pml4 != 0 {
-                let frame_ptr = frame as *const crate::proc::SavedUserFrame as u64;
-                unsafe {
-                    crate::plan9_arch::hal::switch_to_user::kernel_resume_user(
-                        frame_ptr,
-                        pml4,
-                    );
-                }
+                unsafe { crate::userfp::resume(next) }
             }
         }
         // If new process has no saved context, this is first run
@@ -929,6 +923,8 @@ impl Scheduler {
                 let mut child_frame = parent_frame;
                 child_frame.set_ret(0);
                 proc.user_frame = Some(child_frame);
+                #[cfg(not(target_arch = "aarch64"))]
+                proc.user_fp.data.copy_from_slice(&p.user_fp.data);
             }
         } else {
             proc.pri = PRI_NORMAL;

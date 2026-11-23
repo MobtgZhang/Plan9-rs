@@ -233,6 +233,11 @@ static mut TSS: Tss = Tss::new();
 const INTERRUPT_STACK_SIZE: usize = 16384;
 static mut INTERRUPT_STACK: [u8; INTERRUPT_STACK_SIZE] = [0; INTERRUPT_STACK_SIZE];
 
+pub fn interrupt_stack_range() -> core::ops::Range<usize> {
+    let base = &raw const INTERRUPT_STACK as usize;
+    base..base + INTERRUPT_STACK_SIZE
+}
+
 /// Write the 16-byte TSS descriptor at GDT slots 6 and 7.
 unsafe fn set_tss_descriptor(base: u64) {
     // TSS limit = 103 (0x67); descriptor bytes are:

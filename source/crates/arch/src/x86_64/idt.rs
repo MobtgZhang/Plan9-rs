@@ -1,16 +1,8 @@
 //! Interrupt Descriptor Table for x86_64
 //!
 //! Each `IdtEntry` describes one of the 256 possible entries (0..=255).
-//! In the boot path we install a single "spurious" handler at every vector
-//! that:
-//!   * prints the vector number on the VGA console (if available) so a
-//!     fault is visible to the user;
-//!   * halts the CPU (with interrupts disabled) so we never silently return
-//!     from an unknown exception.
-//!
-//! The function is written in a single body and parameterised by the
-//! exception number via an entry stub (see `isr_stubs` further down). Each
-//! stub pushes the vector number, then jumps to `default_exception_handler`.
+//! Exception stubs distinguish user faults from fatal kernel exceptions
+//! and dispatch to the kernel with the vector and CPU-supplied frame.
 
 use core::mem::size_of;
 
@@ -315,98 +307,6 @@ pub fn start_interrupts() {
     crate::x86_64::outb(0xA1, 0xFF); // slave remains masked
     crate::x86_64::io_delay();
     crate::x86_64::sti();
-}
-
-/// Direct COM1 hex printout helper.
-fn arch_log(s: &[u8]) {
-    for &b in s {
-        unsafe {
-            // Preserve RDX: the exception handler receives `rip` in RDX and
-            // must not overwrite it while emitting diagnostics.  R10 is a
-            // scratch register used only inside the asm block.  `volatile`
-            // is required: these blocks write to an I/O port, which the
-            // compiler cannot see as a side effect, so unmarked asm! calls
-            // may be reordered or removed entirely.
-            core::arch::asm!(
-                "mov r10w, dx",
-                "mov dx, 0x3F8",
-                "mov al, {v}",
-                "out dx, al",
-                "mov dx, r10w",
-                v = in(reg_byte) b,
-                out("r10") _,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-}
-
-fn arch_log_hex(prefix: &[u8], val: u64) {
-    arch_log(prefix);
-    let hex = b"0123456789abcdef";
-    let mut shift = 60;
-    while (val >> shift) & 0xf == 0 && shift > 0 { shift -= 4; }
-    loop {
-        let nibble = ((val >> shift) & 0xf) as usize;
-        arch_log(&[hex[nibble]]);
-        if shift == 0 { break; }
-        shift -= 4;
-    }
-}
-
-/// Common exception handler body (defined in idt_asm.S).
-///
-/// This is defined in pure assembly (idt_asm.S) so we can use local labels
-/// for the serial-print loop. It clears DR6/DR7, prints the exception
-/// vector/error_code/rip in hex, and halts.
-#[no_mangle]
-pub unsafe extern "C" fn default_exception_handler(
-    vector: u64, error_code: u64, rip: u64
-) -> ! {
-    arch_log(b"\n[FAULT] vector=");
-    arch_log_dec(vector);
-    arch_log(b" error=");
-    arch_log_dec(error_code);
-    arch_log_hex(b" rip=", rip);
-    // CR2 (page-fault address) and DR state, for #PF/#DB diagnosis.
-    let mut cr2: u64;
-    core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
-    arch_log_hex(b" cr2=", cr2);
-    if vector == 1 {
-        let mut dr6: u64;
-        let mut dr7: u64;
-        core::arch::asm!(
-            "mov {}, dr6",
-            "mov {}, dr7",
-            out(reg) dr6, out(reg) dr7, options(nomem, nostack)
-        );
-        arch_log_hex(b" dr6=", dr6);
-        arch_log_hex(b" dr7=", dr7);
-    }
-    arch_log(b"\n");
-    loop {
-        unsafe { core::arch::asm!("hlt", options(nostack, preserves_flags)); }
-    }
-}
-
-/// Decimal print of a u64 (lowercased, no leading zeros).
-fn arch_log_dec(mut v: u64) {
-    if v == 0 {
-        arch_log(b"0");
-        return;
-    }
-    let mut buf = [0u8; 24];
-    let mut len = 0;
-    while v > 0 && len < buf.len() {
-        buf[len] = b'0' + (v % 10) as u8;
-        v /= 10;
-        len += 1;
-    }
-    let mut i = len;
-    while i > 0 {
-        i -= 1;
-        arch_log(&[buf[i]]);
-    }
 }
 
 extern "C" {

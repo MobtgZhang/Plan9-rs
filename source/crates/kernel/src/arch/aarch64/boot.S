@@ -230,6 +230,7 @@ vec_el0_irq:
 
     .global aarch64_resume_frame
 aarch64_resume_frame:
+    msr     daifset, #0xf
     adrp    x1, _bootstack_top
     add     x1, x1, :lo12:_bootstack_top
     sub     sp, x1, #800

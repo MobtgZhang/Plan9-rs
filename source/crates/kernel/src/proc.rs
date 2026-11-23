@@ -1014,6 +1014,10 @@ pub trait Chan: Send + Sync {
     fn write(&mut self, buf: &[u8]) -> Result<usize>;
     /// Close channel
     fn close(&mut self);
+    #[doc(hidden)]
+    fn pending_close(&mut self) -> Option<crate::devmnt::PendingClose> {
+        None
+    }
     /// Get channel type
     fn dev(&self) -> usize;
     /// Get file offset
@@ -1050,6 +1054,9 @@ pub trait Chan: Send + Sync {
     fn dev_chan(&self) -> Option<crate::dev::Chan> {
         None
     }
+    fn io_device_chan(&self) -> Option<crate::dev::Chan> {
+        None
+    }
     fn access_mode(&self) -> u8 {
         2
     }
@@ -1061,6 +1068,10 @@ pub trait Chan: Send + Sync {
     }
     fn mark_close_on_exec(&self) {}
     fn open_id(&self) -> Option<usize> {
+        None
+    }
+    #[doc(hidden)]
+    fn mount_state(&self) -> Option<alloc::sync::Arc<crate::devmnt::MountState>> {
         None
     }
     /// Get file status (Plan 9 stat shape)
@@ -1075,6 +1086,7 @@ struct SharedChan(alloc::sync::Arc<SharedChanState>, usize);
 struct SharedChanState {
     channel: Spinlock<OwnedChan>,
     close_on_exec: AtomicBool,
+    mount_state: Spinlock<Option<alloc::sync::Arc<crate::devmnt::MountState>>>,
 }
 
 struct OwnedChan(Box<dyn Chan>);
@@ -1094,12 +1106,16 @@ impl SharedChan {
             Box::new(Self(alloc::sync::Arc::new(SharedChanState {
                 channel: Spinlock::new(OwnedChan(chan)),
                 close_on_exec: AtomicBool::new(false),
+                mount_state: Spinlock::new(None),
             }), dev))
         }
     }
 }
 
 impl Chan for SharedChan {
+    fn io_device_chan(&self) -> Option<crate::dev::Chan> {
+        self.0.channel.lock().0.io_device_chan()
+    }
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         self.0.channel.lock().0.read(buf)
     }
@@ -1110,6 +1126,9 @@ impl Chan for SharedChan {
         self.0.channel.lock().0.write(buf)
     }
     fn close(&mut self) {}
+    fn pending_close(&mut self) -> Option<crate::devmnt::PendingClose> {
+        alloc::sync::Arc::get_mut(&mut self.0)?.channel.lock().0.pending_close()
+    }
     fn dev(&self) -> usize {
         self.1
     }
@@ -1142,6 +1161,9 @@ impl Chan for SharedChan {
     }
     fn open_id(&self) -> Option<usize> {
         Some(alloc::sync::Arc::as_ptr(&self.0) as usize)
+    }
+    fn mount_state(&self) -> Option<alloc::sync::Arc<crate::devmnt::MountState>> {
+        Some(self.0.mount_state.lock().get_or_insert_with(|| alloc::sync::Arc::new(crate::devmnt::MountState::new())).clone())
     }
     fn stat(&mut self) -> Result<crate::dev::DirEntry> {
         self.0.channel.lock().0.stat()
@@ -1824,6 +1846,7 @@ pub struct Proc {
     pub lastupdate: i64,
     /// Scheduler context (setjmp/longjmp)
     pub sched: Label,
+    pub kernel_context: Option<[u64; 2]>,
     /// Was preempted flag
     pub preempted: bool,
     /// Delay scheduling counter (when holding locks)
@@ -1857,6 +1880,7 @@ pub struct Proc {
     pub awaiting_message: Option<(u64, usize)>,
     pub reading_proc_wait: Option<(Pid, u64, usize)>,
     pub sleep_deadline: Option<u64>,
+    pub(crate) mount_io: Option<crate::devmnt::PendingIo>,
 
     // === Resources ===
     /// File descriptor group
@@ -1956,6 +1980,9 @@ pub struct Proc {
     // === EDF Real-Time ===
     /// EDF scheduling info (if real-time process)
     pub edf: Option<EdfInfo>,
+    pub(crate) user_edf: Option<crate::useredf::Reservation>,
+    #[cfg(not(target_arch = "aarch64"))]
+    pub(crate) user_fp: crate::userfp::State,
 
     // === Alarm ===
     /// Alarm state
@@ -2005,6 +2032,7 @@ impl Proc {
             cpu: 0,
             lastupdate: 0,
             sched: Label::new(),
+            kernel_context: None,
             preempted: false,
             delaysched: 0,
             kstack: 0,
@@ -2019,6 +2047,7 @@ impl Proc {
             awaiting_message: None,
             reading_proc_wait: None,
             sleep_deadline: None,
+            mount_io: None,
             fgrp: None,
             pgrp: None,
             egrp: None,
@@ -2063,6 +2092,9 @@ impl Proc {
             cpu_affinity: CpuMask::all(),
             wired: WiredInfo::new(),
             edf: None,
+            user_edf: None,
+            #[cfg(not(target_arch = "aarch64"))]
+            user_fp: crate::userfp::initial_state(),
             alarm: AlarmState::new(),
             waitr: Rendez::new(),
             waitq_lock: Spinlock::new(()),

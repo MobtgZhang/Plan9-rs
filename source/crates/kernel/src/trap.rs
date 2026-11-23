@@ -215,16 +215,8 @@ type ExHandler = fn(&ExceptionFrame);
 
 /// Panic handler for unrecoverable exceptions
 fn panic_handler(frame: &ExceptionFrame) {
-    // Print exception info
-    let _exc = frame.error_code;
-    
-    // Disable interrupts
-    crate::plan9_arch::hal::cli();
-    
-    // Halt
-    loop {
-        crate::plan9_arch::hal::hlt();
-    }
+    panic!("unhandled kernel exception: pc={:#x} sp={:#x} error={:#x}",
+        frame.rip, frame.rsp, frame.error_code);
 }
 
 /// Page fault handler - calls the real implementation from fault.rs
@@ -376,11 +368,10 @@ fn syscall_handler(
     a0: u64,
     a1: u64,
     a2: u64,
-    a3: u64,
-    a4: u64,
-    a5: u64,
     user_frame_ptr: u64,
 ) -> i64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe { crate::userfp::capture() };
     // Copy the CPU's IRET frame and the saved user registers into a stable
     // per-process frame.  The assembly stub points `user_frame_ptr` at the
     // first saved register (R15), and the IRET fields begin at +120 bytes.
@@ -418,9 +409,9 @@ fn syscall_handler(
         arg0: a0,
         arg1: a1,
         arg2: a2,
-        arg3: a3,
-        arg4: a4,
-        arg5: a5,
+        arg3: saved.r10,
+        arg4: saved.r8,
+        arg5: saved.r9,
         ret: 0,
     };
 
@@ -455,16 +446,7 @@ fn syscall_handler(
                     p.insyscall = false;
                     crate::syscall::user_exec_return();
 
-                    let frame_ptr = p
-                        .user_frame
-                        .as_ref()
-                        .map(|fr| fr as *const SavedUserFrame as u64)
-                        .unwrap_or(0);
-                    let pml4 = p.mmupdb.as_u64();
-                    plan9_arch::hal::switch_to_user::kernel_resume_user(
-                        frame_ptr,
-                        pml4,
-                    );
+                    crate::userfp::resume(p);
                 }
             }
         }
@@ -584,21 +566,12 @@ pub unsafe extern "C" fn aarch64_svc_handler(fp: *mut u64) -> u64 {
                 f.set_stack(p.get_exec_stack());
                 f.set_ret(0);
                 f.pstate = plan9_arch::hal::switch_to_user::USER_PSTATE_INIT;
-                f.simd = [0; 32];
-                f.fpsr = 0;
-                f.fpcr = 0;
                 p.user_frame = Some(f);
                 p.clear_exec_context();
                 p.insyscall = false;
                 crate::syscall::user_exec_return();
 
-                let frame_ptr = p
-                    .user_frame
-                    .as_ref()
-                    .map(|fr| fr as *const SavedUserFrame as u64)
-                    .unwrap_or(0);
-                let root = p.mmupdb.as_u64();
-                plan9_arch::hal::switch_to_user::kernel_resume_user(frame_ptr, root);
+                crate::userfp::resume(p);
             }
         }
     }
@@ -661,30 +634,7 @@ pub unsafe extern "C" fn aarch64_sync_el1_handler(fp: *mut u64) -> ! {
     let esr = read_esr_el1();
     let far = read_far_el1();
     let elr = *fp.add(31); // ELR saved at frame offset 248
-    crate::cons::puts(b"\nPANIC: aarch64 kernel sync exception\n");
-    crate::cons::puts(b"  ESR=");
-    crate::serial::put_hex_u64(esr);
-    crate::cons::puts(b" FAR=");
-    crate::serial::put_hex_u64(far);
-    crate::cons::puts(b" ELR=");
-    crate::serial::put_hex_u64(elr);
-    crate::cons::puts(b"\n");
-    // Dump x0-x30 (frame[0..30]).
-    crate::cons::puts(b"  regs:");
-    for r in 0..31usize {
-        if r % 4 == 0 {
-            crate::cons::puts(b"\n   ");
-        }
-        crate::cons::puts(b" x");
-        let hi = (r / 10) as u8;
-        let lo = (r % 10) as u8;
-        crate::serial::put_bytes(&[b'0' + hi, b'0' + lo, b'=']);
-        crate::serial::put_hex_u64(*fp.add(r));
-    }
-    crate::cons::puts(b"\n");
-    loop {
-        crate::plan9_arch::hal::hlt();
-    }
+    panic!("aarch64 kernel exception: ESR={esr:#x} FAR={far:#x} ELR={elr:#x}");
 }
 
 /// Kernel-mode IRQ (EL1): acknowledge the GIC and return.  No scheduling
@@ -1092,7 +1042,22 @@ pub extern "C" fn kernel_syscall_from_user(
     a2: u64,
     user_frame_ptr: u64,
 ) -> i64 {
-    syscall_handler(num as usize, a0, a1, a2, 0, 0, 0, user_frame_ptr)
+    syscall_handler(num as usize, a0, a1, a2, user_frame_ptr)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub unsafe extern "C" fn kernel_exception_from_kernel(vector: u64, error: u64, rip: u64) -> ! {
+    let cr2: u64;
+    core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
+    if vector == 1 {
+        let dr6: u64;
+        let dr7: u64;
+        core::arch::asm!("mov {}, dr6", "mov {}, dr7", out(reg) dr6, out(reg) dr7,
+            options(nomem, nostack, preserves_flags));
+        panic!("x86 kernel exception: vector={vector} error={error:#x} rip={rip:#x} cr2={cr2:#x} dr6={dr6:#x} dr7={dr7:#x}");
+    }
+    panic!("x86 kernel exception: vector={vector} error={error:#x} rip={rip:#x} cr2={cr2:#x}");
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1102,6 +1067,7 @@ pub unsafe extern "C" fn kernel_exception_from_user(
     registers: *const u64,
     has_error_code: usize,
 ) -> ! {
+    crate::userfp::capture();
     let mut saved = SavedUserFrame::default();
     let frame = core::ptr::addr_of_mut!(saved).cast::<u64>();
     core::ptr::copy_nonoverlapping(registers, frame, 15);
@@ -1144,6 +1110,7 @@ pub unsafe extern "C" fn kernel_interrupt_from_user(vector: u64, registers: *con
         // Acknowledge the legacy 8259 PIC (master EOI, port 0x20).
         crate::plan9_arch::hal::io::outb(0x20, 0x20);
         if *registers.add(16) & 3 == 3 {
+            crate::userfp::capture();
             crate::syscall::user_tick(registers.cast::<SavedUserFrame>().read());
         }
     }
@@ -1223,6 +1190,9 @@ pub unsafe extern "C" fn riscv64_user_trap_handler(fp: *mut u64) -> u64 {
     let scause = read_scause();
     let code = scause & !(1u64 << 63);
     let interrupt = scause & (1u64 << 63) != 0;
+    if *fp.add(33) & (1 << 8) == 0 {
+        crate::userfp::capture();
+    }
 
     let mut registers = [0; 32];
     core::ptr::copy_nonoverlapping(fp, registers.as_mut_ptr(), registers.len());
@@ -1311,19 +1281,13 @@ pub unsafe extern "C" fn riscv64_user_trap_handler(fp: *mut u64) -> u64 {
                 f.set_entry(p.get_exec_entry());
                 f.set_stack(p.get_exec_stack());
                 f.set_ret(0);
-                f.sstatus = plan9_arch::hal::switch_to_user::USER_SSTATUS_INIT;
+                f.sstatus = crate::userfp::user_sstatus();
                 p.user_frame = Some(f);
                 p.clear_exec_context();
                 p.insyscall = false;
                 crate::syscall::user_exec_return();
 
-                let frame_ptr = p
-                    .user_frame
-                    .as_ref()
-                    .map(|fr| fr as *const SavedUserFrame as u64)
-                    .unwrap_or(0);
-                let root = p.mmupdb.as_u64();
-                plan9_arch::hal::switch_to_user::kernel_resume_user(frame_ptr, root);
+                crate::userfp::resume(p);
             }
         }
     }
@@ -1347,9 +1311,10 @@ pub unsafe extern "C" fn riscv64_user_trap_handler(fp: *mut u64) -> u64 {
 pub extern "C" fn loongarch64_kernel_fault() -> ! {
     use plan9_arch::loongarch64::cpu::{csr, csr_read};
 
+    let estat = csr_read::<{ csr::ESTAT }>();
     panic!(
-        "LoongArch kernel fault: ESTAT={:#x} ERA={:#x} BADV={:#x}",
-        csr_read::<{ csr::ESTAT }>(),
+        "LoongArch kernel fault: ecode={} ESTAT={estat:#x} ERA={:#x} BADV={:#x}",
+        (estat >> 16) & 0x3f,
         csr_read::<{ csr::ERA }>(),
         csr_read::<{ csr::BADV }>(),
     );
@@ -1367,6 +1332,7 @@ pub extern "C" fn loongarch64_kernel_fault() -> ! {
 pub unsafe extern "C" fn loongarch64_user_trap_handler(fp: *mut u64) -> u64 {
     use plan9_arch::loongarch64::cpu::{csr, csr_read};
 
+    crate::userfp::capture();
     let estat = csr_read::<{ csr::ESTAT }>();
     let code = (estat >> 16) & 0x3F;
 
@@ -1459,13 +1425,7 @@ pub unsafe extern "C" fn loongarch64_user_trap_handler(fp: *mut u64) -> u64 {
                 p.insyscall = false;
                 crate::syscall::user_exec_return();
 
-                let frame_ptr = p
-                    .user_frame
-                    .as_ref()
-                    .map(|fr| fr as *const SavedUserFrame as u64)
-                    .unwrap_or(0);
-                let root = p.mmupdb.as_u64();
-                plan9_arch::hal::switch_to_user::kernel_resume_user(frame_ptr, root);
+                crate::userfp::resume(p);
             }
         }
     }

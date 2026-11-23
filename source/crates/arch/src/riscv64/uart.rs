@@ -52,6 +52,18 @@ pub fn putc(b: u8) {
     }
 }
 
+pub fn try_putc(byte: u8) {
+    unsafe {
+        for _ in 0..65_536 {
+            if read(reg::LSR) & lsr::TX_EMPTY != 0 {
+                write(reg::RBR, byte);
+                return;
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Transmit a slice of bytes.
 pub fn write_bytes(bytes: &[u8]) {
     for &b in bytes {

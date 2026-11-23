@@ -13,10 +13,10 @@
 
 extern crate plan9_common;
 
-/// Initial `sstatus` for user entry: SPP=0 (U-mode), SPIE=0, i.e. 0.
+/// Initial `sstatus` for user entry: SPP=0 (U-mode), SPIE=0, and FP enabled.
 /// `sret` copies SPIE into SIE. The supervisor timer can interrupt U-mode
 /// even when SIE is clear, while S-mode can run with interrupts masked.
-pub const USER_SSTATUS_INIT: u64 = 0;
+pub const USER_SSTATUS_INIT: u64 = 3 << 13;
 
 /// Selectors kept for API parity with the x86_64 module.
 pub const USER_DS: u16 = 0;
@@ -54,10 +54,12 @@ pub unsafe fn switch_to_user_trampoline(pml4_phys: u64, frame_ptr: u64) -> ! {
     core::arch::asm!(
         "csrw sepc, {pc}",
         "csrw sstatus, {ss}",
+        "csrw sscratch, {trap_frame}",
         "mv sp, {sp}",
         "sret",
         pc = in(reg) entry,
         ss = in(reg) sstatus,
+        trap_frame = in(reg) core::ptr::addr_of!(_user_trap_frame),
         sp = in(reg) user_sp,
         options(noreturn, nostack)
     );
@@ -68,7 +70,7 @@ pub unsafe fn switch_to_user_trampoline(pml4_phys: u64, frame_ptr: u64) -> ! {
 // its very first instruction.  Every path that resumes user mode through
 // this function bypasses boot.S's exit restore, so it is redone here.
 extern "C" {
-    static _user_trap_area: u8;
+    static _user_trap_frame: u8;
 }
 
 /// Resume a user process after a kernel-mode syscall/trap.
@@ -86,18 +88,9 @@ extern "C" {
 /// # Safety
 /// Never returns.
 pub unsafe fn kernel_resume_user(frame_ptr: u64, pml4_phys: u64) -> ! {
-    // Re-point sscratch at the supervisor trap frame (see above); leaving
-    // it as the previous process's user sp would make the next trap save
-    // its frame onto a U-mode page — which faults (S-mode, SUM=0) and
-    // recurses into the trap entry forever, silently.  boot.S defines the
-    // frame as the top 34 slots (272 bytes) of the 8 KiB trap area.
-    core::arch::asm!(
-        "csrw sscratch, {ft}",
-        ft = in(reg) core::ptr::addr_of!(_user_trap_area) as usize + 8192 - 34 * 8,
-        options(nomem, nostack)
-    );
     super::mmu::cr3_write(plan9_common::types::PhysAddr::new(pml4_phys));
     core::arch::asm!(
+        "csrw sscratch, a1",
         "mv t0, a0",
         // sepc / sstatus → CSRs, then reuse t1/t2 for x6/x7.
         "ld t1, 256(t0)",
@@ -141,6 +134,7 @@ pub unsafe fn kernel_resume_user(frame_ptr: u64, pml4_phys: u64) -> ! {
         "ld t0, 40(t0)",
         "sret",
         in("a0") frame_ptr,
+        in("a1") core::ptr::addr_of!(_user_trap_frame),
         options(noreturn, nostack)
     );
 }

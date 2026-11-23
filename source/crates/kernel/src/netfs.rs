@@ -152,6 +152,16 @@ fn decode(path: u64) -> Option<(Protocol, u32, Kind)> {
     Some((protocol, (path >> 8) as u32, kind))
 }
 
+pub(crate) fn tcp_data_channel(channel: &Chan) -> Option<u32> {
+    if crate::dev::devs().find_by_char('I') != Some(channel.dev) {
+        return None;
+    }
+    match decode(channel.qid.path) {
+        Some((Protocol::Tcp, id, Kind::Data)) => Some(id),
+        _ => None,
+    }
+}
+
 fn endpoint(value: &str, protocol: Protocol) -> Option<IpEndpoint> {
     if let Some((address, port)) = value.split_once('!') {
         return Some(IpEndpoint::new(address.parse().ok()?, port.parse().ok()?));

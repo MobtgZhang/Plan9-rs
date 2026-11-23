@@ -22,9 +22,7 @@ use super::mmu::{cr3_write, flush_tlb};
 use plan9_common::types::PhysAddr;
 
 extern "C" {
-    /// The user trap frame area defined by boot.S (8 KiB in .bss; the top
-    /// 272 bytes are the frame, the rest is the handler's scratch stack).
-    static _user_trap_area: u8;
+    static _user_trap_frame: u8;
 }
 
 /// Initial PRMD for user entry: PPLV = 0b11 (PLV3), PIE = 1.
@@ -105,10 +103,9 @@ pub unsafe fn switch_to_user_trampoline(pml4_phys: u64, frame_ptr: u64) -> ! {
 /// # Safety
 /// Never returns.
 pub unsafe fn kernel_resume_user(frame_ptr: u64, pml4_phys: u64) -> ! {
-    // Boot.S's trap frame: _user_trap_area + 8192 - 272 (the top 34 u64
-    // slots of the 8 KiB area, 16-byte aligned).
-    let trap_frame_base = core::ptr::addr_of!(_user_trap_area) as u64 + 7920;
+    let trap_frame_base = core::ptr::addr_of!(_user_trap_frame) as u64;
     core::arch::asm!(
+        "bl _restore_user_fp",
         // Switch the page-table root: PGDL := child PML4 physical address.
         "csrwr $a0, 0x19",
         // Make the new PGDL and TLB flush visible before touching any

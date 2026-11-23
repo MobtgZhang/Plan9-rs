@@ -32,8 +32,10 @@ SECTIONS
 
     .text : ALIGN(4K)
     {
+        _text_start = .;
         *(.text._start)
         *(.text .text.*)
+        _text_end = .;
     } :text
 
     .vectors : ALIGN(2K)

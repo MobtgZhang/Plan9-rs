@@ -18,6 +18,8 @@ pub mod directboot;
 
 // Process management
 pub mod proc;
+mod useredf;
+mod userfp;
 pub mod sched;
 
 // Hardware

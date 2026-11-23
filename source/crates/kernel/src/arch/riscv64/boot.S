@@ -30,13 +30,10 @@ _start:
     li      t0, -1
     csrc    sie, t0
 
-    /* Supervisor trap entry + user trap frame: identity-mapped (VA = PA),
-     * so both are valid with the MMU off and after paging_init switches
-     * satp on. */
+    /* The kernel uses its current stack for supervisor traps. */
     la      t0, _user_trap
     csrw    stvec, t0
-    la      t0, _user_trap_frame
-    csrw    sscratch, t0
+    csrw    sscratch, zero
 
     /* Boot stack (from the linker script, in .bss). */
     la      sp, _bootstack_top
@@ -60,8 +57,9 @@ hang:
  * On a U-mode trap the CPU stays on the user's `sp` — RISC-V (unlike
  * AArch64) does not switch stacks automatically, so `sscratch` holds the
  * address of a dedicated kernel-side trap frame and the entry swaps
- * sp <-> sscratch as its very first instruction.  The trap frame area also
- * provides the scratch stack the Rust handler runs on.
+ * sp <-> sscratch as its very first instruction. The trap frame area also
+ * provides the stack the Rust handler runs on. In S-mode sscratch is zero;
+ * a supervisor fault saves its frame below the interrupted kernel stack.
  *
  * Trap frame layout (u64 slots, mirrors the aarch64 frame):
  *   [ 0..32]  x0..x31   (a0..a5 = [10..15]; syscall number in a7 = [17];
@@ -70,26 +68,29 @@ hang:
  *   [33]      sstatus   (as trapped: SPP=0, SIE=0; boot.S clears SPP/SPIE
  *                        on the way back out)
  *
- * Interrupts are kept off everywhere (USER_SSTATUS_INIT clears SPIE), so
- * only exceptions reach this entry — an `ecall` from U-mode is the Plan 9
- * syscall gate; everything else is fatal and dumped by the handler.
+ * The supervisor timer can interrupt U-mode. S-mode keeps interrupts masked.
  * -------------------------------------------------------------------------- */
 
     .section .bss.user_trap, "aw", @nobits
     .balign 4096
     .global _user_trap_area
 _user_trap_area:
-    /* 8 KiB: [area, area + 8 KiB - 272) is the handler's scratch stack,
-     * the top 272 bytes (34 u64 slots) are the trap frame itself. */
-    .space  8192
-    .set    _user_trap_frame, _user_trap_area + 8192 - 34*8
+    .space  65536 - 34*8
+    .global _user_trap_frame
+_user_trap_frame:
+    .space  34*8
+    .global _user_trap_end
+_user_trap_end:
 
     .section .text.user_trap, "ax"
     .balign 4
     .global _user_trap
 _user_trap:
-    /* Swap sp (user sp) with sscratch (&frame): sp = &frame. */
     csrrw   sp, sscratch, sp
+    bnez    sp, 1f
+    csrr    sp, sscratch
+    addi    sp, sp, -34*8
+1:
 
     sd      x1, 1*8(sp)
     sd      x3, 3*8(sp)
@@ -122,8 +123,8 @@ _user_trap:
     sd      x30, 30*8(sp)
     sd      x31, 31*8(sp)
 
-    /* The user sp moved into sscratch — store it into the x2 slot. */
-    csrr    t0, sscratch
+    /* Save the interrupted stack pointer and mark subsequent traps as S-mode. */
+    csrrw   t0, sscratch, zero
     sd      t0, 2*8(sp)
     csrr    t0, sepc
     sd      t0, 32*8(sp)

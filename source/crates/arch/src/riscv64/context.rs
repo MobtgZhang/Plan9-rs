@@ -223,11 +223,12 @@ impl Default for FpuState {
 /// # Safety
 /// Buffer must be aligned and at least FPU_STATE_SIZE bytes; FPU must
 /// be enabled in `sstatus.FS`.
-#[cfg(target_feature = "d")]
 #[inline]
 pub unsafe fn fpsave(state: &mut FpuState) {
     let ptr = state.data.as_mut_ptr() as u64;
     core::arch::asm!(
+        ".option push",
+        ".option arch, +d",
         "fsd f0,  0({p})",
         "fsd f1,  8({p})",
         "fsd f2,  16({p})",
@@ -262,6 +263,7 @@ pub unsafe fn fpsave(state: &mut FpuState) {
         "fsd f31, 248({p})",
         "frcsr {t}",            // fcsr
         "sd {t}, 256({p})",
+        ".option pop",
         t = out(reg) _,
         p = in(reg) ptr,
         options(nostack)
@@ -272,11 +274,12 @@ pub unsafe fn fpsave(state: &mut FpuState) {
 ///
 /// # Safety
 /// Buffer must contain a previously saved FPU state.
-#[cfg(target_feature = "d")]
 #[inline]
 pub unsafe fn fprestore(state: &FpuState) {
     let ptr = state.data.as_ptr() as u64;
     core::arch::asm!(
+        ".option push",
+        ".option arch, +d",
         "fld f0,  0({p})",
         "fld f1,  8({p})",
         "fld f2,  16({p})",
@@ -311,6 +314,7 @@ pub unsafe fn fprestore(state: &FpuState) {
         "fld f31, 248({p})",
         "ld {t}, 256({p})",
         "fscsr x0, {t}",
+        ".option pop",
         t = out(reg) _,
         p = in(reg) ptr,
         options(nostack)
@@ -336,16 +340,52 @@ pub unsafe fn restore_fpu_state(state: &FpuState) { fprestore(state) }
 ///
 /// # Safety
 /// Only call in kernel mode.
-#[cfg(target_feature = "d")]
 pub unsafe fn init_fpu() {
     core::arch::asm!(
-        "li t0, (3 << 13)",     // FS = 0b11 (Dirty → enable)
-        "csrs sstatus, t0",
+        "csrs sstatus, {mask}",
+        mask = in(reg) 3usize << 13,
         options(nostack)
     );
 }
 
 /// Check whether FPU instructions trap (sstatus.FS == Off).
+pub unsafe fn probe_double() -> bool {
+    let supported: usize;
+    core::arch::asm!(
+        "csrrci {status}, sstatus, 2",
+        "la {vector}, 2f",
+        "csrrw {vector}, stvec, {vector}",
+        "li {scratch}, 0x6000",
+        "csrs sstatus, {scratch}",
+        "li {supported}, 1",
+        ".option push",
+        ".option arch, +d",
+        "fmv.d.x f0, zero",
+        ".option pop",
+        "j 3f",
+        ".balign 4",
+        "2:",
+        "li {supported}, 0",
+        "la {scratch}, 3f",
+        "csrw sepc, {scratch}",
+        "sret",
+        "3:",
+        "csrw stvec, {vector}",
+        "csrw sstatus, {status}",
+        supported = out(reg) supported,
+        status = out(reg) _,
+        vector = out(reg) _,
+        scratch = out(reg) _,
+        options(nostack),
+    );
+    if supported != 0 {
+        init_fpu();
+        true
+    } else {
+        false
+    }
+}
+
 pub fn fpu_used_since_switch() -> bool {
     let sstatus: u64;
     unsafe { core::arch::asm!("csrr {}, sstatus", out(reg) sstatus, options()) };

@@ -9,6 +9,7 @@ rustflags = [
   "--cfg", "aes_force_soft",
   "-C", "relocation-model=static",
   "-C", "panic=abort",
+  "-C", "force-frame-pointers=yes",
 ]
 
 [target.aarch64-unknown-none]
@@ -16,6 +17,7 @@ runner = "none"
 rustflags = [
   "-C", "relocation-model=static",
   "-C", "panic=abort",
+  "-C", "force-frame-pointers=yes",
 ]
 
 [target.riscv64imac-unknown-none-elf]
@@ -23,6 +25,7 @@ runner = "none"
 rustflags = [
   "-C", "relocation-model=static",
   "-C", "panic=abort",
+  "-C", "force-frame-pointers=yes",
 ]
 
 [target.loongarch64-unknown-none]
@@ -30,4 +33,5 @@ runner = "none"
 rustflags = [
   "-C", "relocation-model=static",
   "-C", "panic=abort",
+  "-C", "force-frame-pointers=yes",
 ]

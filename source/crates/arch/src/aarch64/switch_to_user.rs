@@ -87,6 +87,7 @@ pub unsafe fn switch_to_user_trampoline(pml4_phys: u64, frame_ptr: u64) -> ! {
 
     // 3. Eret into EL0.
     core::arch::asm!(
+        "msr daifset, #0xf",
         "msr sp_el0, {sp}",
         "msr elr_el1, {pc}",
         "msr spsr_el1, {ps}",

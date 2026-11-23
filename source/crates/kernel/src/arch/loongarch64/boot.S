@@ -96,7 +96,7 @@ _start:
 /* ----------------------------------------------------------------------------
  * User trap frame area.
  *
- * 8 KiB in .bss: the top 34 u64 slots (272 bytes, 16-byte aligned at the
+ * 64 KiB in .bss: the top 34 u64 slots (272 bytes, 16-byte aligned at the
  * top) are the trap frame; everything below it is the scratch stack the
  * Rust handler runs on.
  *
@@ -112,9 +112,16 @@ _start:
     .balign 4096
     .global _user_trap_area
 _user_trap_area:
-    .space  8192
+    .space  65536 - 34*8
     .global _user_trap_frame
-    .set    _user_trap_frame, _user_trap_area + 8192 - 34*8
+_user_trap_frame:
+    .space  34*8
+    .global _user_trap_end
+_user_trap_end:
+    .balign 16
+    .global _user_fpregs
+_user_fpregs:
+    .space 272
 
 /* ----------------------------------------------------------------------------
  * User-mode trap entries.
@@ -183,8 +190,20 @@ _user_trap:
     csrrd   $t0, 0x1                   /* PRMD, as trapped */
     st.d    $t0,  $sp, 256
 
+    la.pcrel $t4, _user_fpregs
+    .irp reg, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fst.d   $f\reg, $t4, (8 * \reg)
+    .endr
+    movfcsr2gr $t5, $fcsr0
+    st.d    $t5, $t4, 256
+    .irp reg, 0,1,2,3,4,5,6,7
+    movcf2gr $t5, $fcc\reg
+    st.b    $t5, $t4, (264 + \reg)
+    .endr
+    movgr2fcsr $fcsr0, $zero
     or      $a0, $sp, $r0
     bl      loongarch64_user_trap_handler
+    bl      _restore_user_fp
     /* a0 = frame pointer (the syscall result sits in the $r4 slot). */
 
     ld.d    $t0,  $sp, 248
@@ -238,6 +257,20 @@ _user_trap:
      * relative to the frame; after it $sp is user state. */
     ld.d    $r3,  $sp, 16
     ertn
+
+    .global _restore_user_fp
+_restore_user_fp:
+    la.pcrel $t4, _user_fpregs
+    .irp reg, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fld.d   $f\reg, $t4, (8 * \reg)
+    .endr
+    ld.d    $t5, $t4, 256
+    movgr2fcsr $fcsr0, $t5
+    .irp reg, 0,1,2,3,4,5,6,7
+    ld.bu   $t5, $t4, (264 + \reg)
+    movgr2cf $fcc\reg, $t5
+    .endr
+    jr      $ra
 
 _kernel_fault:
     bl      loongarch64_kernel_fault

@@ -47,7 +47,7 @@ pub enum ProcQid {
     Profile = 8,
     Regs = 9,
     Fpregs = 10,
-    Kstack = 11,
+    Kregs = 11,
     Pctl = 12,
     Pfd = 13,
     Wait = 14,
@@ -60,6 +60,8 @@ pub enum ProcQid {
 const PROC_FILES: &[(&str, ProcQid, u32)] = &[
     ("args", ProcQid::Args, 0o444),
     ("ctl", ProcQid::Ctl, 0o200),
+    ("fpregs", ProcQid::Fpregs, 0o600),
+    ("kregs", ProcQid::Kregs, 0o400),
     ("mem", ProcQid::Memory, 0o600),
     ("note", ProcQid::Note, 0o600),
     ("noteid", ProcQid::Noteid, 0o664),
@@ -545,6 +547,7 @@ impl ProcFsDev {
                 8 => ProcQid::Profile,
                 9 => ProcQid::Regs,
                 10 => ProcQid::Fpregs,
+                11 => ProcQid::Kregs,
                 14 => ProcQid::Wait,
                 15 => ProcQid::Args,
                 16 => ProcQid::Notepg,
@@ -636,19 +639,22 @@ impl Dev for ProcFsDev {
         if matches!(ftype, ProcQid::Ctl | ProcQid::Note | ProcQid::Notepg | ProcQid::Noteid) {
             Self::check_owner(target)?;
         }
-        if target.private_memory && matches!(ftype, ProcQid::Ctl | ProcQid::Note | ProcQid::Memory | ProcQid::Regs) {
+        if target.private_memory && matches!(ftype, ProcQid::Ctl | ProcQid::Note | ProcQid::Memory | ProcQid::Regs | ProcQid::Fpregs | ProcQid::Kregs) {
             return Err(DevError::Eperm);
         }
-        if matches!(ftype, ProcQid::Memory | ProcQid::Profile | ProcQid::Wait | ProcQid::Regs) {
+        if matches!(ftype, ProcQid::Memory | ProcQid::Profile | ProcQid::Wait | ProcQid::Regs | ProcQid::Fpregs) {
             Self::check_owner(target)?;
+        }
+        if ftype == ProcQid::Kregs {
+            Self::check_kernel_context(target)?;
         }
         match (ftype, mode & 3) {
             (ProcQid::Notepg, 1) if target.note_group != 1 => {
                 ch.aux = Some(alloc::sync::Arc::new(target.note_group));
                 Ok(())
             }
-            (ProcQid::Ctl, 1) | (ProcQid::Note | ProcQid::Noteid | ProcQid::Memory | ProcQid::Regs, 0..=2) => Ok(()),
-            (ProcQid::None | ProcQid::Status | ProcQid::Profile | ProcQid::Segment | ProcQid::Args | ProcQid::Wait, 0) => Ok(()),
+            (ProcQid::Ctl, 1) | (ProcQid::Note | ProcQid::Noteid | ProcQid::Memory | ProcQid::Regs | ProcQid::Fpregs, 0..=2) => Ok(()),
+            (ProcQid::None | ProcQid::Status | ProcQid::Profile | ProcQid::Segment | ProcQid::Args | ProcQid::Wait | ProcQid::Kregs, 0) => Ok(()),
             _ => Err(DevError::Eperm),
         }
     }
@@ -722,6 +728,8 @@ impl Dev for ProcFsDev {
                 Ok(profile.read(buf, offset))
             }
             ProcQid::Regs => Self::read_registers(pid, buf, offset),
+            ProcQid::Kregs => Self::read_kernel_context(pid, buf, offset),
+            ProcQid::Fpregs => Self::read_fp_registers(pid, buf, offset),
             _ => Err(DevError::Enoent),
         }
     }
@@ -747,6 +755,7 @@ impl Dev for ProcFsDev {
             ProcQid::Noteid => Self::write_noteid(pid, buf),
             ProcQid::Memory => Self::write_memory(pid, buf, offset),
             ProcQid::Regs => Self::write_registers(pid, buf, offset),
+            ProcQid::Fpregs => Self::write_fp_registers(pid, buf, offset),
             ProcQid::Notepg => {
                 let group = ch.aux.as_deref().and_then(|aux| aux.downcast_ref::<crate::proc::Pid>())
                     .ok_or(DevError::Eperm)?;
@@ -776,6 +785,8 @@ impl Dev for ProcFsDev {
                     ProcQid::Args => proc.exec_args.len() as u64,
                     ProcQid::Status => 176,
                     ProcQid::Regs => Self::register_size() as u64,
+                    ProcQid::Kregs => Self::register_size() as u64,
+                    ProcQid::Fpregs => crate::userfp::SIZE as u64,
                     ProcQid::Wait => {
                         let mut count = 0;
                         let mut entry = proc.waitq.as_deref();
@@ -923,13 +934,18 @@ impl ProcFsDev {
             return Err(DevError::Eperm);
         }
         let segment = proc.find_segment(offset).ok_or(DevError::Einval)?;
-        if !matches!(segment.segtype, SegType::Data | SegType::Bss | SegType::Stack) {
+        if !matches!(segment.segtype, SegType::Text | SegType::Data | SegType::Bss | SegType::Stack) {
             return Err(DevError::Eperm);
         }
         let count = Self::memory_window(buf.len(), offset, segment.top);
         let mut page = [0; crate::segment::PAGE_SIZE as usize];
         page[..count].copy_from_slice(&buf[..count]);
-        crate::syscall::put_user_bytes(proc, offset, &page[..count]).map_err(|_| DevError::Eio)?;
+        let write = if segment.segtype == SegType::Text {
+            crate::syscall::patch_user_text
+        } else {
+            crate::syscall::put_user_bytes
+        };
+        write(proc, offset, &page[..count]).map_err(|_| DevError::Eio)?;
         Ok(count)
     }
 
@@ -947,6 +963,47 @@ impl ProcFsDev {
         { core::mem::size_of::<SavedUserFrame>() }
     }
 
+    fn check_kernel_context(target: &crate::proc::Proc) -> Result<(), DevError> {
+        if target.private_memory || !crate::proc::curproc().is_some_and(|caller| caller.uid == 0) {
+            return Err(DevError::Eperm);
+        }
+        Ok(())
+    }
+
+    fn read_kernel_context(pid: i32, buf: &mut [u8], offset: u64) -> Result<usize, DevError> {
+        let proc = Self::real_proc(pid).ok_or(DevError::Enoent)?;
+        Self::check_kernel_context(proc)?;
+        let [pc, sp] = proc.kernel_context.ok_or(DevError::Einval)?;
+        let mut frame = crate::proc::SavedUserFrame::default();
+        frame.set_entry(pc);
+        frame.set_stack(sp);
+        Ok(crate::dev::read_bytes(Self::register_bytes(&frame), buf, offset))
+    }
+
+    fn read_fp_registers(pid: i32, buf: &mut [u8], offset: u64) -> Result<usize, DevError> {
+        let proc = Self::real_proc(pid).ok_or(DevError::Enoent)?;
+        Self::check_owner(proc)?;
+        if proc.private_memory {
+            return Err(DevError::Eperm);
+        }
+        let bytes = crate::userfp::read(proc).ok_or(DevError::Einval)?;
+        Ok(crate::dev::read_bytes(bytes, buf, offset))
+    }
+
+    fn write_fp_registers(pid: i32, buf: &[u8], offset: u64) -> Result<usize, DevError> {
+        let proc = Self::writable_proc(pid)?;
+        if proc.private_memory || proc.state != crate::proc::State::Stopped {
+            return Err(DevError::Eperm);
+        }
+        if offset >= crate::userfp::SIZE as u64 {
+            return Ok(0);
+        }
+        let offset = offset as usize;
+        let count = buf.len().min(crate::userfp::SIZE - offset);
+        crate::userfp::write(proc, offset, &buf[..count]).ok_or(DevError::Einval)?;
+        Ok(count)
+    }
+
     fn read_registers(pid: i32, buf: &mut [u8], offset: u64) -> Result<usize, DevError> {
         let proc = Self::real_proc(pid).ok_or(DevError::Enoent)?;
         Self::check_owner(proc)?;
@@ -954,10 +1011,13 @@ impl ProcFsDev {
             return Err(DevError::Eperm);
         }
         let frame = proc.user_frame.as_ref().ok_or(DevError::Einval)?;
-        let bytes = unsafe {
+        Ok(crate::dev::read_bytes(Self::register_bytes(frame), buf, offset))
+    }
+
+    fn register_bytes(frame: &crate::proc::SavedUserFrame) -> &[u8] {
+        unsafe {
             core::slice::from_raw_parts(core::ptr::from_ref(frame).cast(), Self::register_size())
-        };
-        Ok(crate::dev::read_bytes(bytes, buf, offset))
+        }
     }
 
     fn write_registers(pid: i32, buf: &[u8], offset: u64) -> Result<usize, DevError> {
@@ -995,45 +1055,27 @@ impl ProcFsDev {
     }
 
     fn read_segments(pid: i32, buf: &mut [u8], offset: u64) -> Result<usize, DevError> {
+        use crate::proc::SegType;
+        use core::fmt::Write;
+
         let proc = Self::real_proc(pid).ok_or(DevError::Enoent)?;
         let mut text = alloc::string::String::new();
-        text.push_str("Segment\tType\tBase\tTop\tSize\n");
-        for (i, seg) in proc.seg.iter().enumerate() {
-            if let Some(s) = seg {
-                if s.segtype == crate::proc::SegType::None {
-                    continue;
-                }
-                let name = match s.segtype {
-                    crate::proc::SegType::Text => "text",
-                    crate::proc::SegType::Data => "data",
-                    crate::proc::SegType::Bss => "bss",
-                    crate::proc::SegType::Stack => "stack",
-                    crate::proc::SegType::Shared => "shared",
-                    crate::proc::SegType::Physical => "phys",
-                    crate::proc::SegType::None => continue,
-                };
-                text.push_str(&alloc::format!(
-                    "{}\t{}\t{:#x}\t{:#x}\t{}\n",
-                    i,
-                    name,
-                    s.base,
-                    s.top,
-                    s.size()
-                ));
-            }
+        for segment in proc.seg.iter().flatten() {
+            let name = match segment.segtype {
+                SegType::Text => "Text",
+                SegType::Data => "Data",
+                SegType::Bss => "Bss",
+                SegType::Stack => "Stack",
+                SegType::Shared => "Shared",
+                SegType::Physical => "Phys",
+                SegType::None => continue,
+            };
+            let readonly = if segment.segtype == SegType::Text { 'R' } else { ' ' };
+            let profile = if segment.profile.is_some() { 'P' } else { ' ' };
+            let _ = writeln!(text, "{name:<6} {readonly}{profile} {:08x} {:08x} {:4}",
+                segment.base, segment.top, segment.refcount);
         }
-
-        // Stream: the caller's channel offset advances by the number of
-        // bytes returned, so serve the window [offset, offset+buf.len())
-        // of the pre-built text and report EOF with a zero-length read.
-        let bytes = text.as_bytes();
-        let off = offset as usize;
-        if off >= bytes.len() {
-            return Ok(0);
-        }
-        let end = (off + buf.len()).min(bytes.len());
-        buf[..end - off].copy_from_slice(&bytes[off..end]);
-        Ok(end - off)
+        Ok(crate::dev::read_bytes(text.as_bytes(), buf, offset))
     }
     
     fn check_owner(target: &crate::proc::Proc) -> Result<(), DevError> {
@@ -1058,7 +1100,7 @@ impl ProcFsDev {
         let mut fields = core::str::from_utf8(buf).map_err(|_| DevError::Einval)?.split_whitespace();
         let cmd = fields.next().ok_or(DevError::Einval)?;
         let argument = fields.next();
-        let takes_argument = matches!(cmd, "close" | "pri" | "fixedpri" | "wired");
+        let takes_argument = matches!(cmd, "close" | "pri" | "fixedpri" | "wired" | "period" | "deadline" | "cost");
         if fields.next().is_some() || (takes_argument && argument.is_none())
             || (argument.is_some() && !takes_argument && cmd != "trace")
         {
@@ -1069,6 +1111,9 @@ impl ProcFsDev {
             return Err(DevError::Eperm);
         }
         match cmd {
+            "period" | "deadline" | "cost" | "sporadic" | "extra" | "deadlinenotes" | "admit" | "expel" => {
+                crate::useredf::configure(proc, cmd, argument)?;
+            }
             "kill" => {
                 if crate::proc::curproc().is_some_and(|current| current.pid == proc.pid) {
                     proc.notify = None;
@@ -1080,7 +1125,7 @@ impl ProcFsDev {
                 }
             }
             "stop" => {
-                if proc.state != State::Stopped {
+                if !matches!(proc.state, State::Stopped | State::Broken) {
                     proc.stopped_from = Some(if proc.state == State::Running { State::Ready } else { proc.state });
                     proc.state = State::Stopped;
                     crate::syscall::wake_stop_waiters(pid as _, true);
@@ -1092,7 +1137,7 @@ impl ProcFsDev {
                 if step && proc.state != State::Stopped {
                     return Err(DevError::Einval);
                 }
-                if !step && proc.state == State::Stopped {
+                if !step && matches!(proc.state, State::Stopped | State::Broken) {
                     return Ok(buf.len());
                 }
                 let caller = crate::proc::curproc_mut().ok_or(DevError::Eperm)?;

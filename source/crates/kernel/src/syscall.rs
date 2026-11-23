@@ -7,6 +7,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -769,15 +770,19 @@ fn wake_child_wait(proc: &mut Proc, result: i64) {
 
 pub(crate) fn set_user_ready(proc: &mut Proc) {
     proc.state = State::Ready;
+    crate::useredf::update(proc, plan9_arch::hal::timer::ms_since_boot());
     record_trace(proc, TraceEvent::Ready);
 }
 
 fn block_user(proc: &mut Proc) {
     proc.state = State::Wait;
+    crate::useredf::account(proc, plan9_arch::hal::timer::ms_since_boot());
     record_trace(proc, TraceEvent::Sleep);
 }
 
 static RETIRED_ROOTS: Spinlock<Vec<crate::plan9_common::types::PhysAddr>> = Spinlock::new(Vec::new());
+static BROKEN_PROCS: Spinlock<VecDeque<Pid>> = Spinlock::new(VecDeque::new());
+const MAX_BROKEN_PROCS: usize = 4;
 
 fn resume_user(proc: &'static mut Proc) -> ! {
     if proc.insyscall && core::mem::take(&mut proc.stop_on_return) {
@@ -797,18 +802,21 @@ fn resume_user(proc: &'static mut Proc) -> ! {
         resume_next(ready_user(proc.pid));
     }
     if prepare_note(proc).is_err() {
-        let pid = proc.pid;
-        let next = finish_user_with_status(pid, 1, note_exit_message(proc)).or_else(|| ready_user(pid));
-        resume_next(next);
+        terminate_note(proc);
     }
+    let now = plan9_arch::hal::timer::ms_since_boot();
+    crate::useredf::account(proc, now);
+    if crate::useredf::rank(proc).is_none() {
+        set_user_ready(proc);
+        resume_next(ready_user(proc.pid));
+    }
+    crate::useredf::dispatch(proc, now);
     proc.state = State::Running;
     if !was_running {
         record_trace(proc, TraceEvent::Run);
     }
-    let frame = proc.user_frame.as_ref().unwrap() as *const _ as u64;
-    let root = proc.mmupdb.as_u64();
     crate::proc::set_curproc(proc);
-    unsafe { plan9_arch::hal::switch_to_user::kernel_resume_user(frame, root) }
+    unsafe { crate::userfp::resume(curproc().unwrap()) }
 }
 
 fn resume_next(next: Option<crate::proc::Pid>) -> ! {
@@ -830,11 +838,14 @@ fn resume_next(next: Option<crate::proc::Pid>) -> ! {
 }
 
 fn ready_user(excluding: crate::proc::Pid) -> Option<crate::proc::Pid> {
-    let ready = |proc: &&Proc| proc.pid != excluding && proc.state == State::Ready
-        && proc.user_frame.is_some() && proc.wired.can_run_on(0);
-    scheduler().procs.iter().filter(ready)
-        .min_by_key(|proc| (core::cmp::Reverse(proc.pri), proc.pid <= excluding, proc.pid))
-        .map(|proc| proc.pid)
+    let now = plan9_arch::hal::timer::ms_since_boot();
+    scheduler().procs.iter_mut().filter(|proc| proc.pid != excluding && proc.state == State::Ready
+        && proc.user_frame.is_some() && proc.wired.can_run_on(0))
+        .filter_map(|proc| {
+            crate::useredf::update(proc, now);
+            crate::useredf::rank(proc).map(|rank| (rank, proc.pid <= excluding, proc.pid))
+        })
+        .min().map(|(_, _, pid)| pid)
 }
 
 pub(crate) fn finish_user(pid: crate::proc::Pid, status: i32) -> Option<crate::proc::Pid> {
@@ -843,14 +854,11 @@ pub(crate) fn finish_user(pid: crate::proc::Pid, status: i32) -> Option<crate::p
 
 pub(crate) fn finish_user_with_status(pid: Pid, status: i32, message: Option<alloc::string::String>) -> Option<Pid> {
     let mut proc = scheduler().procs.remove(pid)?;
-    record_trace(&proc, TraceEvent::Dead);
-    for child in scheduler().procs.iter_mut().filter(|child| child.parent == Some(pid)) {
-        child.parent = None;
-    }
-    wake_stop_waiters(pid, false);
-    if let Some(reader) = proc_wait_reader(pid).and_then(crate::proc::find_proc) {
-        reader.reading_proc_wait = None;
-        wake_child_wait(reader, Error::Ebadpid as i64);
+    drop(proc.mount_io.take());
+    let broken = proc.state == State::Broken;
+    if broken {
+        BROKEN_PROCS.lock().retain(|entry| *entry != pid);
+        wake_stop_waiters(pid, false);
     }
     let active = curproc().is_some_and(|current| current.pid == pid);
     if active {
@@ -859,8 +867,24 @@ pub(crate) fn finish_user_with_status(pid: Pid, status: i32, message: Option<all
     } else {
         crate::init_loader::release_user_root(proc.mmupdb);
     }
+    let next = if broken { None } else { report_user_exit(&mut proc, status, message) };
+    drop(proc.fgrp.take());
+    next
+}
+
+fn report_user_exit(proc: &mut Proc, status: i32, message: Option<alloc::string::String>) -> Option<Pid> {
+    let pid = proc.pid;
+    record_trace(proc, TraceEvent::Dead);
+    for child in scheduler().procs.iter_mut().filter(|child| child.parent == Some(pid)) {
+        child.parent = None;
+    }
+    wake_stop_waiters(pid, proc.state == State::Broken);
+    if let Some(reader) = proc_wait_reader(pid).and_then(crate::proc::find_proc) {
+        reader.reading_proc_wait = None;
+        wake_child_wait(reader, Error::Ebadpid as i64);
+    }
     let mut next = None;
-    if let Some(parent) = proc.parent.and_then(crate::proc::find_proc) {
+    if let Some(parent) = proc.parent.take().and_then(crate::proc::find_proc) {
         parent.nchild = parent.nchild.saturating_sub(1);
         let mut entry = crate::proc::Waitq::new(pid, status, proc.utime.saturating_add(proc.ctime));
         entry.message = message;
@@ -900,7 +924,6 @@ pub(crate) fn finish_user_with_status(pid: Pid, status: i32, message: Option<all
             }
         }
     }
-    drop(proc.fgrp.take());
     next
 }
 
@@ -997,8 +1020,16 @@ fn sys_internallist(frame: &SyscallFrame) -> Result<usize> {
     }
 
     let path = copy_cstring_from_user(path_ptr)?;
+    user_buffer(curproc().ok_or(Error::Eperm)?, buf_ptr, cap, true)?;
+    let directories = crate::vfs::open_name_directories(&path)?;
+    if let [directory] = directories.as_slice() {
+        if let Some(pending) = directory.pending_names(buf_ptr, cap) {
+            drop(directories);
+            return wait_mount_io(curproc_mut().ok_or(Error::Eperm)?, pending);
+        }
+    }
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, cap) };
-    Ok(crate::vfs::list_names(&path, buf)?)
+    Ok(crate::vfs::list_names(directories, buf)?)
 }
 
 /// Execute a program - public interface for internal use
@@ -1033,8 +1064,24 @@ pub fn exec_syscall(path: *const u8, argv: *const *const u8, envp: *const *const
 ///
 /// aarch64 note: block descriptors are detected by `bit0=1 && bit1=0`
 /// (table descriptors have bits[1:0]=0b11), not by the x86 PS bit.
-#[cfg(not(target_arch = "riscv64"))]
 unsafe fn translate_user_paddr(pml4_phys: u64, vaddr: u64) -> u64 {
+    translate_user_page(pml4_phys, vaddr, false)
+}
+
+fn user_leaf(entry: u64, writable: bool) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    let allowed = entry & 4 != 0 && (!writable || entry & 2 != 0);
+    #[cfg(target_arch = "aarch64")]
+    let allowed = entry & (1 << 6) != 0 && (!writable || entry & (1 << 7) == 0);
+    #[cfg(target_arch = "loongarch64")]
+    let allowed = entry & (3 << 2) == (3 << 2) && entry & (1 << 61) == 0 && (!writable || entry & 2 != 0);
+    #[cfg(target_arch = "riscv64")]
+    let allowed = entry & 0x12 == 0x12 && (!writable || entry & 4 != 0);
+    allowed
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+unsafe fn translate_user_page(pml4_phys: u64, vaddr: u64, writable: bool) -> u64 {
     use crate::init_loader::read_pte;
     const PRESENT: u64 = 1;
     #[cfg(target_arch = "aarch64")]
@@ -1056,30 +1103,34 @@ unsafe fn translate_user_paddr(pml4_phys: u64, vaddr: u64) -> u64 {
     let i3 = ((vaddr >> 30) & 0x1FF) as usize;
     let i2 = ((vaddr >> 21) & 0x1FF) as usize;
     let i1 = ((vaddr >> 12) & 0x1FF) as usize;
+    let table_valid = |entry| {
+        entry & PRESENT != 0 && (!cfg!(target_arch = "x86_64") || user_leaf(entry, writable))
+    };
+    let leaf = |entry, offset| if user_leaf(entry, writable) { (entry & mask) + offset } else { 0 };
 
     let pml4e = read_pte(pml4_phys, i4);
-    if pml4e & PRESENT == 0 { return 0; }
+    if !table_valid(pml4e) { return 0; }
     #[cfg(target_arch = "aarch64")]
     if is_block(pml4e) {
         // L0-level 512 GiB block (never created, but be consistent).
-        return (pml4e & mask) + (vaddr & 0x7F_FFFF_FFFF);
+        return leaf(pml4e, vaddr & 0x7F_FFFF_FFFF);
     }
     let pdpt = pml4e & mask;
     let pdpte = read_pte(pdpt, i3);
-    if pdpte & PRESENT == 0 { return 0; }
+    if !table_valid(pdpte) { return 0; }
     if is_block(pdpte) {
-        return (pdpte & mask) + (vaddr & 0x3FFF_FFFF);
+        return leaf(pdpte, vaddr & 0x3FFF_FFFF);
     }
     let pd = pdpte & mask;
     let pde = read_pte(pd, i2);
-    if pde & PRESENT == 0 { return 0; }
+    if !table_valid(pde) { return 0; }
     if is_block(pde) {
-        return (pde & mask) + (vaddr & 0x1F_FFFF);
+        return leaf(pde, vaddr & 0x1F_FFFF);
     }
     let pt = pde & mask;
     let pte = read_pte(pt, i1);
     if pte & PRESENT == 0 { return 0; }
-    (pte & mask) + (vaddr & 0xFFF)
+    leaf(pte, vaddr & 0xFFF)
 }
 
 /// Sv39 variant: root → mid → leaf table.  A block descriptor (R/W/X set)
@@ -1087,7 +1138,7 @@ unsafe fn translate_user_paddr(pml4_phys: u64, vaddr: u64) -> u64 {
 /// user image, but 1 GiB blocks inherited in the kernel half are possible —
 /// those addresses are never translated here (user VA only).
 #[cfg(target_arch = "riscv64")]
-unsafe fn translate_user_paddr(pml4_phys: u64, vaddr: u64) -> u64 {
+unsafe fn translate_user_page(pml4_phys: u64, vaddr: u64, writable: bool) -> u64 {
     use crate::init_loader::read_pte;
     const PRESENT: u64 = 1;
     // R|W|X — a leaf (block) descriptor has any of these set.
@@ -1095,24 +1146,27 @@ unsafe fn translate_user_paddr(pml4_phys: u64, vaddr: u64) -> u64 {
     let root_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let mid_idx  = ((vaddr >> 21) & 0x1FF) as usize;
     let leaf_idx = ((vaddr >> 12) & 0x1FF) as usize;
+    let leaf = |entry, offset| {
+        if user_leaf(entry, writable) { (((entry >> 10) << 12) & 0x000F_FFFF_FFFF_F000) + offset } else { 0 }
+    };
 
     let root_e = read_pte(pml4_phys, root_idx);
     if root_e & PRESENT == 0 { return 0; }
     if root_e & R_WX != 0 {
         // 1 GiB block.
-        return (((root_e >> 10) << 12) & 0x000F_FFFF_FFFF_F000) + (vaddr & 0x3FFF_FFFF);
+        return leaf(root_e, vaddr & 0x3FFF_FFFF);
     }
     let mid_table = ((root_e >> 10) << 12) & 0x000F_FFFF_FFFF_F000;
     let mid_e = read_pte(mid_table, mid_idx);
     if mid_e & PRESENT == 0 { return 0; }
     if mid_e & R_WX != 0 {
         // 2 MiB block.
-        return (((mid_e >> 10) << 12) & 0x000F_FFFF_FFFF_F000) + (vaddr & 0x1F_FFFF);
+        return leaf(mid_e, vaddr & 0x1F_FFFF);
     }
     let leaf_table = ((mid_e >> 10) << 12) & 0x000F_FFFF_FFFF_F000;
     let pte = read_pte(leaf_table, leaf_idx);
     if pte & PRESENT == 0 { return 0; }
-    (((pte >> 10) << 12) & 0x000F_FFFF_FFFF_F000) + (vaddr & 0xFFF)
+    leaf(pte, vaddr & 0xFFF)
 }
 
 const EXEC_SCRIPT_HEADER: usize = 256;
@@ -1553,74 +1607,33 @@ fn patch_got(data: &mut [u8]) {
 
 /// Copy argument vector from user space
 fn copy_argv_from_user(argv_ptr: u64) -> Result<Vec<Vec<u8>>> {
-    if argv_ptr == 0 {
-        return Ok(Vec::new());
-    }
-    
-    let mut argv = Vec::new();
-    let mut ptr = argv_ptr;
-    
-    loop {
-        // Read pointer at current position
-        if !is_user_addr(ptr) {
-            break;
-        }
-        
-        let arg_ptr = unsafe {
-            core::ptr::read(ptr as *const u64)
-        };
-        
-        if arg_ptr == 0 {
-            break;
-        }
-        
-        if !is_user_addr(arg_ptr) {
-            break;
-        }
-        
-        // Copy the string
-        let s = copy_cstring_from_user(arg_ptr)?;
-        argv.push(s);
-        
-        ptr += 8;
-    }
-    
-    Ok(argv)
+    copy_string_vector(argv_ptr)
 }
 
 /// Copy environment vector from user space
 fn copy_envp_from_user(envp_ptr: u64) -> Result<Vec<Vec<u8>>> {
-    if envp_ptr == 0 {
+    copy_string_vector(envp_ptr)
+}
+
+fn copy_string_vector(mut address: u64) -> Result<Vec<Vec<u8>>> {
+    if address == 0 {
         return Ok(Vec::new());
     }
-    
-    let mut envp = Vec::new();
-    let mut ptr = envp_ptr;
-    
+    let proc = curproc().ok_or(Error::Eperm)?;
+    let mut values = Vec::new();
+    let mut remaining = 32 * 1024usize;
     loop {
-        if !is_user_addr(ptr) {
-            break;
+        let mut pointer = [0; core::mem::size_of::<u64>()];
+        get_user_bytes(proc, address, &mut pointer)?;
+        let value = u64::from_le_bytes(pointer);
+        if value == 0 {
+            return Ok(values);
         }
-        
-        let env_ptr = unsafe {
-            core::ptr::read(ptr as *const u64)
-        };
-        
-        if env_ptr == 0 {
-            break;
-        }
-        
-        if !is_user_addr(env_ptr) {
-            break;
-        }
-        
-        let s = copy_cstring_from_user(env_ptr)?;
-        envp.push(s);
-        
-        ptr += 8;
+        let value = copy_cstring_from_user(value)?;
+        remaining = remaining.checked_sub(pointer.len() + value.len() + 1).ok_or(Error::Einval)?;
+        values.push(value);
+        address = address.checked_add(pointer.len() as u64).ok_or(Error::Efault)?;
     }
-    
-    Ok(envp)
 }
 
 /// Build user stack with arguments and environment for exec
@@ -1987,8 +2000,10 @@ fn sys_internalopen(frame: &SyscallFrame) -> Result<usize> {
     
     // Use the VFS to open the file and allocate a descriptor.
     match crate::vfs::sys_open(&path, omode) {
-        Ok(fd) if fd >= 0 => Ok(fd as usize),
-        Ok(_) => Err(Error::Enomem),
+        Ok(crate::vfs::OpenResult::Descriptor(fd)) => Ok(fd as usize),
+        Ok(crate::vfs::OpenResult::Pending(pending)) => {
+            wait_mount_io(curproc_mut().ok_or(Error::Eperm)?, crate::devmnt::PendingIo::Open(pending))
+        }
         Err(_) => Err(Error::Enoent),
     }
 }
@@ -2030,35 +2045,45 @@ fn sys_internalcreate(frame: &SyscallFrame) -> Result<usize> {
 
 /// Copy a null-terminated string from user space
 fn copy_cstring_from_user(ptr: u64) -> Result<Vec<u8>> {
-    if ptr == 0 {
-        return Err(Error::Ebadf);
-    }
-    
-    if !is_user_addr(ptr) {
-        return Err(Error::Ebadf);
-    }
-    
-    // Read up to 256 bytes or until null
-    let mut buf: Vec<u8> = Vec::with_capacity(256);
-    let mut addr = ptr;
-
-    loop {
-        if buf.len() >= 255 {
-            break;
+    const LIMIT: usize = 256;
+    let proc = curproc().ok_or(Error::Eperm)?;
+    let mut result = Vec::new();
+    let mut address = ptr;
+    while result.len() < LIMIT {
+        let segment = proc.find_segment(address).ok_or(Error::Efault)?;
+        let count = (LIMIT - result.len()).min(4096 - (address as usize & 4095))
+            .min((segment.top - address) as usize);
+        user_buffer(proc, address, count, false)?;
+        let bytes = unsafe { core::slice::from_raw_parts(address as *const u8, count) };
+        if let Some(end) = bytes.iter().position(|byte| *byte == 0) {
+            result.extend_from_slice(&bytes[..end]);
+            return Ok(result);
         }
-        // Read one byte at a time
-        // In a real implementation, this would use copyin from user space
-        let byte = unsafe {
-            core::ptr::read(addr as *const u8)
-        };
-        if byte == 0 {
-            break;
-        }
-        buf.push(byte);
-        addr = unsafe { (addr as *const u8).add(1) as u64 };
+        result.extend_from_slice(bytes);
+        address = address.checked_add(count as u64).ok_or(Error::Efault)?;
     }
+    Err(Error::Einval)
+}
 
-    Ok(buf)
+fn user_buffer(proc: &Proc, mut address: u64, length: usize, writable: bool) -> Result<()> {
+    if length == 0 {
+        return Ok(());
+    }
+    let end = address.checked_add(length as u64).ok_or(Error::Efault)?;
+    if address == 0 || length > isize::MAX as usize || !is_user_addr(address) || !is_user_addr(end - 1) {
+        return Err(Error::Efault);
+    }
+    while address < end {
+        let segment = proc.find_segment(address).ok_or(Error::Efault)?;
+        if writable && !matches!(segment.segtype, SegType::Data | SegType::Bss | SegType::Stack | SegType::Shared) {
+            return Err(Error::Efault);
+        }
+        if unsafe { translate_user_page(proc.mmupdb.as_u64(), address, writable) } == 0 {
+            return Err(Error::Efault);
+        }
+        address += (end.min(segment.top) - address).min(4096 - (address & 4095));
+    }
+    Ok(())
 }
 
 /// READ - read data
@@ -2090,12 +2115,13 @@ fn sys_internalread(frame: &SyscallFrame) -> Result<usize> {
     // `Fgrp::set_stdio`, so reads go through the device instead of a
     // hard-coded serial path.
     let proc = curproc_mut().ok_or(Error::Ebadfd)?;
+    user_buffer(proc, buf_ptr, n, true)?;
     let fgrp = match proc.fgrp.as_mut() {
         Some(f) => f,
         None => return Err(Error::Ebadfd),
     };
 
-    let mut chan = match fgrp.get_channel(fd) {
+    let chan = match fgrp.get_channel(fd) {
         Some(c) => c,
         None => return Err(Error::Ebadfd),
     };
@@ -2104,6 +2130,11 @@ fn sys_internalread(frame: &SyscallFrame) -> Result<usize> {
         drop(chan);
         return read_proc_wait(target, buf_ptr, n);
     }
+
+    let mut chan = match crate::devmnt::PendingIo::start(chan, buf_ptr, n, false) {
+        Ok(pending) => return wait_mount_io(proc, pending),
+        Err(channel) => channel,
+    };
 
     let buf = unsafe {
         core::slice::from_raw_parts_mut(buf_ptr as *mut u8, n)
@@ -2141,20 +2172,22 @@ fn sys_internalwrite(frame: &SyscallFrame) -> Result<usize> {
         return Err(Error::Ebadf);
     }
 
-    let buf = unsafe {
-        core::slice::from_raw_parts(buf_ptr as *const u8, n)
-    };
-
     // stdout/stderr are ordinary Plan 9 channels fd 1 and fd 2.  Writing
     // them reaches `ConsDev`, which renders into the graphical console and
     // mirrors to serial/VGA as appropriate.
     let proc = curproc_mut().ok_or(Error::Ebadfd)?;
+    user_buffer(proc, buf_ptr, n, false)?;
+    let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, n) };
     let fgrp = match proc.fgrp.as_mut() {
         Some(f) => f,
         None => return Err(Error::Ebadfd),
     };
 
-    let mut channel = fgrp.get_channel(fd).ok_or(Error::Ebadfd)?;
+    let channel = fgrp.get_channel(fd).ok_or(Error::Ebadfd)?;
+    let mut channel = match crate::devmnt::PendingIo::start(channel, buf_ptr, n, true) {
+        Ok(pending) => return wait_mount_io(proc, pending),
+        Err(channel) => channel,
+    };
     let result = channel.write(buf);
     drop(channel);
     match result {
@@ -2197,6 +2230,10 @@ fn sys_internalclose(frame: &SyscallFrame) -> Result<usize> {
 
     if let Some(fgrp) = proc.fgrp.as_mut() {
         if let Some(mut chan) = fgrp.close_fd(fd) {
+            if let Some(pending) = chan.pending_close() {
+                drop(chan);
+                return wait_mount_io(proc, crate::devmnt::PendingIo::Close(pending));
+            }
             chan.close();
             return Ok(0);
         }
@@ -2302,17 +2339,11 @@ fn sys_internalpipe(frame: &SyscallFrame) -> Result<usize> {
         return Err(Error::Ebadf);
     }
 
-    // Verify we can write to the user pointer
-    if !is_user_addr(fds_ptr) || !is_user_addr(fds_ptr + 15) {
-        return Err(Error::Ebadf);
-    }
-
-    // Get current process
-    let proc = curproc().ok_or(Error::Eperm)?;
-    let proc_mut = unsafe { &mut *(core::ptr::addr_of!(*proc) as *mut Proc) };
+    let proc = curproc_mut().ok_or(Error::Eperm)?;
+    user_buffer(proc, fds_ptr, 16, true)?;
 
     // Get file descriptor group
-    let fgrp = match proc_mut.fgrp.as_mut() {
+    let fgrp = match proc.fgrp.as_mut() {
         Some(f) => f,
         None => return Err(Error::Ebadf),
     };
@@ -2338,8 +2369,8 @@ fn sys_internalpipe(frame: &SyscallFrame) -> Result<usize> {
     // 64-bit slot per descriptor (`long fd[2]` in Plan 9), so the array is
     // 16 bytes: fds[0] = read, fds[1] = write.
     unsafe {
-        core::ptr::write(fds_ptr as *mut i64, read_fd as i64);
-        core::ptr::write((fds_ptr as *mut i64).add(1), write_fd as i64);
+        core::ptr::write_unaligned(fds_ptr as *mut i64, read_fd as i64);
+        core::ptr::write_unaligned((fds_ptr + 8) as *mut i64, write_fd as i64);
     }
 
     Ok(0)
@@ -2441,6 +2472,10 @@ impl crate::proc::Chan for PipeEnd {
 fn sys_internalstat(frame: &SyscallFrame) -> Result<usize> {
     let path = copy_cstring_from_user(frame.arg(0))?;
     let mut chan = namec(&path, crate::vfs::NamecMode::Walk, 0, 0)?;
+    if let Some(pending) = crate::devmnt::PendingIo::stat(&chan, frame.arg(1), frame.arg(2) as usize, true) {
+        drop(chan);
+        return wait_mount_stat(frame, pending);
+    }
     let result = crate::devmnt::stat_record(&mut chan, true);
     let _ = crate::dev::dev_close(&mut chan);
     copy_stat_to_user(frame, &result?)
@@ -2459,7 +2494,17 @@ fn sys_internalstat(frame: &SyscallFrame) -> Result<usize> {
 /// * Bytes written, or error
 fn sys_internalfstat(frame: &SyscallFrame) -> Result<usize> {
     let mut file = crate::vfs::fd_channel(frame.arg(0) as i32).ok_or(Error::Ebadfd)?;
+    let address = frame.arg(1);
+    let size = frame.arg(2) as usize;
+    if size < 2 {
+        return Err(Error::Einval);
+    }
     let record = if let Some(mut chan) = file.dev_chan() {
+        if let Some(pending) = crate::devmnt::PendingIo::stat(&chan, address, size, false) {
+            drop(chan);
+            drop(file);
+            return wait_mount_stat(frame, pending);
+        }
         crate::devmnt::stat_record(&mut chan, false)?
     } else {
         let entry = file.stat()?;
@@ -2469,14 +2514,25 @@ fn sys_internalfstat(frame: &SyscallFrame) -> Result<usize> {
     copy_stat_to_user(frame, &record)
 }
 
+fn wait_mount_stat(frame: &SyscallFrame, pending: crate::devmnt::PendingIo) -> Result<usize> {
+    if frame.arg(2) < 2 {
+        return Err(Error::Einval);
+    }
+    let proc = curproc_mut().ok_or(Error::Eperm)?;
+    validate_wait_buffer(proc, frame.arg(1), 2)?;
+    wait_mount_io(proc, pending)
+}
+
 fn copy_stat_to_user(frame: &SyscallFrame, record: &[u8]) -> Result<usize> {
-    let address = frame.arg(1);
-    let size = frame.arg(2) as usize;
+    let proc = curproc().ok_or(Error::Eperm)?;
+    copy_stat_to_proc(proc, frame.arg(1), frame.arg(2) as usize, record)
+}
+
+pub(crate) fn copy_stat_to_proc(proc: &Proc, address: u64, size: usize, record: &[u8]) -> Result<usize> {
     if size < 2 {
         return Err(Error::Einval);
     }
     let count = if size < record.len() { 2 } else { record.len() };
-    let proc = curproc().ok_or(Error::Eperm)?;
     validate_wait_buffer(proc, address, count)?;
     put_user_bytes(proc, address, &record[..count])?;
     Ok(count)
@@ -2503,6 +2559,10 @@ fn sys_internalwstat(frame: &SyscallFrame) -> Result<usize> {
     let path = copy_cstring_from_user(frame.arg(0))?;
     let stat = copy_wstat(frame.arg(1), frame.arg(2) as usize)?;
     let mut chan = namec(&path, crate::vfs::NamecMode::Walk, 0, 0)?;
+    if let Some(pending) = crate::devmnt::PendingIo::wstat(&chan, &stat)? {
+        drop(chan);
+        return wait_mount_io(curproc_mut().ok_or(Error::Eperm)?, pending);
+    }
     crate::devmnt::wstat(&mut chan, &stat)?;
     Ok(stat.len())
 }
@@ -2522,31 +2582,22 @@ fn sys_internalfwstat(frame: &SyscallFrame) -> Result<usize> {
     let stat = copy_wstat(frame.arg(1), frame.arg(2) as usize)?;
     let mut chan = crate::vfs::fd_channel(frame.arg(0) as i32)
         .and_then(|file| file.dev_chan()).ok_or(Error::Ebadfd)?;
+    if let Some(pending) = crate::devmnt::PendingIo::wstat(&chan, &stat)? {
+        drop(chan);
+        drop(stat);
+        return wait_mount_io(curproc_mut().ok_or(Error::Eperm)?, pending);
+    }
     crate::devmnt::wstat(&mut chan, &stat)?;
     Ok(stat.len())
 }
 
-fn copy_wstat(mut address: u64, count: usize) -> Result<Vec<u8>> {
+fn copy_wstat(address: u64, count: usize) -> Result<Vec<u8>> {
     if !(49..=u16::MAX as usize).contains(&count) {
         return Err(Error::Einval);
     }
-    if !is_user_addr(address) || !address.checked_add((count - 1) as u64).is_some_and(is_user_addr) {
-        return Err(Error::Efault);
-    }
     let proc = curproc().ok_or(Error::Eperm)?;
     let mut result = vec![0; count];
-    let mut remaining = result.as_mut_slice();
-    while !remaining.is_empty() {
-        let physical = unsafe { translate_user_paddr(proc.mmupdb.as_u64(), address) };
-        if physical == 0 {
-            return Err(Error::Efault);
-        }
-        let length = remaining.len().min(4096 - (address as usize & 4095));
-        let source = crate::vm::phys_to_virt(crate::plan9_common::types::PhysAddr::new(physical));
-        unsafe { core::ptr::copy_nonoverlapping(source.as_u64() as *const u8, remaining.as_mut_ptr(), length) };
-        remaining = &mut remaining[length..];
-        address += length as u64;
-    }
+    get_user_bytes(proc, address, &mut result)?;
     Ok(result)
 }
 
@@ -2878,7 +2929,8 @@ fn sys_internalgetcwd(frame: &SyscallFrame) -> Result<usize> {
     let path = if proc.cwd_path.is_empty() { b"/".to_vec() } else { proc.cwd_path.clone() };
     let bytes = &path[..core::cmp::min(path.len(), cap - 1)];
 
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, cap) };
+    user_buffer(proc, buf_ptr, bytes.len() + 1, true)?;
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, bytes.len() + 1) };
     buf[..bytes.len()].copy_from_slice(bytes);
     buf[bytes.len()] = 0; // NUL-terminate
     Ok(bytes.len())
@@ -2943,7 +2995,8 @@ fn sys_internalgetuser(frame: &SyscallFrame) -> Result<usize> {
     // Fall back to the canonical name for uid 0 before login runs.
     let name: &[u8] = if len == 0 { b"glenda" } else { &proc.uname[..len] };
     let n = core::cmp::min(name.len(), cap - 1);
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, cap) };
+    user_buffer(proc, buf_ptr, n + 1, true)?;
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, n + 1) };
     buf[..n].copy_from_slice(&name[..n]);
     buf[n] = 0;
     Ok(n)
@@ -2961,9 +3014,9 @@ fn sys_internalgetgroups(frame: &SyscallFrame) -> Result<usize> {
     }
     let proc = curproc().ok_or(Error::Eperm)?;
     let max = core::cmp::min(proc.groups.len(), cap / 4);
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u32, max) };
+    user_buffer(proc, buf_ptr, max * 4, true)?;
     for (i, g) in proc.groups.iter().take(max).enumerate() {
-        buf[i] = *g;
+        unsafe { core::ptr::write_unaligned((buf_ptr + (i * 4) as u64) as *mut u32, g.to_le()) };
     }
     Ok(max)
 }
@@ -3231,8 +3284,7 @@ fn sys_internalsysnoted(frame: &SyscallFrame) -> Result<usize> {
     }
     if action == 1 || action > 3 {
         proc.last_note = Some(saved.note);
-        let pid = proc.pid;
-        resume_next(finish_user_with_status(pid, 1, note_exit_message(proc)).or_else(|| ready_user(pid)));
+        terminate_note(proc);
     }
 
     let mut restored = saved.original;
@@ -3263,6 +3315,48 @@ fn note_exit_message(proc: &Proc) -> Option<alloc::string::String> {
     Some(alloc::string::String::from_utf8_lossy(&note.msg[..end]).into_owned())
 }
 
+fn terminate_note(proc: &mut Proc) -> ! {
+    let pid = proc.pid;
+    let message = note_exit_message(proc);
+    if !proc.last_note.is_some_and(|note| note.flag == DEBUG_NOTE) {
+        resume_next(finish_user_with_status(pid, 1, message).or_else(|| ready_user(pid)));
+    }
+    let reason = message.as_deref().unwrap_or("sys: trap");
+    if pid == 1 {
+        panic!("boot process died: {reason}");
+    }
+    let end = proc.text.iter().position(|byte| *byte == 0).unwrap_or(proc.text.len());
+    let name = core::str::from_utf8(&proc.text[..end]).unwrap_or("process");
+    let diagnostic = format!("{name} {pid}: {reason}\n");
+    if proc.fgrp.as_mut().and_then(|group| group.get_channel(2))
+        .is_none_or(|mut fd| !fd.write(diagnostic.as_bytes()).is_ok_and(|count| count == diagnostic.len()))
+    {
+        crate::serial::put_bytes(diagnostic.as_bytes());
+    }
+    proc.state = State::Broken;
+    proc.user_edf = None;
+    proc.insyscall = false;
+    proc.stop_on_return = false;
+    proc.stop_on_syscall = false;
+    proc.alarm.cancel();
+    let next = report_user_exit(proc, 1, message);
+    drop(proc.fgrp.take());
+    drop(proc.dot.take());
+    drop(proc.egrp.take());
+    drop(proc.pgrp.take());
+    proc.waitq = None;
+    let oldest = {
+        let mut broken = BROKEN_PROCS.lock();
+        let oldest = if broken.len() == MAX_BROKEN_PROCS { broken.pop_front() } else { None };
+        broken.push_back(pid);
+        oldest
+    };
+    if let Some(oldest) = oldest {
+        finish_user(oldest, 1);
+    }
+    resume_next(next.or_else(|| ready_user(pid)))
+}
+
 fn put_note_bytes(proc: &Proc, address: u64, bytes: &[u8]) -> Result<()> {
     let end = address.checked_add(bytes.len() as u64).ok_or(Error::Efault)?;
     if !proc.find_segment(address).is_some_and(|seg| seg.segtype == crate::proc::SegType::Stack && end <= seg.top) {
@@ -3272,6 +3366,7 @@ fn put_note_bytes(proc: &Proc, address: u64, bytes: &[u8]) -> Result<()> {
 }
 
 pub(crate) fn put_user_bytes(proc: &Proc, mut address: u64, mut bytes: &[u8]) -> Result<()> {
+    user_buffer(proc, address, bytes.len(), true)?;
     while !bytes.is_empty() {
         let pa = unsafe { translate_user_paddr(proc.mmupdb.as_u64(), address) };
         if pa == 0 {
@@ -3286,14 +3381,40 @@ pub(crate) fn put_user_bytes(proc: &Proc, mut address: u64, mut bytes: &[u8]) ->
     Ok(())
 }
 
-pub(crate) fn get_user_bytes(proc: &Proc, address: u64, bytes: &mut [u8]) -> Result<()> {
+pub(crate) fn patch_user_text(proc: &Proc, address: u64, bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
-    let end = address.checked_add(bytes.len() as u64).ok_or(Error::Efault)?;
-    if !proc.find_segment(address).is_some_and(|segment| end <= segment.top) {
+    let pa = unsafe { translate_user_paddr(proc.mmupdb.as_u64(), address) };
+    if pa == 0 || bytes.len() > 4096 - (address as usize & 4095) {
         return Err(Error::Efault);
     }
+    let destination = crate::vm::phys_to_virt(crate::plan9_common::types::PhysAddr::new(pa)).as_u64();
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), destination as *mut u8, bytes.len()) };
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let ctr: u64;
+        core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nomem, nostack));
+        let line_size = 4 << ((ctr >> 16) & 15);
+        let mut line = destination & !(line_size - 1);
+        while line < destination + bytes.len() as u64 {
+            core::arch::asm!("dc cvau, {line}", line = in(reg) line, options(nostack));
+            line += line_size;
+        }
+        core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack));
+    }
+    #[cfg(target_arch = "riscv64")]
+    plan9_arch::riscv64::cpu::fence_i();
+    #[cfg(target_arch = "loongarch64")]
+    {
+        plan9_arch::loongarch64::cpu::dbar();
+        plan9_arch::loongarch64::cpu::ibar();
+    }
+    Ok(())
+}
+
+pub(crate) fn get_user_bytes(proc: &Proc, address: u64, bytes: &mut [u8]) -> Result<()> {
+    user_buffer(proc, address, bytes.len(), false)?;
     let mut copied = 0;
     while copied < bytes.len() {
         let address = address + copied as u64;
@@ -3348,23 +3469,42 @@ fn prepare_note(proc: &mut Proc) -> Result<bool> {
     Ok(true)
 }
 
+const DEBUG_NOTE: u32 = 1;
+
+#[inline(always)]
+fn capture_kernel_context() -> [u64; 2] {
+    let (pc, sp): (u64, u64);
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("lea {pc}, [rip + 2f]", "2: mov {sp}, rsp", pc = out(reg) pc, sp = out(reg) sp, options(nomem, nostack, preserves_flags));
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("adr {pc}, 2f", "2: mov {sp}, sp", pc = out(reg) pc, sp = out(reg) sp, options(nomem, nostack, preserves_flags));
+        #[cfg(target_arch = "riscv64")]
+        core::arch::asm!("auipc {pc}, 0", "mv {sp}, sp", pc = out(reg) pc, sp = out(reg) sp, options(nomem, nostack));
+        #[cfg(target_arch = "loongarch64")]
+        core::arch::asm!("pcaddi {pc}, 0", "move {sp}, $sp", pc = out(reg) pc, sp = out(reg) sp, options(nomem, nostack));
+    }
+    [pc, sp]
+}
+
 pub(crate) fn user_fault(frame: crate::proc::SavedUserFrame, reason: &str, address: Option<u64>) -> ! {
     let proc = curproc_mut().expect("user fault without a process");
+    proc.kernel_context = Some(capture_kernel_context());
     let pc = frame.entry();
     let message = match address {
         Some(address) => alloc::format!("sys: trap: {reason} addr={address:#x} pc={pc:#x}"),
         None => alloc::format!("sys: trap: {reason} pc={pc:#x}"),
     };
-    let note = crate::user_regs::Note::new(proc.pid, message.as_bytes(), 1);
+    let note = crate::user_regs::Note::new(proc.pid, message.as_bytes(), DEBUG_NOTE);
+    proc.user_frame = Some(frame);
     if proc.notified {
-        let pid = proc.pid;
-        resume_next(finish_user_with_status(pid, 1, Some(message)).or_else(|| ready_user(pid)));
+        proc.last_note = Some(note);
+        terminate_note(proc);
     }
     let count = (proc.nnote as usize).min(crate::proc::NNOTE - 1);
     proc.note.copy_within(..count, 1);
     proc.note[0] = note;
     proc.nnote = count as i32 + 1;
-    proc.user_frame = Some(frame);
     resume_user(proc)
 }
 
@@ -3372,6 +3512,8 @@ pub(crate) fn user_return(result: i64) {
     let Some(proc) = curproc_mut() else { return };
     let Some(frame) = proc.user_frame.as_mut() else { return };
     frame.set_ret(result as u64);
+    let now = plan9_arch::hal::timer::ms_since_boot();
+    crate::useredf::account(proc, now);
     if core::mem::take(&mut proc.stop_on_return) {
         proc.stopped_from = Some(State::Ready);
         proc.state = State::Stopped;
@@ -3379,6 +3521,10 @@ pub(crate) fn user_return(result: i64) {
     }
     if proc.state == State::Stopped {
         resume_next(ready_user(proc.pid));
+    }
+    if proc.user_edf.as_ref().is_some_and(|edf| edf.admitted()) {
+        reschedule_user(proc, None, false);
+        crate::useredf::dispatch(proc, now);
     }
     if proc.has_pending_signals() && !proc.notified {
         resume_user(proc);
@@ -3391,6 +3537,9 @@ pub(crate) fn user_tick(frame: crate::proc::SavedUserFrame) {
     if proc.state != State::Running || proc.insyscall {
         return;
     }
+    proc.kernel_context = Some(capture_kernel_context());
+    let now = plan9_arch::hal::timer::ms_since_boot();
+    crate::useredf::account(proc, now);
     proc.utime += crate::timer::MS_PER_TICK;
     if let Some(text) = proc.seg.iter_mut().flatten().find(|segment| segment.segtype == crate::proc::SegType::Text) {
         crate::proc::segclock(text, frame.entry());
@@ -3419,24 +3568,35 @@ pub(crate) fn user_tick(frame: crate::proc::SavedUserFrame) {
         }
     }
     let proc = curproc_mut().unwrap();
-    if let Some(next) = ready_user(proc.pid) {
-        let higher = crate::proc::find_proc(next).is_some_and(|next| next.pri > proc.pri);
-        if higher || (quantum_expired && !proc.fixedpri) {
+    reschedule_user(proc, Some(frame), quantum_expired);
+    crate::useredf::dispatch(proc, now);
+}
+
+fn reschedule_user(proc: &mut Proc, frame: Option<crate::proc::SavedUserFrame>, quantum_expired: bool) {
+    let rank = crate::useredf::rank(proc);
+    let next = ready_user(proc.pid);
+    let preempt = next.and_then(crate::proc::find_proc).as_deref().and_then(crate::useredf::rank).is_some_and(|other| {
+        rank.is_some_and(|current| other < current || (current.0 != 0 && quantum_expired && !proc.fixedpri))
+    });
+    if rank.is_none() || preempt {
+        if let Some(frame) = frame {
             proc.user_frame = Some(frame);
-            record_trace(proc, TraceEvent::Slice);
-            set_user_ready(proc);
-            resume_next(Some(next));
         }
+        record_trace(proc, TraceEvent::Slice);
+        set_user_ready(proc);
+        resume_next(next);
     }
 }
 
 pub(crate) fn user_syscall_entry(instruction_size: u64) {
     let Some(proc) = curproc_mut() else { return };
+    proc.kernel_context = Some(capture_kernel_context());
     if !core::mem::take(&mut proc.stop_on_syscall) {
         return;
     }
     let Some(frame) = proc.user_frame.as_mut() else { return };
     frame.set_entry(frame.entry().wrapping_sub(instruction_size));
+    crate::useredf::account(proc, plan9_arch::hal::timer::ms_since_boot());
     proc.insyscall = false;
     proc.stopped_from = Some(State::Ready);
     proc.state = State::Stopped;
@@ -3446,6 +3606,7 @@ pub(crate) fn user_syscall_entry(instruction_size: u64) {
 
 pub(crate) fn user_exec_return() {
     if let Some(proc) = curproc_mut() {
+        crate::userfp::reset(proc);
         if proc.stop_on_exec {
             proc.stopped_from = Some(State::Ready);
             proc.state = State::Stopped;
@@ -3532,6 +3693,9 @@ impl Proc {
 fn sys_internalsleep(frame: &SyscallFrame) -> Result<usize> {
     let duration = frame.arg(0) as u64;
     if duration == 0 {
+        if curproc().and_then(|proc| proc.user_edf.as_ref()).is_some_and(|edf| edf.admitted()) {
+            return sys_internalyield(frame);
+        }
         return Ok(0);
     }
     let proc = curproc_mut().ok_or(Error::Eperm)?;
@@ -3557,6 +3721,7 @@ pub(crate) fn user_io_interrupted() -> bool {
 }
 
 fn poll_user_deadlines() {
+    crate::devmnt::poll_background();
     let now = plan9_arch::hal::timer::ms_since_boot();
     for proc in scheduler().procs.iter_mut() {
         poll_alarm(proc, now);
@@ -3564,7 +3729,27 @@ fn poll_user_deadlines() {
             proc.sleep_deadline = None;
             wake_child_wait(proc, 0);
         }
+        if let Some(mut pending) = proc.mount_io.take() {
+            if let Some(result) = pending.poll(proc) {
+                drop(pending);
+                wake_child_wait(proc, match result {
+                    Ok(count) => count as i64,
+                    Err(error) => error.to_isize() as i64,
+                });
+            } else {
+                proc.mount_io = Some(pending);
+            }
+        }
     }
+}
+
+fn wait_mount_io(proc: &mut Proc, mut pending: crate::devmnt::PendingIo) -> Result<usize> {
+    if let Some(result) = pending.poll(proc).or_else(|| pending.poll(proc)) {
+        return result;
+    }
+    proc.mount_io = Some(pending);
+    block_user(proc);
+    resume_next(ready_user(proc.pid))
 }
 
 /// ALARM - alarm clock
@@ -3646,6 +3831,9 @@ fn read_proc_wait(target: Pid, address: u64, size: usize) -> Result<usize> {
         reader.awaiting_message = Some((address, size));
     } else {
         let parent = crate::proc::find_proc(target).ok_or(Error::Ebadpid)?;
+        if parent.state == State::Broken {
+            return Err(Error::Enochild);
+        }
         if reader.uid != 0 && reader.uname != parent.uname {
             return Err(Error::Eperm);
         }
@@ -3889,10 +4077,16 @@ fn sys_internalthreadwait(frame: &SyscallFrame) -> Result<usize> {
 
 /// YIELD - yield processor.
 ///
-/// The prototype does not perform user-mode preemption, so a yield is
-/// recorded but does not schedule another user process.
 fn sys_internalyield(_frame: &SyscallFrame) -> Result<usize> {
     if let Some(current) = curproc_mut() {
+        crate::useredf::account(current, plan9_arch::hal::timer::ms_since_boot());
+        if crate::useredf::yield_job(current) {
+            if let Some(frame) = current.user_frame.as_mut() {
+                frame.set_ret(0);
+            }
+            set_user_ready(current);
+            resume_next(ready_user(current.pid));
+        }
         if let Some(next) = ready_user(current.pid).and_then(crate::proc::find_proc) {
             if let Some(frame) = current.user_frame.as_mut() {
                 frame.set_ret(0);
@@ -4248,20 +4442,9 @@ fn sys_internalflock(frame: &SyscallFrame) -> Result<usize> {
 /// * `0` on success
 /// * Error code on failure
 fn sys_internalsymlink(frame: &SyscallFrame) -> Result<usize> {
-    let target_ptr = frame.arg(0) as *const u8;
-    let link_ptr = frame.arg(1) as *const u8;
-    
-    // Read target path from user space
-    let target = read_cstring(target_ptr, 256)?;
-    
-    // Read link path from user space
-    let link = read_cstring(link_ptr, 256)?;
-    
-    // Create the symbolic link
-    match crate::vfs::symlink(target.as_bytes(), link.as_bytes()) {
-        Ok(()) => Ok(0),
-        Err(_e) => Err(Error::Einval),
-    }
+    let target = copy_cstring_from_user(frame.arg(0))?;
+    let link = copy_cstring_from_user(frame.arg(1))?;
+    crate::vfs::symlink(&target, &link).map(|()| 0).map_err(|_| Error::Einval)
 }
 
 /// READLINK - read symbolic link
@@ -4275,54 +4458,16 @@ fn sys_internalsymlink(frame: &SyscallFrame) -> Result<usize> {
 /// * Number of bytes read on success
 /// * Error code on failure
 fn sys_internalreadlink(frame: &SyscallFrame) -> Result<usize> {
-    let path_ptr = frame.arg(0) as *const u8;
-    let buf_ptr = frame.arg(1) as *mut u8;
+    let path = copy_cstring_from_user(frame.arg(0))?;
+    let address = frame.arg(1);
     let bufsize = frame.arg(2) as usize;
-    
-    // Read path from user space
-    let path = read_cstring(path_ptr, 256)?;
-    
-    // Create buffer for VFS to write into
-    let mut buf = alloc::vec![0u8; bufsize];
-    
-    // Read the symbolic link
-    match crate::vfs::readlink(path.as_bytes(), &mut buf) {
-        Ok(n) => {
-            // Copy data to user space
-            copy_to_user(buf_ptr, &buf[..n]);
-            Ok(n)
-        }
-        Err(_e) => Err(Error::Einval),
-    }
-}
-
-/// Read a null-terminated string from user space
-fn read_cstring(ptr: *const u8, max_len: usize) -> Result<alloc::string::String> {
-    if ptr.is_null() {
-        return Err(Error::Efault);
-    }
-    
-    let mut result = alloc::string::String::new();
-    for i in 0..max_len {
-        let byte = unsafe { core::ptr::read(ptr.add(i)) };
-        if byte == 0 {
-            break;
-        }
-        result.push(byte as char);
-    }
-    
-    Ok(result)
-}
-
-/// Copy data to user space
-fn copy_to_user(dest: *mut u8, src: &[u8]) {
-    if dest.is_null() || src.is_empty() {
-        return;
-    }
-    
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr(), dest, src.len());
-    }
+    let proc = curproc().ok_or(Error::Eperm)?;
+    user_buffer(proc, address, bufsize, true)?;
+    let mut buf = [0; 256];
+    let length = buf.len().min(bufsize);
+    let count = crate::vfs::readlink(&path, &mut buf[..length]).map_err(|_| Error::Einval)?;
+    put_user_bytes(proc, address, &buf[..count])?;
+    Ok(count)
 }
 
 // ============================================================================
@@ -4338,7 +4483,11 @@ fn is_user_addr(addr: u64) -> bool {
         (addr >> 60) == 0xF
     }
     // User space is 0x0 to 0x7FFFFFFFFFFF
-    #[cfg(not(target_arch = "loongarch64"))]
+    #[cfg(target_arch = "riscv64")]
+    {
+        addr < 1 << 38
+    }
+    #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
     {
         addr < 0x8000_0000_0000
     }

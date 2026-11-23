@@ -34,6 +34,7 @@ pub const MAX_FILE_NAME: usize = 256;
 pub const ROOTDEV: char = '/';
 
 const OCEXEC: u32 = 0x20;
+const OEXCL: u32 = 0x1000;
 
 /// Mount flags (Plan 9 semantics)
 pub const MBEFORE: u32 = 0x01;
@@ -438,6 +439,7 @@ pub fn namec(
 
     let components = rest.map(parse_path).unwrap_or_default();
     let mut union = current_path.as_deref().and_then(namespace_mounts);
+    let mut created = false;
 
     for (index, comp) in components.iter().copied().enumerate() {
         if comp.is_empty() || comp == b"." {
@@ -494,6 +496,7 @@ pub fn namec(
                     .ok_or(VfsError::Eperm)?.root;
                 let dev = devs_mut().get_mut(chan.dev).ok_or(VfsError::Enoent)?;
                 dev.create(&mut chan, name, mode as u8, perm).map_err(VfsError::from_dev_error)?;
+                created = true;
             } else {
                 return Err(VfsError::Enoent);
             }
@@ -507,6 +510,7 @@ pub fn namec(
                     NamecMode::Create(mode, perm) if index + 1 == components.len() => {
                         dev.create(&mut chan, name, mode as u8, perm)
                             .map_err(VfsError::from_dev_error)?;
+                        created = true;
                     }
                     _ => return Err(VfsError::Enoent),
                 }
@@ -515,6 +519,9 @@ pub fn namec(
         }
     }
 
+    if matches!(amode, NamecMode::Create(mode, _) if mode & OEXCL != 0) && !created {
+        return Err(VfsError::Eexists);
+    }
     if let NamecMode::Remove = amode {
         if let Some(dev) = devs_mut().get_mut(chan.dev) {
             dev.remove(&mut chan).map_err(VfsError::from_dev_error)?;
@@ -649,6 +656,10 @@ impl DevChanAdapter {
         Self { chan, directory_records: None }
     }
 
+    pub(crate) fn pending_names(&self, address: u64, size: usize) -> Option<crate::devmnt::PendingIo> {
+        crate::devmnt::PendingIo::list(&self.chan, address, size)
+    }
+
     fn read_channel(&mut self, buf: &mut [u8], interruptible: bool) -> crate::proc::Result<usize> {
         let device = devs_mut().get_mut(self.chan.dev).ok_or(crate::proc::Error::Eio)?;
         let offset = self.chan.offset;
@@ -761,6 +772,10 @@ impl crate::proc::Chan for DevChanAdapter {
         Some(self.chan.clone())
     }
 
+    fn io_device_chan(&self) -> Option<Chan> {
+        self.dev_chan()
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> crate::proc::Result<usize> {
         if self.chan.qid.type_ & dev::qidtype::DIR != 0 {
             self.read_directory(buf, false)
@@ -796,6 +811,10 @@ impl crate::proc::Chan for DevChanAdapter {
         if let Some(dev) = devs_mut().get_mut(self.chan.dev) {
             dev.close(&mut self.chan);
         }
+    }
+
+    fn pending_close(&mut self) -> Option<crate::devmnt::PendingClose> {
+        crate::devmnt::PendingClose::start(&mut self.chan)
     }
 
     fn dev(&self) -> usize {
@@ -865,7 +884,11 @@ pub(crate) fn alloc_fd(chan: Chan) -> Result<i32, VfsError> {
 }
 
 fn alloc_device_channel(chan: Chan, close_on_exec: bool) -> Result<i32, VfsError> {
-    alloc_channel(alloc::boxed::Box::new(DevChanAdapter::new(chan)), close_on_exec)
+    alloc_device_channel_in(fgrp().ok_or(VfsError::Eperm)?, chan, close_on_exec)
+}
+
+pub(crate) fn alloc_device_channel_in(group: &crate::proc::Fgrp, chan: Chan, close_on_exec: bool) -> Result<i32, VfsError> {
+    alloc_channel_in(group, alloc::boxed::Box::new(DevChanAdapter::new(chan)), close_on_exec)
 }
 
 pub(crate) fn fd_channel(fd: i32) -> Option<alloc::boxed::Box<dyn crate::proc::Chan>> {
@@ -875,20 +898,26 @@ pub(crate) fn fd_channel(fd: i32) -> Option<alloc::boxed::Box<dyn crate::proc::C
     fgrp().and_then(|f| f.get_channel(fd))
 }
 
-pub fn sys_open(path: &[u8], mode: u32) -> Result<i32, VfsError> {
+pub(crate) enum OpenResult {
+    Descriptor(i32),
+    Pending(crate::devmnt::PendingOpen),
+}
+
+pub(crate) fn sys_open(path: &[u8], mode: u32) -> Result<OpenResult, VfsError> {
     let close_on_exec = mode & OCEXEC != 0;
     let mode = mode & !OCEXEC;
-    let mut chan = namec(path, NamecMode::Open(mode), mode, 0)?;
+    let chan = namec(path, NamecMode::Open(mode), mode, 0)?;
     if let Some(image) = crate::procfs::open_exec_image(&chan, mode) {
-        return alloc_device_channel(image.map_err(VfsError::from_dev_error)?, close_on_exec);
+        return alloc_device_channel(image.map_err(VfsError::from_dev_error)?, close_on_exec).map(OpenResult::Descriptor);
     }
     if crate::devfd::is_descriptor(&chan) {
-        return alloc_channel(crate::devfd::reopen(&chan, mode).map_err(VfsError::from_dev_error)?, close_on_exec);
+        return alloc_channel(crate::devfd::reopen(&chan, mode).map_err(VfsError::from_dev_error)?, close_on_exec)
+            .map(OpenResult::Descriptor);
     }
     if crate::devsrv::is_service(&chan) {
         let published = crate::devsrv::open_service(&chan, mode as u8)
             .map_err(VfsError::from_dev_error)?;
-        return alloc_channel(published, close_on_exec);
+        return alloc_channel(published, close_on_exec).map(OpenResult::Descriptor);
     }
     if chan.qid.type_ & dev::qidtype::DIR != 0 && mode == 0 {
         if let Some(entries) = chan.namespace_path.as_deref().and_then(namespace_mounts) {
@@ -899,12 +928,17 @@ pub fn sys_open(path: &[u8], mode: u32) -> Result<i32, VfsError> {
                 }
                 return alloc_channel(alloc::boxed::Box::new(
                     UnionDirectory { directories, index: 0, offset: 0 },
-                ), close_on_exec);
+                ), close_on_exec).map(OpenResult::Descriptor);
             }
         }
     }
-    chan.open(mode as u8)?;
-    alloc_device_channel(chan, close_on_exec)
+    match crate::devmnt::PendingOpen::start(chan, mode as u8, close_on_exec) {
+        Ok(pending) => Ok(OpenResult::Pending(pending)),
+        Err(mut chan) => {
+            chan.open(mode as u8)?;
+            alloc_device_channel(chan, close_on_exec).map(OpenResult::Descriptor)
+        }
+    }
 }
 
 fn open_union(entries: Vec<MountEntry>) -> Vec<DevChanAdapter> {
@@ -914,12 +948,12 @@ fn open_union(entries: Vec<MountEntry>) -> Vec<DevChanAdapter> {
     }).collect()
 }
 
-pub(crate) fn list_names(path: &[u8], output: &mut [u8]) -> Result<usize, VfsError> {
+pub(crate) fn open_name_directories(path: &[u8]) -> Result<Vec<DevChanAdapter>, VfsError> {
     let mut chan = namec(path, NamecMode::Walk, 0, 0)?;
     if chan.qid.type_ & dev::qidtype::DIR == 0 {
         return Err(VfsError::Enotdir);
     }
-    let mut directories = match chan.namespace_path.as_deref().and_then(namespace_mounts) {
+    let directories = match chan.namespace_path.as_deref().and_then(namespace_mounts) {
         Some(entries) if entries.len() > 1 => open_union(entries),
         _ => {
             chan.open(0)?;
@@ -929,6 +963,10 @@ pub(crate) fn list_names(path: &[u8], output: &mut [u8]) -> Result<usize, VfsErr
     if directories.is_empty() {
         return Err(VfsError::Eperm);
     }
+    Ok(directories)
+}
+
+pub(crate) fn list_names(mut directories: Vec<DevChanAdapter>, output: &mut [u8]) -> Result<usize, VfsError> {
     let mut count = 0;
     let result = directories.iter_mut().try_for_each(|dir| {
         if count < output.len() {
@@ -943,7 +981,11 @@ pub(crate) fn list_names(path: &[u8], output: &mut [u8]) -> Result<usize, VfsErr
 }
 
 fn alloc_channel(chan: alloc::boxed::Box<dyn crate::proc::Chan>, close_on_exec: bool) -> Result<i32, VfsError> {
-    let fd = fgrp().ok_or(VfsError::Eperm)?.alloc_fd_with_exec_mode(chan, close_on_exec);
+    alloc_channel_in(fgrp().ok_or(VfsError::Eperm)?, chan, close_on_exec)
+}
+
+fn alloc_channel_in(group: &crate::proc::Fgrp, chan: alloc::boxed::Box<dyn crate::proc::Chan>, close_on_exec: bool) -> Result<i32, VfsError> {
+    let fd = group.alloc_fd_with_exec_mode(chan, close_on_exec);
     if fd < 0 { Err(VfsError::Enomem) } else { Ok(fd) }
 }
 

@@ -353,7 +353,7 @@ pub unsafe fn fpsave(state: &mut FpuState) {
 /// - Buffer must contain valid FPU state from a previous fpsave
 /// - Should only be called in kernel mode
 #[inline]
-pub unsafe fn fprestore(state: &mut FpuState) {
+pub unsafe fn fprestore(state: &FpuState) {
     core::arch::asm!(
         "fxrstor64 [{0}]",
         in(reg) state.data.as_ptr(),

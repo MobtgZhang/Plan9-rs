@@ -802,7 +802,8 @@ struct MenuEntry {
     subtitle: &'static str,
 }
 
-const MENU: [MenuEntry; 3] = [
+const CPU_SERVER_MENU_ENTRY: usize = 2;
+const MENU: [MenuEntry; 4] = [
     MenuEntry {
         icon: "▶",
         title: "Boot Plan 9 (Rust kernel)",
@@ -812,6 +813,11 @@ const MENU: [MenuEntry; 3] = [
         icon: "▶",
         title: "Boot Plan 9 (verbose)",
         subtitle: "same kernel, extra boot-time chatter",
+    },
+    MenuEntry {
+        icon: "▶",
+        title: "Boot Plan 9 (CPU service)",
+        subtitle: "attempt a restart after a kernel panic",
     },
     MenuEntry {
         icon: "⚙",
@@ -1328,9 +1334,18 @@ unsafe fn build_mb2_info(
     memmap: &[EfiMemoryDescriptor],
     fb: Option<LinearFramebuffer>,
     modules: &[(u64, u64, &str)],
+    cpu_service: bool,
 ) -> u64 {
     let mut w = TagWriter { buf: scratch, len: 8, cap };
     core::ptr::write_bytes(scratch, 0, 8);
+
+    if cpu_service {
+        let cmdline = b"service=cpu\0";
+        w.w32(1);
+        w.w32((8 + cmdline.len()) as u32);
+        w.bytes(cmdline);
+        w.align8();
+    }
 
     // BOOT_LOADER_NAME (type 2)
     let name = b"Plan9RustUEFI\0";
@@ -1786,6 +1801,7 @@ fn efi_main_impl(image_handle: EfiHandle, system_table: *const SystemTable) -> u
             mmap,
             framebuffer,
             &mods[..nmods],
+            choice == CPU_SERVER_MENU_ENTRY,
         );
 
         // Re-fetch the memory map QUIETLY right before ExitBootServices:

@@ -6,11 +6,9 @@
     .code64
 
 /* --------------------------------------------------------------------------
- * default_exception_handler is defined in Rust (plan9-arch idt.rs).
- * kernel_syscall_from_user is defined in the kernel crate (trap.rs).
- * Both are declared extern so the stubs can reference them.
+ * Syscall, interrupt and exception handlers are defined in kernel/trap.rs.
  * ----------------------------------------------------------------------- */
-    .extern default_exception_handler
+    .extern kernel_exception_from_kernel
     .extern kernel_syscall_from_user
     .extern kernel_interrupt_from_user
     .extern kernel_exception_from_user
@@ -52,15 +50,18 @@
 1:
     .endif
     .if \has_err
-        pop     %rsi
-        mov     0(%rsp), %rdx
+        mov     0(%rsp), %rsi
+        mov     8(%rsp), %rdx
         mov     $\vector, %rdi
     .else
         mov     0(%rsp), %rdx
         xor     %rsi, %rsi
         mov     $\vector, %rdi
     .endif
-    jmp     default_exception_handler
+    cld
+    andq    $-16, %rsp
+    call    kernel_exception_from_kernel
+    ud2
     .size   \name, . - \name
 .endm
 

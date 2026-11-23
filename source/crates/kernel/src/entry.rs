@@ -25,6 +25,7 @@ extern crate plan9_arch;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::frame_alloc;
 use crate::heap;
@@ -686,6 +687,10 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
         }
     };
     serial::put_bytes(b"[kernel] parse_boot_info done\n");
+    REBOOT_ON_PANIC.store(
+        boot_info.cmdline.as_str().split_ascii_whitespace().any(|word| word == "service=cpu"),
+        Ordering::Relaxed,
+    );
     let fb_cfg: Option<crate::entry::FramebufferConfig> = boot_info.framebuffer.clone();
 
     // GOP framebuffer is at physical 0x80000000. `early_paging_init`
@@ -829,6 +834,9 @@ pub extern "C" fn kstart(magic: u64, info: u64) -> ! {
     }
     serial::put_bytes(b"[kstart] timer::init_timer\n");
     crate::timer::init_timer();
+
+    #[cfg(feature = "panic-smoke")]
+    panic_smoke();
 
     // Step 4 — scheduler. `schedinit` builds the run queues and proc0.
     serial::put_bytes(b"[kstart] sched::schedinit\n");
@@ -1083,67 +1091,30 @@ fn init_registered_devices() {
     }
 }
 
-/// Push a synthetic IRET frame onto a fresh kernel page and invoke
-/// the `switch_to_user` trampoline. Never returns.
 fn switch_to_user(image: crate::init_loader::InitImage) -> ! {
+    #[cfg(not(target_arch = "riscv64"))]
     use plan9_arch::hal::switch_to_user;
 
-    // Allocate one fresh physical page from the frame allocator for
-    // the IRET frame. The kernel-side caller frame doesn't need to
-    // live anywhere particular since we never iretq back into it.
-    let frame_page = match crate::frame_alloc::frame_alloc_zeroed() {
-        Some(p) => p.as_u64(),
-        None => 0x0020_0000u64, // fallback: known-good identity-mapped low address
-    };
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        {
-            let frame_ptr = frame_page as *mut u64;
-            // scratch (consumed by the trampoline's `add rsp, 8`).
-            core::ptr::write_volatile(frame_ptr.add(0), 0);
-            // RIP
-            core::ptr::write_volatile(frame_ptr.add(1), image.entry);
-            // CS (user)
-            core::ptr::write_volatile(frame_ptr.add(2), switch_to_user::USER_CS as u64);
-            // RFLAGS
-            core::ptr::write_volatile(frame_ptr.add(3), switch_to_user::USER_RFLAGS_INIT);
-            // RSP
-            core::ptr::write_volatile(frame_ptr.add(4), image.user_sp);
-            // SS (user)
-            core::ptr::write_volatile(frame_ptr.add(5), switch_to_user::USER_DS as u64);
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            // aarch64 trampoline frame layout (see `build_user_frame`):
-            // [0] scratch, [1] entry, [2] pstate, [3] user SP.
-            // Build through the arch helper so the pstate bits are set
-            // correctly (EL0t, SP_EL0 active, interrupts enabled).
-            switch_to_user::build_user_frame(
-                frame_page,
-                image.entry,
-                image.user_sp,
-                0, // root table installed separately by the trampoline
-            );
-        }
-        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
-        {
-            // riscv64/loongarch64 trampoline frame layout (see
-            // `build_user_frame`): [0] scratch, [1] entry (sepc/ERA),
-            // [2] sstatus/PRMD, [3] user SP, [4] user root table.
-            // Without this the trampoline reads a zeroed frame and
-            // `sret`/`ertn`s into U-mode at PC=0 with SP=0.
-            switch_to_user::build_user_frame(
-                frame_page,
-                image.entry,
-                image.user_sp,
-                0, // root table installed separately by the trampoline
-            );
-        }
+    let proc = crate::proc::curproc_mut().expect("missing init process");
+    let mut frame = crate::proc::SavedUserFrame::default();
+    frame.set_entry(image.entry);
+    frame.set_stack(image.user_sp);
+    #[cfg(target_arch = "x86_64")]
+    {
+        frame.cs = switch_to_user::USER_CS as u64;
+        frame.ss = switch_to_user::USER_DS as u64;
+        frame.rflags = switch_to_user::USER_RFLAGS_INIT;
     }
-
-    let pml4_phys = image.pml4.as_u64();
+    #[cfg(target_arch = "aarch64")]
+    { frame.pstate = switch_to_user::USER_PSTATE_INIT; }
+    #[cfg(target_arch = "loongarch64")]
+    { frame.prmd = switch_to_user::USER_PRMD_INIT; }
     unsafe {
-        switch_to_user::switch_to_user_trampoline(pml4_phys, frame_page)
+        crate::userfp::init_boot();
+        #[cfg(target_arch = "riscv64")]
+        { frame.sstatus = crate::userfp::user_sstatus(); }
+        proc.user_frame = Some(frame);
+        crate::userfp::resume(proc)
     }
 }
 
@@ -1159,37 +1130,145 @@ fn hlt_loop() -> ! {
 // Panic Handler
 // ============================================================================
 
-/// Panic handler: print the message to serial and halt.
-/// With `panic = "abort"` in the workspace profile, this is never called at
-/// runtime but remains available for the compiler's lang item requirement.
+static PANICKING: AtomicBool = AtomicBool::new(false);
+static REBOOT_ON_PANIC: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "panic-smoke")]
+#[inline(never)]
+fn panic_smoke() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("ud2", options(noreturn));
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(".inst 0", options(noreturn));
+    }
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(".4byte 0", options(noreturn));
+    }
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!(".word 0", options(noreturn));
+    }
+}
+
+struct PanicConsole;
+
+impl core::fmt::Write for PanicConsole {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        for byte in text.bytes() {
+            #[cfg(target_arch = "x86_64")]
+            serial::putc(byte);
+            #[cfg(not(target_arch = "x86_64"))]
+            plan9_arch::hal::console::try_putc(byte);
+        }
+        Ok(())
+    }
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial::put_bytes(b"PANIC: ");
-    if let Some(s) = info.message().as_str() {
-        serial::put_bytes(s.as_bytes());
+    use core::fmt::Write;
+
+    plan9_arch::hal::cli();
+    if PANICKING.swap(true, Ordering::AcqRel) {
+        hlt_loop();
     }
-    if let Some(loc) = info.location() {
-        serial::put_bytes(b" at ");
-        serial::put_bytes(loc.file().as_bytes());
-        serial::put_bytes(b":");
-        let line = loc.line();
-        let mut n = line;
-        let mut digits = [0u8; 20];
-        let mut len = 0;
-        if n == 0 {
-            digits[0] = b'0';
-            len = 1;
-        } else {
-            while n > 0 && len < 20 {
-                digits[19 - len] = b'0' + (n % 10) as u8;
-                n /= 10;
-                len += 1;
+    let mut console = PanicConsole;
+    let _ = writeln!(console, "PANIC: {info}");
+    panic_backtrace(&mut console);
+    if REBOOT_ON_PANIC.load(Ordering::Relaxed) {
+        let _ = writeln!(console, "CPU server: attempting reboot");
+        let start = plan9_arch::hal::timer::ms_since_boot();
+        for _ in 0..100_000_000 {
+            if plan9_arch::hal::timer::ms_since_boot().saturating_sub(start) >= 1000 {
+                break;
             }
+            core::hint::spin_loop();
         }
-        for i in 0..len {
-            serial::put_bytes(&[digits[20 - len + i]]);
-        }
+        reboot_after_panic();
     }
-    serial::put_bytes(b"\n");
+    let _ = writeln!(console, "System halted.");
     hlt_loop();
+}
+
+#[inline(never)]
+fn panic_backtrace(console: &mut PanicConsole) {
+    use core::fmt::Write;
+
+    extern "C" {
+        static _bootstack_bottom: u8;
+        static _bootstack_top: u8;
+        static _text_start: u8;
+        static _text_end: u8;
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+        static _user_trap_area: u8;
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+        static _user_trap_end: u8;
+    }
+    let boot_stack = (&raw const _bootstack_bottom as usize)..(&raw const _bootstack_top as usize);
+    #[cfg(target_arch = "x86_64")]
+    let trap_stack = plan9_arch::hal::gdt::interrupt_stack_range();
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+    let trap_stack = (&raw const _user_trap_area as usize)..(&raw const _user_trap_end as usize);
+    let text = (&raw const _text_start as usize)..(&raw const _text_end as usize);
+    let (mut frame, stack): (usize, usize);
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("mov {frame}, rbp", "mov {stack}, rsp", frame = out(reg) frame, stack = out(reg) stack, options(nomem, nostack, preserves_flags));
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mov {frame}, x29", "mov {stack}, sp", frame = out(reg) frame, stack = out(reg) stack, options(nomem, nostack, preserves_flags));
+        #[cfg(target_arch = "riscv64")]
+        core::arch::asm!("mv {frame}, s0", "mv {stack}, sp", frame = out(reg) frame, stack = out(reg) stack, options(nomem, nostack));
+        #[cfg(target_arch = "loongarch64")]
+        core::arch::asm!("move {frame}, $fp", "move {stack}, $sp", frame = out(reg) frame, stack = out(reg) stack, options(nomem, nostack));
+    }
+    let _ = writeln!(console, "Kernel backtrace (return PCs, sp={stack:#x}):");
+    #[cfg(not(target_arch = "aarch64"))]
+    let bounds = [boot_stack, trap_stack];
+    #[cfg(target_arch = "aarch64")]
+    let bounds = [boot_stack];
+    let Some(bounds) = bounds.iter().find(|range| range.contains(&stack)) else { return };
+    for depth in 0..32 {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let record = frame;
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+        let record = frame.saturating_sub(16);
+        if record & 7 != 0 || record < stack || record > bounds.end - 16 {
+            break;
+        }
+        let (parent, return_pc) = unsafe {
+            let ptr = record as *const usize;
+            (ptr.read_volatile(), ptr.add(1).read_volatile())
+        };
+        if !text.contains(&return_pc) {
+            break;
+        }
+        let _ = writeln!(console, "  #{depth} {return_pc:#018x}");
+        if parent <= frame {
+            break;
+        }
+        frame = parent;
+    }
+}
+
+fn reboot_after_panic() {
+    #[cfg(target_arch = "x86_64")]
+    plan9_arch::hal::outb(0xcf9, 0x06);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("hvc #0", inout("x0") 0x8400_0009u64 => _, clobber_abi("C"), options(nostack));
+    }
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("ecall", in("a7") 0x5352_5354usize, in("a6") 0usize,
+            inout("a0") 1usize => _, inout("a1") 1usize => _, options(nostack));
+    }
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        let register = plan9_arch::loongarch64::mmu::mmio_phys_to_virt(0x100e_001e);
+        (register as *mut u8).write_volatile(0x42);
+    }
 }
