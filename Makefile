@@ -35,12 +35,12 @@ MEM        ?= 512
 PROJECT_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 SOURCE_DIR   := $(PROJECT_ROOT)/source
 BUILD_DIR    := $(PROJECT_ROOT)/build/$(ARCH)
-ISO_FILE     := $(BUILD_DIR)/plan9.iso
+ISO_FILE     = $(BUILD_DIR)/plan9.iso
 
 # Cargo commands should run from source/ where the workspace is.
 CARGO_CMD = cd $(SOURCE_DIR) && $(CARGO)
 
-.PHONY: all build-tool kernel init esp rootfs iso check-all clean run run-console run-serial boot-smoke net-smoke mount-smoke help
+.PHONY: all build-tool kernel init esp rootfs iso check-all clean run run-console run-serial boot-smoke net-smoke mount-smoke native-9p-smoke panic-smoke rc-diff help
 
 # =============================================================================
 # Build targets (delegate to build-tool)
@@ -102,12 +102,22 @@ QEMU_CMD = qemu-system-$(ARCH) $(QEMU_MACHINE_$(ARCH)) -m $(MEM) $(UEFI_ARGS) \
 run: QEMU_OUTPUT = -display gtk
 run-console: QEMU_OUTPUT = -display none -serial stdio
 run-serial: QEMU_OUTPUT = -display none -serial file:"$(BUILD_DIR)/serial.log"
-boot-smoke net-smoke mount-smoke: QEMU_OUTPUT = -display none -serial stdio
+boot-smoke net-smoke mount-smoke native-9p-smoke rc-diff: QEMU_OUTPUT = -display none -serial stdio
 boot-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" "$(ARCH)" "$(BUILD_DIR)/smoke-serial.log" --
 net-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --network "$(ARCH)" "$(BUILD_DIR)/net-serial.log" --
 mount-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --mount "$(ARCH)" "$(BUILD_DIR)/mount-serial.log" --
+native-9p-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --plan9port "$(PLAN9PORT)" $(if $(PLAN9_TICKET_PORT),--ticket-port "$(PLAN9_TICKET_PORT)") "$(ARCH)" "$(BUILD_DIR)/native-9p-serial.log" --
+rc-diff: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --rc-reference "$(RC_REFERENCE)" "$(ARCH)" "$(BUILD_DIR)/rc-diff-serial.log" --
 
-run run-console run-serial boot-smoke net-smoke mount-smoke: iso
+panic-smoke: BUILD_DIR := $(PROJECT_ROOT)/build/$(ARCH)/panic-smoke
+panic-smoke: QEMU_OUTPUT = -display none -serial stdio
+panic-smoke: build-tool
+	@test -f "$(UEFI_FW)" || { echo "No UEFI firmware for $(ARCH)." >&2; exit 1; }
+	cd "$(SOURCE_DIR)" && PLAN9_PANIC_SMOKE=1 $(CARGO) run -p build-tool -- --arch $(ARCH) --build-dir "$(BUILD_DIR)" iso
+	python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --panic "$(ARCH)" "$(BUILD_DIR)/halt-serial.log" -- $(QEMU_CMD) $(QEMU_OUTPUT)
+	python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --panic --cpu-service "$(ARCH)" "$(BUILD_DIR)/reboot-serial.log" -- $(QEMU_CMD) $(QEMU_OUTPUT)
+
+run run-console run-serial boot-smoke net-smoke mount-smoke native-9p-smoke rc-diff: iso
 	@test -f "$(UEFI_FW)" || { echo "No UEFI firmware for $(ARCH); set UEFI_FW_$(ARCH)." >&2; exit 1; }
 	@if [ "$(ARCH)" = "riscv64" ] || [ -n "$(UEFI_VARS)" ]; then \
 		test -f "$(UEFI_VARS)" || { echo "No UEFI variables image for $(ARCH); set UEFI_VARS_$(ARCH)." >&2; exit 1; }; \
@@ -139,6 +149,10 @@ help:
 	@echo "  boot-smoke   - Test the GOP menu, graphical keyboard and shell"
 	@echo "  net-smoke    - Test DHCP, ICMP, TCP and UDP in QEMU"
 	@echo "  mount-smoke  - Test authenticated 9P mounts and remote file operations in QEMU"
+	@echo "  native-9p-smoke - Test factotum, Fossil and Venti with PLAN9PORT=/path/to/plan9port"
+	@echo "                    Set PLAN9_TICKET_PORT to test an independent Plan 9 authsrv instead"
+	@echo "  panic-smoke  - Test panic diagnostics, halt and restart in QEMU"
+	@echo "  rc-diff      - Compare shell behavior with RC_REFERENCE=/path/to/plan9port/bin/rc"
 	@echo ""
 	@echo "Variables:"
 	@echo "  ARCH=x86_64|aarch64|riscv64|loongarch64"

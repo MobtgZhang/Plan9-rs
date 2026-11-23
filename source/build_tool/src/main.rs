@@ -239,7 +239,7 @@ impl Builder {
             "clear", "env", "basename", "dirname", "true", "false", "cmp", "diff",
             "nl", "more", "rmdir", "ln", "uptime", "who", "expr", "fortune",
             "units", "dc", "ed", "yes", "tty", "uname", "printf",
-            "ping", "netcat", "ipconfig", "snoopy", "traceroute", "bind", "mount", "unmount",
+            "ping", "netcat", "ipconfig", "snoopy", "traceroute", "bind", "mount", "unmount", "snap",
         ] {
             let src = release.join(name);
             if !src.exists() {
@@ -545,7 +545,8 @@ impl Builder {
         
         // Build kernel with the bare-metal target and release profile.
         let mut cmd = std::process::Command::new("cargo");
-        cmd.arg("build")
+        cmd.current_dir(self.source_dir.join("crates/kernel"))
+           .arg("build")
            .arg("-p")
            .arg("plan9-kernel")
            .arg("--manifest-path")
@@ -553,6 +554,9 @@ impl Builder {
            .arg("--target")
            .arg(self.kernel_triple())
            .arg("--release");
+        if std::env::var_os("PLAN9_PANIC_SMOKE").is_some_and(|value| value == "1") {
+            cmd.args(["--features", "panic-smoke"]);
+        }
         let status = cmd.status().context("Failed to build kernel")?;
         if !status.success() {
             anyhow::bail!("kernel build failed");

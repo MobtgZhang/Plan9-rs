@@ -2,12 +2,16 @@
 """Verify the GOP menu, kernel display and interactive shell in QEMU."""
 
 import argparse
+from contextlib import contextmanager
+from http.client import HTTPConnection
 import json
 import os
 from pathlib import Path
+import pty
 from queue import Empty, Queue
 import re
 import selectors
+import signal
 import socket
 import struct
 import subprocess
@@ -15,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+import tty
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -22,7 +27,7 @@ PROMPT = re.compile(rb"(?:root|glenda)@plan9:[^\r\n]*> ")
 COMMANDS = b"""
 basename bind cat chmod chown clear cmp cp cut date dc diff dirname du echo ed env expr
 false fortune grep group head hostname id ipconfig kill ln ls mkdir more mount mv netcat nl passwd ping printf
-ps pwd rc rm rmdir seq sleep snoopy sort stat su tail tee test time touch tr traceroute true tty uname
+ps pwd rc rm rmdir seq sleep snap snoopy sort stat su tail tee test time touch tr traceroute true tty uname
 uniq units unmount uptime useradd usermod wc who whoami yes
 """.split()
 HELP_FOOTER = b"redirection: < > >>    pipelines: cmd | cmd    lists: cmd ; cmd"
@@ -30,6 +35,8 @@ MENU_MARKER = b"bootloader: GOP menu"
 FRAMEBUFFER_MARKER = b"bootloader: GOP linear framebuffer found"
 INTERACTIVE_SELECTION = b"bootloader: selected Boot Plan 9 (verbose)"
 UDP_HEADERS_READY = re.compile(rb"netcat: UDP headers ready\r?\n")
+P9SK1_TICKET_REQUEST_SIZE = 141
+P9SK1_TICKET_PAIR_SIZE = 144
 
 
 class SerialShell:
@@ -64,9 +71,9 @@ class SerialShell:
         self.process.stdin.write(command + b"\r")
         self.process.stdin.flush()
 
-    def command(self, command):
+    def command(self, command, timeout=25):
         self.send(command)
-        return self.read_prompt(25)
+        return self.read_prompt(timeout)
 
 
 class Qmp:
@@ -175,6 +182,182 @@ def check_boot(arch, shell, qmp, output_dir):
     check_rc_and_processes(shell)
 
 
+def check_panic(shell, qmp, arch, cpu_service):
+    shell.read_until(re.compile(MENU_MARKER), 90, "UEFI GOP menu")
+    if cpu_service:
+        qmp.key("down")
+        qmp.key("down")
+    qmp.key("ret")
+    message = {
+        "x86_64": rb"x86 kernel exception: vector=6 error=0x0 rip=0x[0-9a-f]+ cr2=0x[0-9a-f]+",
+        "aarch64": rb"aarch64 kernel exception: ESR=0x(?:0|2000000) FAR=0x[0-9a-f]+ ELR=0x[0-9a-f]+",
+        "riscv64": rb"RISC-V trap: scause=0x2 sepc=0x[0-9a-f]+ stval=0x[0-9a-f]+",
+        "loongarch64": rb"LoongArch kernel fault: ecode=13 ESTAT=0x[0-9a-f]+ ERA=0x[0-9a-f]+ BADV=0x[0-9a-f]+",
+    }[arch]
+    shell.read_until(re.compile(rb"PANIC: [^\n]*\n\s*" + message), 45, "illegal kernel instruction panic")
+    shell.read_until(re.compile(rb"Kernel backtrace .*\n\s*#0 0x[0-9a-f]+"), 5, "kernel backtrace")
+    if cpu_service:
+        shell.read_until(re.compile(rb"CPU server: attempting reboot"), 5, "panic reboot decision")
+        shell.read_until(re.compile(MENU_MARKER), 90, "UEFI menu after reset")
+    else:
+        shell.read_until(re.compile(rb"System halted\."), 5, "panic halt decision")
+        try:
+            shell.read_until(re.compile(MENU_MARKER), 2, "unexpected terminal reset")
+        except TimeoutError:
+            return
+        raise RuntimeError("terminal mode restarted after announcing a halt")
+
+
+RC_DIFF_CASES = {
+    "comments and blank lines": "# comment\n\necho visible # trailing comment\n",
+    "literal quotes": "echo 'a b' 'isn''t' '$x' '[a-z]*' ''",
+    "utf8 literals": "echo '网络' 'é'",
+    "adjacent quoted words": "echo un'quoted'^suffix",
+    "concat broadcasting": "echo pre^(one two)^post; echo (a b)^(x y)",
+    "concat length error": "echo (a b)^(x y z)",
+    "list slices": "x=(a b c d); echo $x(2 3-4); echo $x(2-)",
+    "subscript boundaries": "x=(a b c d); echo before $x(0 4 3-2 8 2-99) after",
+    "empty and undefined values": "empty=(); echo $#empty $#missing; echo before $missing after",
+    "indirect variable": "name=value; value=(red blue); echo $$name",
+    "join variable": "value=(red blue); echo $\"value",
+    "command-local assignment": "x=outer; x=inner rc -c 'echo $x'; echo $x",
+    "assignment preserves status": "~ a b; x=ready; echo $x $status",
+    "function parameters": "fn greet { echo $#* $1 $2 }; greet a b; greet c",
+    "implicit for after shift": "fn args { shift; for (item) echo $item }; args one two three",
+    "function aliases": "fn one two { echo $#* $* }; one a; two b c; fn one two",
+    "remove function": "fn demo { echo yes }; demo; fn demo",
+    "function definition and removal preserve status": "~ a b; fn demo { true }; echo $status; ~ a b; fn demo; echo $status",
+    "if and if not": "if(~ a a) echo then\nif not echo impossible\nif(~ a b) echo impossible\nif not echo else\n",
+    "for list": "for(x in a b c) echo $x",
+    "while loop": "x=(a b c); while(! ~ $#x 0) { echo $x(1); x=$x(2-) }",
+    "while final condition status": "while (~ yes no) echo wrong; echo 'status='^$status",
+    "while condition runs in shell": "x=(a b); while (x=$x(2-); ! ~ $#x 0) echo $x; echo 'count='^$#x",
+    "for variable restoration": "x=outer; for (x in a b) echo $x; echo $x",
+    "empty list concatenation": "x=(); echo first $x^suffix last",
+    "function scope restoration": "x=outer; fn change { x=$1 }; @ change inner; echo $x",
+    "switch and patterns": "switch(blues) { case red; echo no; case bl* green; echo yes; case *; echo no }",
+    "unmatched switch preserves status": "~ a b; switch (x) { case y; echo wrong }; echo $status",
+    "pattern classes": "~ abc [ab]b? && echo matched; ~ abc [~a]* || echo not-matched",
+    "conditional lists": "~ a a && echo yes; ~ a b && echo no; ~ a b || echo fallback; ! ~ a b",
+    "errexit inside negation": "rc -e -c '! ~ a b; echo unreachable'",
+    "negation can be tested with errexit": "rc -e -c '! ~ a b || echo fallback; echo continued'",
+    "negation result does not trigger errexit": "rc -e -c '! ~ a a; echo continued'",
+    "group scope": "x=a; { x=b; echo $x }; @ { x=c; echo $x }; echo $x",
+    "pipeline": "echo 'pipe data' | cat",
+    "multiline pipeline": "echo pipe |\ncat &&\necho after\n",
+    "pipeline status": "echo pipe | rc -c 'exit failed'",
+    "alternate pipe descriptors": "echo alternate >[1=2] |[2] cat",
+    "command substitution": "ifs=:; x=`{echo 'one:two'}; echo $#x $x(1)",
+    "empty ifs in command substitution": "ifs=(); x=`{echo 'one two'}; echo $#x $x",
+    "nested substitution": "echo `{@ { echo `{echo nested} }}",
+    "argument expansion order": "echo `{echo left >> trace; echo a} `{echo right >> trace; echo b}; cat trace; rm trace",
+    "list expansion order": "echo (`{echo first >> trace; echo a} `{echo second >> trace; echo b}); cat trace; rm trace",
+    "concatenation expansion order": "echo `{echo left >> trace; echo a}^`{echo right >> trace; echo b}; cat trace; rm trace",
+    "match expansion order": "~ `{echo subject >> trace; echo a} `{echo pattern >> trace; echo a}; cat trace; rm trace",
+    "process substitution": "cat <{echo process-substitution}",
+    "process substitution quoting": "cat <{'echo' 'space and ''quotes'''}",
+    "files and append redirection": "echo first >out; echo second >>out; cat <out; rm out",
+    "redirection alone preserves status": "~ a b; >out; echo $status; cat out; rm out",
+    "background launch preserves status": "~ a b; { true } & echo $status; wait; true",
+    "fd duplication": "echo redirected >[1=2]",
+    "here document": "x=expanded\ncat <<EOF\n$x\nEOF\n",
+    "quoted here document": "x=expanded\ncat <<'EOF'\n$x\nEOF\n",
+    "here document at pipeline boundary": "cat <<EOF | cat\npiped\nEOF\n",
+    "multiple here documents": "cat <<ONE <<TWO\nfirst\nONE\nsecond\n\nTWO\n",
+    "here document variable boundaries": "x=(one two)\ncat <<EOF\n$x! $x^suffix $$x $?\nEOF\n",
+    "sigexit stays local": "rc -c 'fn sigexit { echo exit-trap }; exit'; rc -c 'exit ''custom status''' || echo failed",
+    "failure after output": "echo before-failure; exit failure",
+    "exit success": "exit ''",
+    "exit failure": "exit 'error with spaces'",
+    "syntax error": "echo unexpected )",
+    "quoted variable name": "'with space'=present; echo $'with space'",
+    "subscript expansion order": "x=(one two); echo $x(`{echo first >> trace; echo 1} `{echo second >> trace; echo 2}); cat trace; rm trace",
+    "dynamic variable name followed by a separate list": "x=(one two); echo $`{echo name >> trace; echo x}(`{echo index >> trace; echo 2}); cat trace; rm trace",
+    "subscript numeric prefixes": "x=(one two three); echo begin $x(2x 1-2x x2 2--1) end",
+    "count and join with subscripts": 'x=(one two three); echo $#x(2) $"x(1 3)',
+    "empty substitution with no separators": "ifs=(); echo before `{true} after; echo $#ifs",
+    "substitution keeps selected separators": "ifs=:; echo `{echo ':one::two:'}",
+    "nested lists": "echo (() ((one)) (two (three four)) ())",
+    "white space subject matching": "~ (a b) 'a b' && echo match",
+    "empty switch": "switch(x) {}; echo unexpected",
+    "case without patterns": "switch(()) { case; echo unexpected; case ''; echo matched }",
+    "case fallthrough is disabled": "switch(x) { case x; echo match; case *; echo unexpected }",
+    "character class edge cases": "~ ']' []] && echo bracket; ~ - [-a] && echo leading; ~ b [z-a] && echo descending; ~ a [a-] && echo trailing; true",
+    "quoted and unquoted wildcard": "~ 'a*bc' 'a*'^b* && echo matched; ~ 'axb' 'a*'^b* || echo literal",
+    "glob sorts names and includes hidden files": "mkdir names; >names/z; >names/a; >names/.hidden; echo names/* names/.*; rm names/z names/a names/.hidden; rm names",
+    "unmatched glob preserves spelling": "echo /tmp/rc-differential/nonexistent*/item",
+    "explicit line continuation": "echo first\\\nsecond",
+    "empty for preserves status": "~ a b; for(x in) echo unexpected; echo $status",
+    "multiple scoped assignments": "x=outer; x=inner y=$x rc -c 'echo $x $y'; echo $x $#y",
+    "assignment pipeline scope": "x=outer; x=inner echo $x | cat; echo $x",
+    "three-stage pipeline and failure status": "echo input | cat | cat; rc -c 'exit left' | true | rc -c 'exit right' || echo failed",
+    "tested pipeline with errexit": "rc -e -c 'rc -c ''exit failed'' | true || echo caught; echo continued'",
+    "dangling if not": "echo before; if not echo unexpected; echo after",
+    "if not cannot follow a grouped if": "{ if(~ a b) echo no }; if not echo unexpected",
+    "if not cannot repeat": "if(~ a b) echo no; if not echo unused; if not echo unexpected",
+    "if not follows blank lines": "if(~ a b) echo no\n\n# comment\nif not echo yes",
+    "explicit empty if body": "if(~ a a) ; if not echo unexpected; echo after",
+    "write-side process substitution": "echo `{echo input > >{cat}}",
+    "literal followed by unspaced parentheses": "echo plain(one two)",
+    "quoted literal followed by unspaced parentheses": "echo 'plain'(one two)",
+    "adjacent parenthesized lists stay separate": "echo (a b)(c d)",
+    "parenthesized list requires explicit concatenation": "echo (a b)tail; echo (a b)^tail",
+    "command substitution requires explicit suffix concatenation": "echo `{echo word}suffix; echo `{echo word}^suffix",
+    "subscript requires explicit suffix concatenation": "x=(one two); echo $x(1)suffix; echo $x(1)^suffix",
+    "process substitution starts a new word after a literal": "fn fields { echo $#* }; fields x<{true}",
+}
+
+
+def rc_quote(value):
+    return b"'" + value.replace(b"'", b"''") + b"'"
+
+
+def run_rc_reference(reference, script, directory, environment, name, timeout=10):
+    with subprocess.Popen([reference, "-Y", script], cwd=directory, env=environment, start_new_session=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise RuntimeError(f"reference rc timed out in {name!r}") from error
+        return process.returncode, stdout, stderr
+
+
+def check_rc_reference(shell, reference):
+    reference = Path(reference).resolve(strict=True)
+    environment = dict(os.environ, PLAN9=str(reference.parent.parent), LC_ALL="C",
+                       PATH=f"{reference.parent}{os.pathsep}{os.defpath}")
+    failures = []
+    script_path = b"/tmp/rc-differential/test.rc"
+    shell.command(b"mkdir /tmp/rc-differential")
+    with tempfile.TemporaryDirectory(prefix="plan9-rc-differential-") as directory:
+        script = Path(directory) / "test.rc"
+        for name, source in RC_DIFF_CASES.items():
+            script.write_text(source.rstrip("\n") + "\n", encoding="utf-8")
+            exit_code, stdout, stderr = run_rc_reference(reference, script, directory, environment, name)
+            lines = script.read_bytes().splitlines()
+            for index, line in enumerate(lines[:-1]):
+                mode = b">" if index == 0 else b">>"
+                shell.command(b"printf '%s\\n' " + rc_quote(line) + b" " + mode + script_path)
+            mode = b">>" if len(lines) > 1 else b">"
+            wrapped = (b"printf '%s\\n' " + rc_quote(lines[-1]) + b" " + mode + script_path + b" && "
+                       b"@ { cd /tmp/rc-differential && rc test.rc >[2]/dev/null } "
+                       b"&& echo __RC_DIFF_OK__ || echo __RC_DIFF_FAILED__")
+            guest = shell.command(wrapped).partition(b"\n")[2].splitlines()
+            status = guest.pop() if guest else b""
+            expected_status = b"__RC_DIFF_OK__" if exit_code == 0 else b"__RC_DIFF_FAILED__"
+            if status != expected_status or stdout.splitlines() != guest:
+                failures.append(f"{name}: reference={stdout!r} ({exit_code}), guest={guest!r} ({status!r}); "
+                                f"reference stderr={stderr!r}")
+    if failures:
+        raise RuntimeError("rc differential failures:\n" + "\n".join(failures))
+    print(f"Compared {len(RC_DIFF_CASES)} cases with {reference} -Y")
+
+
 def check_rc_and_processes(shell):
     def expect(command, expected):
         output = shell.command(command).partition(b"\n")[2].splitlines()
@@ -191,7 +374,8 @@ def check_rc_and_processes(shell):
     expect(b"item=outside; for (item in inside) echo $item; echo after-$item", b"after-outside")
     expect(b"mkdir /tmp/rc-glob-assign; touch /tmp/rc-glob-assign/one /tmp/rc-glob-assign/two; "
            b"files=/tmp/rc-glob-assign/*; echo count-$#files", b"count-2")
-    expect(b"echo $(values)(0 3 2- 99 wrong)", b"three two three")
+    expect(b"echo $values(0 3 2- 99 wrong)", b"three two three")
+    expect(b"echo $(values)(0 3 2- 99 wrong)", b"one two three 0 3 2- 99 wrong")
     expect(b"~ (one two) 'one two' && ! ~ (one two) one && echo match-list", b"match-list")
     expect(b"switch (one two) { case 'one two'; echo switch-list }", b"switch-list")
     expect("~ '甲' ? && ~ '乙' [甲乙] && ~ 'b' [c-a] && echo rune-match".encode(), b"rune-match")
@@ -244,7 +428,7 @@ def check_rc_and_processes(shell):
     if output != [b"here text! $ firstarg !", "$变量*名^! $$ $1^arg $!".encode()]:
         raise RuntimeError(f"unexpected here-document expansion: {output!r}")
     expect(b"{ echo background } & wait", b"background")
-    expect(b"{ while (! test -f /tmp/ctl-done) true } & p=$apid; "
+    expect(b"{ while (! test -f /tmp/ctl-done) true; true } & p=$apid; "
            b"echo stop > /proc/$p/ctl && echo waitstop > /proc/$p/ctl && echo startsyscall > /proc/$p/ctl && "
            b"echo startstop > /proc/$p/ctl && "
            b"echo start > /proc/$p/ctl && touch /tmp/ctl-done && wait $p && echo ctl-ok", b"ctl-ok")
@@ -259,7 +443,7 @@ def check_rc_and_processes(shell):
     expect(b"{ sleep 1 } & p=$apid; echo waitstop > /proc/$p/ctl || echo waitstop-exit; wait $p", b"waitstop-exit")
     expect(b"/bin/aux/procsmoke", b"proc-smoke-ok")
     shell.command(b"fn sigint { echo interrupt-note }; fn sigterm { echo term-note }")
-    shell.command(b"{ while (! test -f /tmp/note-done) true } & p=$apid; echo stop > /proc/$p/ctl")
+    shell.command(b"{ while (! test -f /tmp/note-done) true; true } & p=$apid; echo stop > /proc/$p/ctl")
     output = expect(b"echo interrupt > /proc/$p/note && echo term > /proc/$p/notepg && "
                     b"echo start > /proc/$p/ctl && touch /tmp/note-done && wait $p && echo notes-ok", b"notes-ok")
     if output != [b"interrupt-note", b"term-note", b"notes-ok"]:
@@ -363,18 +547,20 @@ def check_system_files(shell, arch):
     check_help(shell.command(b"help"))
 
 
-def serve_9p(listener, factotum=False):
+def serve_9p(listener, factotum=False, disconnect=False):
     def string(value):
         return struct.pack("<H", len(value)) + value
 
+    directories = (b"", b"listing", b"dir-one", b"dir-two", b"list-one", b"list-two", b"list-cancel")
+
     def qid(name):
-        kind = 0x80 if name in (b"", b"listing") else 0x08 if name == b"@auth" else 0
-        path = 3 if name == b"listing" else 2 if name else 1
+        kind = 0x80 if name in directories else 0x08 if name == b"@auth" else 0
+        path = 4 + directories.index(name) if name in directories else 2
         return struct.pack("<BIQ", kind, 0, path)
 
     def stat(name, content):
         mode = modes.get(name, 0o666)
-        if name in (b"", b"listing"):
+        if name in directories:
             mode |= 0x80000000
         fields = (struct.pack("<HI", 0, 0) + qid(name)
                   + struct.pack("<IIIQ", mode, 0, 0, len(content))
@@ -384,7 +570,18 @@ def serve_9p(listener, factotum=False):
     files = {b"rpc": bytearray()} if factotum else {
         b"remote": bytearray(b"hello-9p\n"), b"flush": bytearray(b"after-flush\n"),
         b"flush-race": bytearray(b"completed\n"), b"listing": bytearray(),
+        b"dir-one": b"1", b"dir-two": b"2",
+        b"parallel-one": b"1", b"parallel-two": b"2", b"cancel-one": b"1", b"cancel-two": b"2",
+        b"shared-offset": b"12", b"killed": b"", b"kill-ready": b"r", b"kill-done": b"d",
+        b"metadata-one": b"1", b"metadata-two": b"22", b"stat-cancel": b"cancel",
+        b"path-one": b"1", b"path-two": b"22", b"path-cancel": b"cancel",
+        b"clunk-hold": b"", b"clunk-ready": b"c", b"clunk-read": b"r",
+        b"open-one": b"1", b"open-two": b"2", b"open-cancel": b"o",
+        b"open-kill": b"", b"open-kill-ready": b"r", b"open-kill-done": b"d",
+        b"list-one": b"one", b"list-two": b"two", b"list-cancel": b"first",
     }
+    if disconnect:
+        files = {b"drop-one": b"", b"drop-two": b""}
     modes = {}
     fids = {}
     requests = []
@@ -401,6 +598,22 @@ def serve_9p(listener, factotum=False):
     rpc_reply = b""
     canceled = None
     flushed = set()
+    held = {}
+    reversed_requests = False
+    reversed_directories = False
+    reversed_lists = False
+    writes = {}
+    reversed_writes = False
+    metadata = {b"metadata": {}, b"path": {}}
+    reversed_metadata = set()
+    opened = set()
+    open_pair = {}
+    reversed_opens = False
+    open_flush_tag = None
+    open_kill_released = False
+    clunk_tag = None
+    completed_clunks = 0
+    shared_offset = 0
     with listener.accept()[0] as connection:
         connection.settimeout(25)
         with connection.makefile("rb") as reader:
@@ -422,8 +635,11 @@ def serve_9p(listener, factotum=False):
                     payload = qid(b"@auth")
                 elif kind == 104:
                     fid, auth = struct.unpack_from("<II", body)
-                    if factotum and auth != 0xFFFFFFFF or not factotum and auth not in auth_success:
+                    if auth not in ({0xFFFFFFFF} if factotum or disconnect else auth_success):
                         raise RuntimeError(f"invalid 9P attach auth fid {auth}")
+                    aname = b"" if factotum or disconnect else b"test-tree"
+                    if body[8:] != string(b"root") + string(aname):
+                        raise RuntimeError(f"invalid attach request {body!r}")
                     fids[fid] = b""
                     payload = qid(b"")
                 elif kind == 108:
@@ -432,6 +648,15 @@ def serve_9p(listener, factotum=False):
                     flushed.add(canceled[1])
                     if canceled[2]:
                         connection.sendall(canceled[2])
+                    if canceled[1] == b"cancel-one":
+                        other = held.pop(b"cancel-two", None)
+                        if other is None or other == canceled[0]:
+                            raise RuntimeError("Tflush did not isolate two outstanding requests")
+                        connection.sendall(struct.pack("<IBHIc", 12, 117, other, 1, b"2"))
+                    if canceled[1] == b"open-kill":
+                        open_flush_tag = tag
+                        canceled = None
+                        continue
                     canceled = None
                 elif kind == 110:
                     fid, newfid, count = struct.unpack_from("<IIH", body)
@@ -442,8 +667,25 @@ def serve_9p(listener, factotum=False):
                         fids[newfid] = name
                         payload = struct.pack("<H", count) + (qid(name) if count else b"")
                 elif kind == 112:
-                    name = fids[struct.unpack_from("<I", body)[0]]
+                    fid = struct.unpack_from("<I", body)[0]
+                    name = fids[fid]
+                    if name in (b"open-cancel", b"open-kill") and name not in flushed:
+                        canceled = (tag, name, b"")
+                        if name == b"open-kill" and (ready := held.pop(b"open-kill-ready", None)) is not None:
+                            connection.sendall(struct.pack("<IBHIc", 12, 117, ready, 1, b"r"))
+                        continue
+                    opened.add(fid)
                     payload = qid(name) + struct.pack("<I", 64 if name == b"chunked" else 0)
+                    if name in (b"open-one", b"open-two"):
+                        if name in open_pair or tag in (entry[0] for entry in open_pair.values()):
+                            raise RuntimeError("invalid overlapping open requests")
+                        open_pair[name] = (tag, payload)
+                        if len(open_pair) == 2:
+                            for pending_tag, data in reversed(open_pair.values()):
+                                connection.sendall(struct.pack("<IBH", len(data) + 7, 113, pending_tag) + data)
+                            open_pair.clear()
+                            reversed_opens = True
+                        continue
                 elif kind == 114:
                     fid, length = struct.unpack_from("<IH", body)
                     name = body[6:6 + length]
@@ -456,6 +698,84 @@ def serve_9p(listener, factotum=False):
                     if name == b"chunked" and count > 64:
                         raise RuntimeError(f"request exceeds iounit: {count}")
                     if kind == 116:
+                        if name in (b"list-one", b"list-two") and offset == 0:
+                            if name in held or tag in held.values():
+                                raise RuntimeError("invalid overlapping LIST reads")
+                            held[name] = tag
+                            if len(held) == 2:
+                                for directory, pending_tag in reversed(held.items()):
+                                    data = stat(files[directory], b"")
+                                    connection.sendall(struct.pack("<IBHI", 11 + len(data), 117, pending_tag, len(data)) + data)
+                                held.clear()
+                                reversed_lists = True
+                            continue
+                        if name in (b"dir-one", b"dir-two"):
+                            if offset != 0 or name in held or tag in held.values():
+                                raise RuntimeError("invalid overlapping directory reads")
+                            held[name] = tag
+                            if len(held) == 2:
+                                for directory, pending_tag in reversed(held.items()):
+                                    data = stat(files[directory], b"")
+                                    connection.sendall(struct.pack("<IBHI", 11 + len(data), 117, pending_tag, len(data)) + data)
+                                held.clear()
+                                reversed_directories = True
+                            continue
+                        if name.startswith((b"parallel-", b"drop-")):
+                            if name in held or tag in held.values():
+                                raise RuntimeError("duplicate in-flight 9P request")
+                            held[name] = tag
+                            if len(held) == 2:
+                                if disconnect:
+                                    return
+                                for file_name, pending_tag in reversed(held.items()):
+                                    connection.sendall(struct.pack("<IBHIc", 12, 117, pending_tag, 1, files[file_name]))
+                                held.clear()
+                                reversed_requests = True
+                            continue
+                        if name == b"cancel-one":
+                            canceled = (tag, name, b"")
+                            continue
+                        if name == b"cancel-two":
+                            held[name] = tag
+                            continue
+                        if name == b"killed":
+                            canceled = (tag, name, b"")
+                            if (ready := held.pop(b"kill-ready", None)) is not None:
+                                connection.sendall(struct.pack("<IBHIc", 12, 117, ready, 1, b"r"))
+                            continue
+                        if name == b"kill-ready" and (canceled is None or canceled[1] != b"killed"):
+                            held[name] = tag
+                            continue
+                        if name == b"kill-done" and b"killed" not in flushed:
+                            raise RuntimeError("killing a blocked process did not flush its 9P request")
+                        if name == b"open-kill-ready" and (canceled is None or canceled[1] != b"open-kill"):
+                            held[name] = tag
+                            continue
+                        if name == b"open-kill-done":
+                            if open_flush_tag is None:
+                                raise RuntimeError("killing a blocked opener did not flush its Topen")
+                            connection.sendall(struct.pack("<IBHIc", 12, 117, tag, 1, b"d"))
+                            connection.sendall(struct.pack("<IBH", 7, 109, open_flush_tag))
+                            open_flush_tag = None
+                            open_kill_released = True
+                            continue
+                        if name == b"clunk-ready" and clunk_tag is None:
+                            held[name] = tag
+                            continue
+                        if name == b"clunk-read":
+                            if clunk_tag is None:
+                                raise RuntimeError("read did not overlap a pending clunk")
+                            connection.sendall(struct.pack("<IBHIc", 12, 117, tag, 1, b"r"))
+                            connection.sendall(struct.pack("<IBH", 7, 121, clunk_tag))
+                            clunk_tag = None
+                            completed_clunks += 1
+                            continue
+                        if name == b"shared-offset":
+                            if offset != shared_offset or count != 1:
+                                raise RuntimeError(f"invalid shared fid read: offset={offset}, count={count}")
+                            if offset == 0:
+                                time.sleep(0.25)
+                            shared_offset += offset < len(files[name])
                         if name in (b"flush", b"flush-race") and name not in flushed:
                             partial = b""
                             if name == b"flush-race":
@@ -465,11 +785,11 @@ def serve_9p(listener, factotum=False):
                                 partial = complete[3:]
                             canceled = (tag, name, partial)
                             continue
-                        if name == b"listing":
-                            first = stat(b"first", b"")
+                        if name in (b"listing", b"list-one", b"list-two", b"list-cancel"):
+                            first = stat(files[name] or b"first", b"")
                             if offset == 0:
                                 data = first
-                            elif offset == len(first) and name not in flushed:
+                            elif offset == len(first) and name in (b"listing", b"list-cancel") and name not in flushed:
                                 canceled = (tag, name, b"")
                                 continue
                             elif offset == len(first):
@@ -494,15 +814,43 @@ def serve_9p(listener, factotum=False):
                             if offset != 9 or body[16:] != b"response":
                                 raise RuntimeError(f"invalid auth reply {body!r}")
                             auth_success.add(fid)
+                        elif name in (b"write-one", b"write-two"):
+                            expected = b"1" if name == b"write-one" else b"22"
+                            if name in writes or tag in (entry[0] for entry in writes.values()) or (
+                                    offset, count, body[16:]) != (0, len(expected), expected):
+                                raise RuntimeError(f"invalid concurrent write to {name!r}")
+                            files[name][:] = expected
+                            writes[name] = (tag, count)
+                            if len(writes) == 2:
+                                for pending_tag, written in reversed(writes.values()):
+                                    connection.sendall(struct.pack("<IBHI", 11, 119, pending_tag, written))
+                                writes.clear()
+                                reversed_writes = True
+                            continue
                         else:
                             files[name][offset:offset + count] = body[16:]
                         payload = struct.pack("<I", count)
                 elif kind in (120, 122):
-                    name = fids.pop(struct.unpack_from("<I", body)[0])
+                    fid = struct.unpack_from("<I", body)[0]
+                    name = fids.pop(fid)
+                    was_opened = fid in opened
+                    opened.discard(fid)
+                    if name == b"open-kill" and not open_kill_released:
+                        raise RuntimeError("clunked a killed opener's fid before Rflush")
                     if kind == 122:
                         del files[name]
+                    elif name == b"clunk-hold" and was_opened:
+                        if clunk_tag is not None:
+                            raise RuntimeError("duplicate clunk while an Rclunk is withheld")
+                        clunk_tag = tag
+                        if (ready := held.pop(b"clunk-ready", None)) is not None:
+                            connection.sendall(struct.pack("<IBHIc", 12, 117, ready, 1, b"c"))
+                        continue
                 elif kind == 124:
                     name = fids[struct.unpack_from("<I", body)[0]]
+                    if name in (b"stat-cancel", b"path-cancel") and name not in flushed:
+                        canceled = (tag, name, b"")
+                        continue
                     payload = string(stat(name, files.get(name, b"")))
                 elif kind == 126:
                     name = fids[struct.unpack_from("<I", body)[0]]
@@ -513,33 +861,61 @@ def serve_9p(listener, factotum=False):
                         del files[name][length:]
                 else:
                     raise RuntimeError(f"unexpected 9P request {kind}")
+                if kind in (124, 126):
+                    prefix, _, suffix = name.partition(b"-")
+                    expected = b"one" if kind == 124 else b"two"
+                if kind in (124, 126) and prefix in metadata and suffix == expected and prefix not in reversed_metadata:
+                    pair = metadata[prefix]
+                    if kind in pair or tag in (entry[0] for entry in pair.values()):
+                        raise RuntimeError("invalid overlapping metadata requests")
+                    pair[kind] = (tag, reply, payload)
+                    if len(pair) == 2:
+                        for pending_tag, pending_reply, data in reversed(pair.values()):
+                            connection.sendall(struct.pack("<IBH", len(data) + 7, pending_reply, pending_tag) + data)
+                        pair.clear()
+                        reversed_metadata.add(prefix)
+                    continue
                 connection.sendall(struct.pack("<IBH", len(payload) + 7, reply, tag) + payload)
     required = {100, 104, 110, 112, 116, 118, 120}
     if not factotum:
         required.update({102, 108, 114, 122, 124, 126})
-    if (fids or not required.issubset(requests) or not factotum
-            and (modes.get(b"new") != 0o600 or flushed != {b"flush", b"flush-race", b"listing"})):
+    if (disconnect or fids or not required.issubset(requests) or not factotum
+            and (not reversed_requests or not reversed_directories or not reversed_lists or held or not reversed_writes or writes
+                 or not reversed_opens or open_pair or open_flush_tag is not None
+                 or reversed_metadata != metadata.keys() or any(metadata.values()) or completed_clunks != 2
+                 or shared_offset != 2 or modes.get(b"metadata-two") != 0o640 or modes.get(b"path-two") != 0o620
+                 or modes.get(b"new") != 0o600
+                 or flushed != {b"flush", b"flush-race", b"listing", b"cancel-one", b"killed", b"stat-cancel",
+                                b"path-cancel", b"list-cancel", b"open-cancel", b"open-kill"})):
         raise RuntimeError(f"incomplete 9P exchange, live fids {fids}, requests {requests}")
 
 
-def check_9p_mount(shell):
-    def expect(command, expected):
-        output = shell.command(command).partition(b"\n")[2]
-        if expected not in output.splitlines():
-            raise RuntimeError(f"{command!r}: expected {expected!r}, got {output!r}")
+def expect_line(shell, command, expected, timeout=25):
+    output = shell.command(command, timeout).partition(b"\n")[2]
+    if expected not in output.splitlines():
+        raise RuntimeError(f"{command!r}: expected {expected!r}, got {output!r}")
 
-    def publish(listener, name):
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(1)
-        listener.settimeout(10)
-        port = str(listener.getsockname()[1]).encode()
-        service = b"/srv/" + name
-        expect(b"{ id=`{cat <[0=8]}; echo 'connect 10.0.2.2!" + port
-               + b"' >[1=8] && { echo 9 > " + service + b" } <>[9]/net/tcp/$id/data } "
-               b"<>[8]/net/tcp/clone; ls /srv", service)
+
+def publish_tcp(shell, port, service):
+    path = b"/srv/" + service
+    expect_line(shell, b"{ id=`{cat <[0=8]}; echo 'connect 10.0.2.2!" + str(port).encode()
+                + b"' >[1=8] && { echo 9 > " + path + b" } <>[9]/net/tcp/$id/data } "
+                b"<>[8]/net/tcp/clone; ls /srv", path)
+
+
+def listen_local(listener):
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(25)
+    return listener.getsockname()[1]
+
+
+def check_9p_mount(shell):
+    def expect(command, expected, timeout=25):
+        expect_line(shell, command, expected, timeout)
 
     with socket.socket() as listener, socket.socket() as agent, ThreadPoolExecutor(max_workers=2) as workers:
-        publish(agent, b"smokefactotum")
+        publish_tcp(shell, listen_local(agent), b"smokefactotum")
         factotum = workers.submit(serve_9p, agent, True)
         expect(b"mkdir /mnt/factotum; @ { cd /srv && mount -n ./smokefactotum /mnt/factotum } && echo factotum-mounted",
                b"factotum-mounted")
@@ -547,13 +923,14 @@ def check_9p_mount(shell):
                b"mount-blocked")
         expect(b"mount -n smokefactotum /tmp/mnt-factotum && unmount /tmp/mnt-factotum && cat /mnt/factotum/rpc && echo session-reused",
                b"session-reused")
-        publish(listener, b"smoke9p")
+        publish_tcp(shell, listen_local(listener), b"smoke9p")
         expect(b"chmod 600 /srv/smoke9p && ls -l /srv/smoke9p", b"-600 0 /srv/smoke9p")
         peer = workers.submit(serve_9p, listener)
         expect(b"mkdir /tmp/mnt9p; mount -k 'user=root' smoke9p /tmp/mnt9p test-tree && ls /tmp/mnt9p", b"/tmp/mnt9p/remote")
         expect(b"cat /tmp/mnt9p/remote", b"hello-9p")
         expect(b"echo /tmp/mnt9p/rem*", b"/tmp/mnt9p/remote")
         expect(b"/bin/aux/procsmoke mount-io", b"mount-io-ok")
+        expect(b"/bin/aux/procsmoke mount-parallel", b"mount-parallel-ok")
         expect(b"mkdir /tmp/local9p; touch /tmp/local9p/local; bind -b /tmp/local9p /tmp/mnt9p && "
                b"/bin/aux/procsmoke mount-union", b"mount-union-ok")
         expect(b"unmount /tmp/local9p /tmp/mnt9p && echo union-unmounted", b"union-unmounted")
@@ -564,6 +941,381 @@ def check_9p_mount(shell):
         peer.result(timeout=10)
         expect(b"unmount /mnt/factotum && rm /srv/smokefactotum && echo factotum-removed", b"factotum-removed")
         factotum.result(timeout=10)
+    with socket.socket() as listener, ThreadPoolExecutor(max_workers=1) as workers:
+        port = listen_local(listener)
+        peer = workers.submit(serve_9p, listener, disconnect=True)
+        publish_tcp(shell, port, b"drop9p")
+        expect(b"mkdir /tmp/drop9p; mount -n drop9p /tmp/drop9p && /bin/aux/procsmoke mount-disconnect",
+               b"mount-disconnect-ok")
+        expect(b"unmount /tmp/drop9p && rm /srv/drop9p && echo drop-cleanup", b"drop-cleanup")
+        peer.result(timeout=10)
+
+
+def relay_factotum(listener, endpoint, log):
+    with listener.accept()[0] as guest, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as host, \
+            selectors.DefaultSelector() as selector:
+        host.connect(str(endpoint))
+        pending = {guest: bytearray(), host: bytearray()}
+        for source, target in ((guest, host), (host, guest)):
+            source.settimeout(5)
+            selector.register(source, selectors.EVENT_READ, target)
+        while selector.get_map():
+            events = selector.select(90)
+            if not events:
+                raise RuntimeError("factotum relay timed out")
+            for key, _ in events:
+                data = key.fileobj.recv(8192)
+                if data:
+                    key.data.sendall(data)
+                    frames = pending[key.fileobj]
+                    frames.extend(data)
+                    while len(frames) >= 7:
+                        size, kind, tag = struct.unpack_from("<IBH", frames)
+                        if not 7 <= size <= 1024 * 1024:
+                            raise RuntimeError("invalid frame on factotum relay")
+                        if size > len(frames):
+                            break
+                        log.write(f"factotum 9P type={kind} tag={tag} size={size}\n".encode())
+                        if kind == 107:
+                            log.write(b"factotum 9P error: " + frames[9:size] + b"\n")
+                        elif kind == 117 and frames[11:size].startswith(b"error "):
+                            log.write(b"factotum RPC error: " + frames[17:size] + b"\n")
+                        del frames[:size]
+                else:
+                    selector.unregister(key.fileobj)
+                    key.data.shutdown(socket.SHUT_WR)
+
+
+def format_venti(binaries, environment, directory, log):
+    arena = directory / "venti.arena"
+    index = directory / "venti.index"
+    config = directory / "venti.conf"
+    for path, size in ((arena, 64), (index, 16)):
+        with path.open("wb") as image:
+            image.truncate(size * 1024 * 1024)
+    config.write_text(f"index smoke\narenas {arena}\nisect {index}\n")
+    for command in (("fmtarenas", "-a", "16m", "smoke", arena),
+                    ("fmtisect", "smoke", index), ("fmtindex", config)):
+        subprocess.run([binaries / "venti" / command[0], *command[1:]], env=environment,
+                       stdout=log, stderr=log, timeout=20, check=True)
+    return config
+
+
+@contextmanager
+def venti_server(binaries, environment, config, log, readonly=False):
+    with socket.socket() as reserve, socket.socket() as http_reserve:
+        reserve.bind(("127.0.0.1", 0))
+        http_reserve.bind(("127.0.0.1", 0))
+        port = reserve.getsockname()[1]
+        http_port = http_reserve.getsockname()[1]
+    address = f"tcp!127.0.0.1!{port}"
+    argv = [binaries / "venti/venti", "-s", "-a", address, "-c", config]
+    if readonly:
+        argv.append("-r")
+    else:
+        argv.extend(("-h", f"tcp!127.0.0.1!{http_port}"))
+    with subprocess.Popen(argv,
+                          env=dict(environment, NOLIBTHREADDAEMONIZE="1"),
+                          stdout=log, stderr=log, start_new_session=True) as server:
+        try:
+            deadline = time.monotonic() + 15
+            while True:
+                if server.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError("Venti did not start listening")
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                        break
+                except OSError:
+                    time.sleep(0.05)
+            yield address, http_port
+        finally:
+            try:
+                os.killpg(server.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            server.wait(timeout=5)
+
+
+def sync_venti(binaries, environment, address, http_port, log):
+    subprocess.run([binaries / "venti/sync", "-h", address], env=environment,
+                   stdout=log, stderr=log, timeout=20, check=True)
+    requests = (("/set?name=l0quantum&value=0", b"l0quantum = 0"),
+                ("/flushicache", b"flushed icache"), ("/flushdcache", b"flushed dcache"))
+    for endpoint, expected in requests:
+        http = HTTPConnection("127.0.0.1", http_port, timeout=20)
+        try:
+            http.request("GET", endpoint, headers={"Connection": "close"})
+            response = http.getresponse()
+            result = response.read()
+            if response.status != 200 or expected not in result:
+                raise RuntimeError(f"Venti {endpoint} failed: {response.status} {result!r}")
+        finally:
+            http.close()
+
+
+@contextmanager
+def fossil_console(binaries, environment, disk, venti_address, log):
+    with socket.socket() as reserve:
+        reserve.bind(("127.0.0.1", 0))
+        port = reserve.getsockname()[1]
+    master, slave = pty.openpty()
+    tty.setraw(slave)
+    commands = [f"fsys main config {disk}"]
+    if venti_address:
+        commands.append(f"fsys main venti {venti_address}")
+    commands.extend(("fsys main open -P -c 1000", "uname root :root", f"listen tcp!127.0.0.1!{port}"))
+    argv = ["setsid", "--ctty", binaries / "fossil/fossil", "-t"]
+    for command in commands:
+        argv.extend(("-c", command))
+    try:
+        with subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave,
+                              env=dict(environment, NOLIBTHREADDAEMONIZE="1")) as server, \
+                selectors.DefaultSelector() as selector:
+            try:
+                selector.register(master, selectors.EVENT_READ)
+                pending = b""
+
+                def wait_output(pattern, timeout=20):
+                    nonlocal pending
+                    deadline = time.monotonic() + timeout
+                    while not (match := re.search(pattern, pending)):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not selector.select(remaining):
+                            raise RuntimeError(f"Fossil console timed out: {pending!r}")
+                        chunk = os.read(master, 8192)
+                        if not chunk:
+                            raise RuntimeError("Fossil console closed unexpectedly")
+                        log.write(chunk)
+                        pending += chunk
+                    output, pending = pending[:match.start()], pending[match.end():]
+                    return output, match
+
+                def console(command=None, expected=rb""):
+                    if command is not None:
+                        os.write(master, command + b"\n")
+                    output, _ = wait_output(rb"prompt: ")
+                    if command is not None:
+                        _, echoed, result = output.replace(b"\r", b"").partition(command + b"\n")
+                        match = re.fullmatch(expected, result.strip())
+                        if not echoed or match is None:
+                            raise RuntimeError(f"Fossil console rejected {command!r}: {output!r}")
+                        return match
+
+                console()
+                yield port, console, wait_output
+            finally:
+                server.kill()
+                server.wait(timeout=5)
+                while selector.select(0):
+                    chunk = os.read(master, 8192)
+                    if not chunk:
+                        break
+                    log.write(chunk)
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def check_fossil_recovery(shell, binaries, environment, disk, venti_address, log):
+    with fossil_console(binaries, environment, disk, venti_address, log) as (port, console, _):
+        publish_tcp(shell, port, b"fossil")
+        expect_line(shell, b"mount -n fossil /tmp/fossil || echo auth-required", b"auth-required")
+        expect_line(shell, b"mount -k 'user=root' fossil /tmp/fossil && "
+                    b"echo before > /tmp/fossil/version && cat /tmp/fossil/version", b"before")
+        expect_line(shell, b"/bin/aux/procsmoke crash-snapshot && cp /tmp/procsmoke.snap /tmp/fossil/crash.snap && "
+                    b"chmod 600 /tmp/fossil/crash.snap && "
+                    b"cmp /tmp/procsmoke.snap /tmp/fossil/crash.snap && echo crash-snapshot-copied",
+                    b"crash-snapshot-copied", timeout=90)
+        console(b"fsys main snap -s /active -d /snapshot/smoke")
+        expect_line(shell, b"echo after > /tmp/fossil/version && cat /tmp/fossil/version", b"after")
+        console(b"fsys main sync", rb"main sync: wrote [0-9]+ blocks")
+        expect_line(shell, b"mkdir /tmp/fossil/in-flight && echo pending > /tmp/fossil/in-flight/draft && "
+                    b"mv /tmp/fossil/in-flight/draft /tmp/fossil/in-flight/renamed && "
+                    b"cat /tmp/fossil/in-flight/renamed", b"pending")
+    expect_line(shell, b"cat /tmp/fossil/version || echo server-lost", b"server-lost")
+    expect_line(shell, b"unmount /tmp/fossil && rm /srv/fossil && echo disconnected", b"disconnected")
+    with fossil_console(binaries, environment, disk, venti_address, log) as (port, console, wait_output):
+        publish_tcp(shell, port, b"fossil")
+        expect_line(shell, b"mount -k 'user=root' fossil /tmp/fossil && cat /tmp/fossil/version", b"after")
+        expect_line(shell, b"mount -k 'user=root' fossil /tmp/snapshot main/snapshot && "
+                    b"cat /tmp/snapshot/smoke/version", b"before")
+        expect_line(shell, b"cmp /tmp/procsmoke.snap /tmp/fossil/crash.snap && "
+                    b"cmp /tmp/procsmoke.snap /tmp/snapshot/smoke/crash.snap && echo crash-snapshot-reopened",
+                    b"crash-snapshot-reopened", timeout=90)
+        expect_line(shell, b"echo forbidden > /tmp/snapshot/smoke/version || echo snapshot-read-only",
+                    b"snapshot-read-only")
+        expect_line(shell, b"echo writable > /tmp/fossil/recovered && cat /tmp/fossil/recovered", b"writable")
+        expect_line(shell, b"unmount /tmp/snapshot && unmount /tmp/fossil && rm /srv/fossil && "
+                    b"echo filesystem-cleanup", b"filesystem-cleanup")
+        score_pattern = rb"archive vac:([0-9a-f]{40})"
+        archive = console(b"fsys main snap -a", rb"(?:" + score_pattern + rb")?")
+        if archive[1] is None:
+            _, archive = wait_output(score_pattern + rb"\r?\n", timeout=60)
+        return archive[1].decode()
+
+
+def check_venti_restore(shell, binaries, environment, restored, venti_address, score, log):
+    with restored.open("xb") as image:
+        image.truncate(64 * 1024 * 1024)
+    subprocess.run([binaries / "fossil/flfmt", "-y", "-h", venti_address, "-v", score, restored],
+                   env=environment, stdout=log, stderr=log, timeout=25, check=True)
+    with fossil_console(binaries, environment, restored, venti_address, log) as (port, _, _):
+        publish_tcp(shell, port, b"fossil")
+        expect_line(shell, b"mount -k 'user=root' fossil /tmp/fossil && echo venti-restored", b"venti-restored")
+        expect_line(shell, b"cat /tmp/fossil/version", b"after")
+        expect_line(shell, b"cat /tmp/fossil/recovered", b"writable")
+        expect_line(shell, b"cmp /tmp/procsmoke.snap /tmp/fossil/crash.snap && echo crash-snapshot-restored",
+                    b"crash-snapshot-restored", timeout=90)
+        expect_line(shell, b"unmount /tmp/fossil && rm /srv/fossil /tmp/procsmoke.snap && echo archive-cleanup",
+                    b"archive-cleanup")
+
+
+@contextmanager
+def native_factotum(binaries, environment, address, key, log):
+    endpoint = Path(environment["NAMESPACE"]) / "factotum"
+    with subprocess.Popen([binaries / "factotum", "-n", "-s", "factotum", "-a", address],
+                          env=environment, stdout=log, stderr=log, start_new_session=True) as agent:
+        try:
+            deadline = time.monotonic() + 10
+            while not endpoint.is_socket():
+                if agent.poll() not in (None, 0) or time.monotonic() >= deadline:
+                    raise RuntimeError("plan9port factotum did not publish its socket")
+                time.sleep(0.05)
+            subprocess.run([binaries / "9p", "write", "factotum/ctl"], env=environment,
+                           input=(key + "\n").encode(), stdout=log, stderr=log, timeout=10, check=True)
+            yield endpoint
+        finally:
+            children = subprocess.run(["ps", "-s", str(agent.pid), "-o", "pid="],
+                                      capture_output=True, timeout=5, check=False)
+            for pid in map(int, children.stdout.split()):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            agent.wait(timeout=5)
+
+
+@contextmanager
+def mount_factotum(shell, endpoint, log):
+    with socket.socket() as relay, ThreadPoolExecutor(max_workers=1) as worker:
+        port = listen_local(relay)
+        future = worker.submit(relay_factotum, relay, endpoint, log)
+        try:
+            publish_tcp(shell, port, b"nativefactotum")
+            expect_line(shell, b"mkdir /mnt/factotum; "
+                        b"mount -n nativefactotum /mnt/factotum && echo agent-ready", b"agent-ready")
+            yield
+        finally:
+            shell.command(b"unmount /mnt/factotum; rm /srv/nativefactotum")
+        future.result(timeout=10)
+
+
+def ticket_relay(listener, server_port, enabled, finished, observed, log):
+    listener.settimeout(0.25)
+    while not finished.is_set():
+        try:
+            client, _ = listener.accept()
+        except TimeoutError:
+            continue
+        with client:
+            client.settimeout(5)
+            with client.makefile("rb") as stream:
+                request = stream.read(P9SK1_TICKET_REQUEST_SIZE)
+            if len(request) != P9SK1_TICKET_REQUEST_SIZE or request[0] != 1:
+                raise RuntimeError("expected a p9sk1 ticket request")
+            identity = tuple(field.rstrip(b"\0") for field in (request[1:29], request[85:113], request[113:141]))
+            if identity != (b"fossilhost", b"root", b"root"):
+                raise RuntimeError(f"unexpected p9sk1 ticket identities: {identity!r}")
+            if not enabled.is_set():
+                observed.put("offline")
+                continue
+            with socket.create_connection(("127.0.0.1", server_port), timeout=5) as server:
+                server.sendall(request)
+                with server.makefile("rb") as stream:
+                    status = stream.read(1)
+                    if status != b"\x04":
+                        raise RuntimeError(f"native authsrv did not return AuthOK: {status!r}")
+                    tickets = stream.read(P9SK1_TICKET_PAIR_SIZE)
+                    if len(tickets) != P9SK1_TICKET_PAIR_SIZE:
+                        raise RuntimeError("native authsrv returned incomplete tickets")
+            log.write(b"native authsrv: AuthOK for authid=fossilhost hostid=root uid=root\n")
+            client.sendall(status + tickets)
+            observed.put("native-ticket")
+
+
+def check_native_tickets(shell, binaries, environment, directory, disk, ticket_port, log):
+    client_password = os.environ.get("PLAN9_TEST_CLIENT_PASSWORD", "")
+    server_password = os.environ.get("PLAN9_TEST_SERVER_PASSWORD", "")
+    if (not all(re.fullmatch(r"[!-~]{8,27}", password) for password in (client_password, server_password))
+            or client_password == server_password):
+        raise RuntimeError("set distinct disposable PLAN9_TEST_CLIENT_PASSWORD and "
+                           "PLAN9_TEST_SERVER_PASSWORD (8 to 27 printable nonspace ASCII characters)")
+    server_namespace = directory / "fs-agent"
+    server_namespace.mkdir(mode=0o700)
+    server_environment = dict(environment, NAMESPACE=str(server_namespace))
+    enabled = threading.Event()
+    finished = threading.Event()
+    observed = Queue()
+    with socket.socket() as relay, ThreadPoolExecutor(max_workers=1) as worker:
+        address = f"tcp!127.0.0.1!{listen_local(relay)}"
+        future = worker.submit(ticket_relay, relay, ticket_port, enabled, finished, observed, log)
+        try:
+            key = f"key proto=p9sk1 dom={address}"
+            client_password = client_password.replace("'", "''")
+            server_password = server_password.replace("'", "''")
+            server_key = f"{key} role=server user=fossilhost !password='{server_password}'"
+            client_key = f"{key} user=root !password='{client_password}'"
+            with native_factotum(binaries, server_environment, address, server_key, log), \
+                    native_factotum(binaries, environment, address, client_key, log) as endpoint, \
+                    mount_factotum(shell, endpoint, log), \
+                    fossil_console(binaries, server_environment, disk, None, log) as (port, _, _):
+                shell.command(b"mkdir /tmp/fossil")
+                publish_tcp(shell, port, b"fossil")
+                try:
+                    expect_line(shell, b"mount -k 'user=root' fossil /tmp/fossil || echo auth-offline", b"auth-offline")
+                    enabled.set()
+                    expect_line(shell, b"mount -k 'user=root' fossil /tmp/fossil && "
+                                b"echo ticket-authenticated > /tmp/fossil/proof && cat /tmp/fossil/proof",
+                                b"ticket-authenticated")
+                finally:
+                    shell.command(b"unmount /tmp/fossil; rm /srv/fossil")
+        finally:
+            finished.set()
+            future.result(timeout=10)
+    if observed.qsize() != 2 or [observed.get_nowait() for _ in range(2)] != ["offline", "native-ticket"]:
+        raise RuntimeError("did not observe both the offline request and native ticket exchange")
+
+
+def check_native_9p(shell, plan9, log, ticket_port):
+    plan9 = Path(plan9).resolve(strict=True)
+    binaries = plan9 / "bin"
+    with tempfile.TemporaryDirectory(prefix="plan9-native9p-") as directory, socket.socket() as offline:
+        directory = Path(directory)
+        offline.bind(("127.0.0.1", 0))
+        offline_address = f"tcp!127.0.0.1!{offline.getsockname()[1]}"
+        environment = dict(os.environ, PLAN9=str(plan9), NAMESPACE=str(directory),
+                           PATH=f"{binaries}{os.pathsep}{os.defpath}")
+        environment.pop("NOLIBTHREADDAEMONIZE", None)
+        disk = directory / "fossil.disk"
+        with disk.open("wb") as image:
+            image.truncate(64 * 1024 * 1024)
+        subprocess.run([binaries / "fossil/flfmt", "-y", disk], env=environment,
+                       stdout=log, stderr=log, timeout=20, check=True)
+        if ticket_port is not None:
+            check_native_tickets(shell, binaries, environment, directory, disk, ticket_port, log)
+            return
+        venti_config = format_venti(binaries, environment, directory, log)
+        key = f"key proto=p9sk1 dom={offline_address} user=root !password=disposable-smoke-key"
+        with native_factotum(binaries, environment, offline_address, key, log) as endpoint, \
+                mount_factotum(shell, endpoint, log):
+            shell.command(b"mkdir /tmp/fossil /tmp/snapshot")
+            with venti_server(binaries, environment, venti_config, log) as (venti_address, http_port):
+                score = check_fossil_recovery(shell, binaries, environment, disk, venti_address, log)
+                sync_venti(binaries, environment, venti_address, http_port, log)
+            disk.unlink()
+            with venti_server(binaries, environment, venti_config, log, readonly=True) as (venti_address, _):
+                check_venti_restore(shell, binaries, environment, directory / "restored.disk",
+                                    venti_address, score, log)
 
 
 def wait_for_dhcp(shell):
@@ -634,7 +1386,7 @@ def check_network(shell, qmp):
     })
     if result.strip():
         raise RuntimeError(result.strip())
-    shell.send(b"netcat -l -m accepted * 8123")
+    shell.send(b"netcat -l -m accepted '*' 8123")
     deadline = time.monotonic() + 4
     data = b""
     while not data and time.monotonic() < deadline:
@@ -645,8 +1397,9 @@ def check_network(shell, qmp):
                     data = reader.read(len(b"accepted"))
         except (ConnectionError, TimeoutError):
             time.sleep(0.05)
-    if data != b"accepted" or b"incoming" not in shell.read_prompt(25):
-        raise RuntimeError(f"TCP listen failed: {data!r}")
+    output = shell.read_prompt(25)
+    if data != b"accepted" or b"incoming" not in output:
+        raise RuntimeError(f"TCP listen failed: {data!r}, guest output: {output!r}")
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
         reserve.bind(("127.0.0.1", 0))
@@ -659,7 +1412,7 @@ def check_network(shell, qmp):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as first, \
             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as second:
         for client, message in ((first, b"udp-first"), (second, b"udp-second")):
-            shell.send(b"netcat -u -l -m datagram * 8124")
+            shell.send(b"netcat -u -l -m datagram '*' 8124")
             client.settimeout(0.15)
             deadline = time.monotonic() + 4
             data = b""
@@ -673,7 +1426,7 @@ def check_network(shell, qmp):
             output = shell.read_prompt(25).partition(b"\n")[2]
             if data != b"datagram" or output.strip() != message:
                 raise RuntimeError(f"UDP listen or port reuse failed: {data!r}, {output!r}")
-        shell.send(b"netcat -u -l -H -n 2 * 8124")
+        shell.send(b"netcat -u -l -H -n 2 '*' 8124")
         shell.read_until(UDP_HEADERS_READY, 10, "UDP headers listener")
         datagrams = ((first, b"header-first"), (second, b"header-second"))
         for client, message in datagrams:
@@ -862,7 +1615,7 @@ def check_wire_network(shell, peer, lock, esp_packets, raw_packets, udp_port):
         (b"echo bind ether /net/ether1 > /net/ipifc/2/ctl; cat /net/ipifc/2/status", b"mtu 1500 bound"),
         (b"echo static 198.18.0.2/24 > /net/ipifc/2/ctl; ipconfig", b"198.18.0.2/24"),
         (b"echo add 198.19.0.0/24 198.18.0.1 > /net/iproute; ipconfig routes", b"198.19.0.0/24 198.18.0.1 ether1"),
-        (b"echo dns=198.18.0.1 > /net/ndb; ndb/dnsquery wire.example", b"wire.example ip 198.19.0.9"),
+        (b"echo 'dns=198.18.0.1' > /net/ndb; ndb/dnsquery wire.example", b"wire.example ip 198.19.0.9"),
         (b"ndb/dnsquery wire.example ipv6", b"wire.example ipv6 2001:db8::9"),
         (b"ping -n 1 wire.example", b"reply from 198.19.0.9"),
         (b"ip/traceroute -a 1 -t 2 198.19.0.9", b"  1  198.18.0.1 "),
@@ -977,7 +1730,7 @@ def check_ipmux_output(shell, raw_packets, udp_port):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
         client.settimeout(5)
         for packet in packets:
-            shell.send(b"netcat -u -l -H * 8124 > /tmp/ipmux-packet")
+            shell.send(b"netcat -u -l -H '*' 8124 > /tmp/ipmux-packet")
             shell.read_until(UDP_HEADERS_READY, 10, "UDP packet upload listener")
             client.sendto(packet, ("127.0.0.1", udp_port))
             if client.recvfrom(1500)[0] != packet:
@@ -1046,10 +1799,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--network", action="store_true")
     parser.add_argument("--mount", action="store_true")
+    parser.add_argument("--panic", action="store_true")
+    parser.add_argument("--cpu-service", action="store_true")
+    parser.add_argument("--rc-reference")
+    parser.add_argument("--plan9port")
+    parser.add_argument("--ticket-port", type=int)
     parser.add_argument("arch")
     parser.add_argument("log")
     parser.add_argument("qemu", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.ticket_port is not None and (not args.plan9port or not 1 <= args.ticket_port <= 65535):
+        parser.error("--ticket-port requires --plan9port and a valid loopback port")
     qemu = args.qemu[1:] if args.qemu[:1] == ["--"] else args.qemu
     if not qemu:
         parser.error("expected a QEMU command after --")
@@ -1063,11 +1823,16 @@ def main():
             peer, guest = socket.socketpair()
             with peer, guest:
                 run_qemu(args, qemu, qmp_path, peer, guest, workers, log, selector, sock)
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"{args.arch}: {error}; see {args.log}", file=sys.stderr)
         return 1
     checks = ("DHCP, IPv4/IPv6 ICMP, TCP/UDP echo and listeners, UDP headers, DNS/CS, GRE, RUDP, ESP, ARP, ipmux, capture, dual-stack forwarding and traceroute" if args.network else
-              "9P mount, authentication, remote mutations and fid lifetime" if args.mount else
+              "9P mount, authentication, fid lifetime, reply multiplexing, cancellation and disconnect" if args.mount else
+              "formatted panic, kernel backtrace and reboot" if args.panic and args.cpu_service else
+              "formatted panic, kernel backtrace and halt" if args.panic else
+              "rc differential tests" if args.rc_reference else
+              "native authsrv tickets with distinct client and server keys" if args.ticket_port else
+              "plan9port factotum, Fossil crash recovery and Venti archive restore" if args.plan9port else
               "boot and shell, device/process listings, rc login profiles and environment groups")
     print(f"{args.arch}: {checks} passed")
     return 0
@@ -1102,6 +1867,16 @@ def run_qemu(args, qemu, qmp_path, peer, guest, workers, log, selector, sock):
                     shell.read_prompt(90)
                     wait_for_dhcp(shell)
                     check_9p_mount(shell)
+                elif args.panic:
+                    check_panic(shell, qmp, args.arch, args.cpu_service)
+                elif args.rc_reference:
+                    shell.read_prompt(90)
+                    check_rc_reference(shell, args.rc_reference)
+                elif args.plan9port:
+                    shell.read_prompt(90)
+                    wait_for_dhcp(shell)
+                    with open(Path(args.log).with_name("native-9p-host.log"), "wb", buffering=0) as host_log:
+                        check_native_9p(shell, args.plan9port, host_log, args.ticket_port)
                 else:
                     check_boot(args.arch, shell, qmp, Path(args.log).resolve().parent)
         finally:

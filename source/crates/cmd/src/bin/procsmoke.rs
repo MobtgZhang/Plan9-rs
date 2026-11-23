@@ -10,9 +10,21 @@ const NOTE_PC: usize = 15;
 const NOTE_PC: usize = 31;
 #[cfg(target_arch = "riscv64")]
 const NOTE_PC: usize = 32;
+#[cfg(target_arch = "x86_64")]
+const REGISTER_SP: usize = 18;
+#[cfg(any(target_arch = "aarch64", target_arch = "loongarch64", target_arch = "riscv64"))]
+const REGISTER_SP: usize = NOTE_PC + 2;
+#[cfg(target_arch = "x86_64")]
+const REGISTER_SIZE: usize = 20 * 8;
+#[cfg(not(target_arch = "x86_64"))]
+const REGISTER_SIZE: usize = (REGISTER_SP + 1) * 8;
+const IO_ERROR: i64 = -3;
+const CRASH_MARKER: u64 = 0x37c1_1fc3_b5e2_a069;
+const CRASH_SNAPSHOT: &[u8] = b"/tmp/procsmoke.snap\0";
 
 static SAVED_PC: AtomicU64 = AtomicU64::new(0);
 static ASYNC_NOTES: AtomicU64 = AtomicU64::new(0);
+static DEADLINE_NOTES: AtomicU64 = AtomicU64::new(0);
 
 fn check(condition: bool, message: &str) {
     if !condition {
@@ -105,6 +117,27 @@ fn illegal_instruction() {
     }
 }
 
+#[cfg(target_arch = "loongarch64")]
+const UNMAPPED_ADDRESS: usize = 0xffff_8000_0000_0001;
+#[cfg(not(target_arch = "loongarch64"))]
+const UNMAPPED_ADDRESS: usize = 1;
+
+#[inline(never)]
+fn unmapped_load() {
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("movzx eax, byte ptr [{address}]", address = in(reg) UNMAPPED_ADDRESS,
+            out("eax") _, options(readonly, nostack));
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("ldrb wzr, [{address}]", address = in(reg) UNMAPPED_ADDRESS, options(readonly, nostack));
+        #[cfg(target_arch = "riscv64")]
+        core::arch::asm!("lbu zero, 0({address})", address = in(reg) UNMAPPED_ADDRESS, options(readonly, nostack));
+        #[cfg(target_arch = "loongarch64")]
+        core::arch::asm!("ld.b {value}, {address}, 0", address = in(reg) UNMAPPED_ADDRESS,
+            value = out(reg) _, options(readonly, nostack));
+    }
+}
+
 extern "C" fn fault_handler(registers: *mut u8, message: *const u8) {
     let prefix = b"sys: trap: illegal instruction pc=";
     check(unsafe { core::slice::from_raw_parts(message, prefix.len()) } == prefix, "fault note message");
@@ -120,17 +153,185 @@ fn check_fault_notes() {
     illegal_instruction();
     check(syscall::notify(None) == 0, "unregister fault handler after NCONT");
 
+    check_broken_child(illegal_instruction, b"sys: trap: illegal instruction", false);
+    check_broken_child(unmapped_load, b"sys: trap: fault read addr=", true);
+    check(syscall::remove(CRASH_SNAPSHOT.as_ptr()) == 0, "remove crash snapshot");
+}
+
+fn check_broken_child(fault: fn(), message: &[u8], capture: bool) {
+    let mut marker = 0u64;
     let pid = syscall::fork();
     check(pid >= 0, "fork faulting child");
     if pid == 0 {
-        illegal_instruction();
+        unsafe { core::ptr::write_volatile(&mut marker, CRASH_MARKER) };
+        fault();
         syscall::exit(0);
     }
     let mut record = [0; 256];
     let size = syscall::await_child(&mut record);
-    check(size > 0 && record[..size as usize].windows(b"sys: trap: illegal instruction".len())
-        .any(|part| part == b"sys: trap: illegal instruction"), "await unhandled fault");
-    check(!ctl(pid, b"waitstop"), "reclaim faulting process");
+    check(size > 0 && record[..size as usize].windows(message.len())
+        .any(|part| part == message), "await unhandled fault");
+    check(ctl(pid, b"waitstop"), "inspect faulting process after await");
+    let fd = open_proc(pid, b"/status", syscall::OREAD);
+    check(fd >= 0, "open faulting process status");
+    let count = syscall::read(fd, record.as_mut_ptr(), record.len());
+    syscall::close(fd);
+    check(count > 0 && record[..count as usize].windows(6).any(|part| part == b"Broken"),
+        "unhandled fault enters Broken");
+    let fd = open_proc(pid, b"/regs", syscall::OREAD);
+    check(fd >= 0 && syscall::read(fd, record.as_mut_ptr(), record.len()) > 0, "read fault registers");
+    syscall::close(fd);
+    let fd = open_proc(pid, b"/kregs", syscall::OREAD);
+    let mut kernel = [0; REGISTER_SIZE];
+    check(fd >= 0 && syscall::read(fd, kernel.as_mut_ptr(), kernel.len()) == REGISTER_SIZE as i64,
+        "read fault kernel register frame");
+    check(kernel[NOTE_PC * 8..][..8] != [0; 8] && kernel[REGISTER_SP * 8..][..8] != [0; 8],
+        "read fault kernel PC and SP");
+    check(syscall::read(fd, record.as_mut_ptr(), 1) == 0, "kernel register frame ends at EOF");
+    syscall::close(fd);
+    if capture {
+        check_snapshot(pid, &marker as *const u64 as u64);
+    }
+    check(!ctl(pid, b"start"), "cannot resume a Broken process");
+    check(ctl(pid, b"kill") && !ctl(pid, b"waitstop"), "reclaim faulting process");
+    check(syscall::await_child(&mut record) < 0, "do not report a Broken exit twice");
+}
+
+fn snap_read(fd: i64, mut bytes: &mut [u8]) {
+    while !bytes.is_empty() {
+        let count = syscall::read(fd, bytes.as_mut_ptr(), bytes.len());
+        check(count > 0 && count as usize <= bytes.len(), "read complete snapshot record");
+        bytes = &mut bytes[count as usize..];
+    }
+}
+
+fn snap_line(fd: i64, line: &mut [u8]) -> &[u8] {
+    for index in 0..line.len() {
+        snap_read(fd, &mut line[index..=index]);
+        if line[index] == b'\n' {
+            return &line[..index];
+        }
+    }
+    syscall::exits("snapshot line too long")
+}
+
+fn snap_number(fd: i64) -> u64 {
+    let mut digits = [0; 20];
+    let mut length = 0;
+    loop {
+        let mut byte = [0];
+        snap_read(fd, &mut byte);
+        if byte[0] == b' ' {
+            break;
+        }
+        check(length < digits.len() && byte[0].is_ascii_digit(), "snapshot number prefix");
+        digits[length] = byte[0];
+        length += 1;
+    }
+    for _ in length + 1..12 {
+        let mut padding = [0];
+        snap_read(fd, &mut padding);
+        check(padding[0] == b' ', "snapshot number padding");
+    }
+    core::str::from_utf8(&digits[..length]).ok().and_then(cmd::parse_u64).unwrap_or_else(|| {
+        syscall::exits("invalid snapshot number")
+    })
+}
+
+fn check_snapshot(pid: i64, marker: u64) {
+    let snap = b"/bin/snap\0";
+    let mut number = [0; 24];
+    cmd::utoa(pid as u64, &mut number);
+    let args = [snap.as_ptr(), b"-o\0".as_ptr(), CRASH_SNAPSHOT.as_ptr(), number.as_ptr(), core::ptr::null()];
+    for expected_success in [true, false] {
+        let child = syscall::fork();
+        check(child >= 0, "fork snapshot command");
+        if child == 0 {
+            if !expected_success {
+                let null = cmd::open_read("/dev/null");
+                syscall::dup2(null, 2);
+            }
+            syscall::exec(snap.as_ptr(), args.as_ptr());
+            syscall::exits("exec snap failed");
+        }
+        check((syscall::wait(child as i32) == 0) == expected_success, "snapshot exclusive output");
+    }
+
+    let fd = syscall::open(CRASH_SNAPSHOT.as_ptr(), syscall::OREAD);
+    check(fd >= 0, "open crash snapshot");
+    let mut line = [0; 96];
+    check(snap_line(fd, &mut line).starts_with(b"process snapshot "), "snapshot signature");
+    loop {
+        let record = snap_line(fd, &mut line);
+        check(record.starts_with(cmd::utoa(pid as u64, &mut number).as_bytes()), "snapshot process ID");
+        let field = record.get(12..).unwrap_or_default();
+        if field == b"text" {
+            break;
+        }
+        let length = snap_number(fd);
+        if field == b"status" {
+            let mut status = [0; 176];
+            check(length == status.len() as u64, "snapshot status length");
+            snap_read(fd, &mut status);
+            check(&status[56..62] == b"Broken", "snapshot retained Broken status");
+        } else {
+            check(syscall::seek(fd, length as i64, 1) >= 0, "skip snapshot metadata");
+        }
+    }
+
+    check(snap_number(fd) == 0, "snapshot executable file offset");
+    let text_len = snap_number(fd);
+    let mut found_stack = false;
+    for region in 0..=1 {
+        let count = if region == 0 { 1 } else {
+            check(snap_line(fd, &mut line).ends_with(b" mem"), "snapshot memory section");
+            snap_number(fd)
+        };
+        for _ in 0..count {
+            let base = if region == 0 { 0 } else { snap_number(fd) };
+            let length = if region == 0 { text_len } else { snap_number(fd) };
+            for offset in (0..length).step_by(1024) {
+                let mut page = [0; 1024];
+                let size = (length - offset).min(1024) as usize;
+                let mut tag = [0];
+                snap_read(fd, &mut tag);
+                check(matches!(tag[0], b'r' | b'z'), "snapshot page tag");
+                if tag[0] == b'r' {
+                    snap_read(fd, &mut page[..size]);
+                }
+                if region == 0 && offset == 0 {
+                    check(&page[..4] == b"\x7fELF", "snapshot executable header");
+                }
+                if region == 1 {
+                    if let Some(index) = marker.checked_sub(base + offset).filter(|index| *index + 8 <= size as u64) {
+                        check(page[index as usize..][..8] == CRASH_MARKER.to_le_bytes(), "snapshot crash stack bytes");
+                        found_stack = true;
+                    }
+                }
+            }
+        }
+    }
+    let mut tail = [0];
+    check(found_stack && syscall::read(fd, tail.as_mut_ptr(), 1) == 0, "complete crash snapshot");
+    syscall::close(fd);
+}
+
+fn check_bad_syscall_buffers() {
+    const BAD_ADDRESS: i64 = -24;
+    let invalid = UNMAPPED_ADDRESS as *mut u8;
+    let path = c"/dev/null".as_ptr().cast::<u8>();
+    let fd = syscall::open(path, syscall::ORDWR);
+    check(fd >= 0, "open channel for invalid buffer checks");
+    check(syscall::read(fd, invalid, 1) == BAD_ADDRESS, "reject unmapped read destination");
+    check(syscall::write(fd, invalid, 1) == BAD_ADDRESS, "reject unmapped write source");
+    check(syscall::read(fd, path.cast_mut(), 1) == BAD_ADDRESS, "reject read into read-only memory");
+    check(syscall::write(fd, path, usize::MAX) == BAD_ADDRESS, "reject overflowing buffer length");
+    check(syscall::open(invalid, syscall::OREAD) == BAD_ADDRESS, "reject unmapped pathname");
+    check(syscall::exec(path, invalid.cast()) == BAD_ADDRESS, "reject unmapped argument vector");
+    let result = unsafe { syscall::syscall1(syscall::SYS_PIPE, UNMAPPED_ADDRESS as u64) };
+    check(result == BAD_ADDRESS, "reject invalid pipe descriptor output");
+    check(syscall::write(fd, path, 1) == 1, "channel still usable after bad addresses");
+    syscall::close(fd);
 }
 
 extern "C" fn async_note_handler(_registers: *mut u8, message: *const u8) {
@@ -304,7 +505,146 @@ fn check_registers() {
         && syscall::write(regs, [0u8; 8].as_ptr(), 8) < 0, "reject invalid program counter");
     check(syscall::write(regs, pc.as_ptr(), pc.len()) == 8, "write valid program counter");
     syscall::close(regs);
+    check_text_write(pid, u64::from_ne_bytes(pc));
     check(ctl(pid, b"start") && syscall::wait(pid as i32) == 0, "resume register target");
+}
+
+fn check_text_write(pid: i64, pc: u64) {
+    let fd = open_proc(pid, b"/mem", syscall::ORDWR);
+    check(fd >= 0, "open stopped target memory");
+    let mut original = [0; 1];
+    let mut changed = [0; 1];
+    check(syscall::seek(fd, pc as i64, 0) == pc as i64
+        && syscall::read(fd, original.as_mut_ptr(), 1) == 1, "read text segment byte");
+    let patch = [original[0] ^ 0xff];
+    check(syscall::seek(fd, pc as i64, 0) == pc as i64 && syscall::write(fd, patch.as_ptr(), 1) == 1,
+        "write stopped target text");
+    check(syscall::seek(fd, pc as i64, 0) == pc as i64 && syscall::read(fd, changed.as_mut_ptr(), 1) == 1
+        && changed == patch, "read back text patch");
+    check(syscall::seek(fd, pc as i64, 0) == pc as i64 && syscall::write(fd, original.as_ptr(), 1) == 1,
+        "restore stopped target text");
+    syscall::close(fd);
+}
+
+#[cfg(target_arch = "x86_64")]
+const FP_OFFSET: i64 = 160 + 15 * 16;
+#[cfg(target_arch = "aarch64")]
+const FP_OFFSET: i64 = 31 * 16;
+#[cfg(target_arch = "riscv64")]
+const FP_OFFSET: i64 = 31 * 8;
+#[cfg(target_arch = "loongarch64")]
+const FP_OFFSET: i64 = 23 * 8;
+
+#[inline(always)]
+fn set_fp_marker(value: u64) {
+    unsafe {
+        use core::arch::asm;
+        #[cfg(target_arch = "x86_64")]
+        asm!("movq xmm15, {}", in(reg) value, options(nostack));
+        #[cfg(target_arch = "aarch64")]
+        asm!("fmov d31, {}", in(reg) value, out("v31") _, options(nostack));
+        #[cfg(target_arch = "riscv64")]
+        asm!(".option push", ".option arch, +d", "fmv.d.x f31, {}", ".option pop",
+            in(reg) value, options(nostack));
+        #[cfg(target_arch = "loongarch64")]
+        asm!("movgr2fr.d $f23, {}", in(reg) value, out("$f23") _, options(nostack));
+    }
+}
+
+#[inline(always)]
+fn fp_marker() -> u64 {
+    let value: u64;
+    unsafe {
+        use core::arch::asm;
+        #[cfg(target_arch = "x86_64")]
+        asm!("movq {}, xmm15", out(reg) value, options(nostack));
+        #[cfg(target_arch = "aarch64")]
+        asm!("fmov {}, d31", out(reg) value, options(nostack));
+        #[cfg(target_arch = "riscv64")]
+        asm!(".option push", ".option arch, +d", "fmv.x.d {}, f31", ".option pop",
+            out(reg) value, options(nostack));
+        #[cfg(target_arch = "loongarch64")]
+        asm!("movfr2gr.d {}, $f23", out(reg) value, options(nostack));
+    }
+    value
+}
+
+fn check_fpregs() {
+    const PARENT: u64 = 0x3ff0_0000_0000_0001;
+    const CHILD: u64 = 0x4000_0000_0000_0002;
+    const PATCHED: u64 = 0x4008_0000_0000_0003;
+    set_fp_marker(PARENT);
+    let pid = syscall::fork();
+    check(pid >= 0, "fork floating point target");
+    if pid == 0 {
+        check(fp_marker() == PARENT, "fork inherits floating point state");
+        let control = open_proc(syscall::getpid(), b"/ctl", syscall::OWRITE);
+        check(control >= 0, "open own ctl for floating point test");
+        set_fp_marker(CHILD);
+        check(syscall::write(control, b"stop".as_ptr(), 4) == 4, "stop with live floating point state");
+        check(fp_marker() == PATCHED, "debugger update reaches hardware floating point register");
+        exec_self(b"exit\0");
+    }
+    check(ctl(pid, b"waitstop"), "wait for floating point target to stop");
+    let fd = open_proc(pid, b"/fpregs", syscall::ORDWR);
+    check(fd >= 0 && syscall::seek(fd, FP_OFFSET, 0) == FP_OFFSET, "seek stopped fpregs");
+    let mut bytes = [0; 8];
+    check(syscall::read(fd, bytes.as_mut_ptr(), 8) == 8 && u64::from_le_bytes(bytes) == CHILD,
+        "fpregs exposes the captured register");
+    let patch = PATCHED.to_le_bytes();
+    check(syscall::seek(fd, FP_OFFSET, 0) == FP_OFFSET
+        && syscall::write(fd, patch.as_ptr(), patch.len()) == 8, "patch stopped floating point target");
+    check(ctl(pid, b"hang") && ctl(pid, b"start") && ctl(pid, b"waitstop"), "stop floating point target after exec");
+    check(syscall::seek(fd, FP_OFFSET, 0) == FP_OFFSET
+        && syscall::read(fd, bytes.as_mut_ptr(), 8) == 8 && bytes == [0; 8], "exec clears floating point state");
+    syscall::close(fd);
+    check(ctl(pid, b"start") && syscall::wait(pid as i32) == 0, "resume floating point target after exec");
+    check(fp_marker() == PARENT, "floating point state remains private to the process");
+}
+
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    "procsmoke_text_one: mov eax, 1; ret",
+    "procsmoke_text_two: mov eax, 2; ret",
+);
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    ".p2align 2", "procsmoke_text_one: mov w0, #1; ret",
+    "procsmoke_text_two: mov w0, #2; ret",
+);
+#[cfg(target_arch = "riscv64")]
+core::arch::global_asm!(
+    ".option push", ".option norvc", ".p2align 2", "procsmoke_text_one: addi a0, zero, 1; ret",
+    "procsmoke_text_two: addi a0, zero, 2; ret", ".option pop",
+);
+#[cfg(target_arch = "loongarch64")]
+core::arch::global_asm!(
+    ".p2align 2", "procsmoke_text_one: addi.w $a0, $zero, 1; jr $ra",
+    "procsmoke_text_two: addi.w $a0, $zero, 2; jr $ra",
+);
+
+fn check_text_execution() {
+    extern "C" {
+        fn procsmoke_text_one() -> u64;
+        fn procsmoke_text_two() -> u64;
+    }
+    let pid = syscall::fork();
+    check(pid >= 0, "fork target for executable patch");
+    if pid == 0 {
+        check(ctl(syscall::getpid(), b"stop"), "stop before executing patched text");
+        check(unsafe { procsmoke_text_one() } == 2, "execute modified text in child");
+        syscall::exit(0);
+    }
+    check(ctl(pid, b"waitstop"), "wait for text patch target");
+    let fd = open_proc(pid, b"/mem", syscall::ORDWR);
+    let address = procsmoke_text_one as *const () as i64;
+    let len = if cfg!(target_arch = "x86_64") { 5 } else { 4 };
+    check(fd >= 0 && syscall::seek(fd, address, 0) == address
+        && syscall::write(fd, procsmoke_text_two as *const () as *const u8, len) == len as i64,
+        "patch executable instruction in a stopped child");
+    syscall::close(fd);
+    check(ctl(pid, b"start") && syscall::wait(pid as i32) == 0, "patched instruction finishes successfully");
+    check(unsafe { procsmoke_text_one() } == 1, "patch does not change the parent executable text");
 }
 
 fn check_local_directories() {
@@ -531,6 +871,99 @@ fn check_scheduling_controls() {
     syscall::close(args);
 }
 
+extern "C" fn deadline_note(_registers: *mut u8, message: *const u8) {
+    if unsafe { core::slice::from_raw_parts(message, 16) } != b"deadline missed\0" {
+        syscall::noted(1);
+        return;
+    }
+    DEADLINE_NOTES.fetch_add(1, Ordering::Relaxed);
+    syscall::noted(0);
+}
+
+fn check_edf_notes_and_extra() {
+    let pid = syscall::getpid();
+    check(syscall::notify(Some(deadline_note)) == 0, "register EDF deadline note handler");
+    check(ctl(pid, b"period 800ms") && ctl(pid, b"deadline 200ms") && ctl(pid, b"cost 20ms")
+        && ctl(pid, b"sporadic") && ctl(pid, b"extra") && ctl(pid, b"deadlinenotes"),
+        "configure sporadic EDF with extra time and deadline notes");
+    let before = syscall::time(1);
+    check(ctl(pid, b"admit"), "admit EDF extra-time reservation");
+    let mut elapsed = 0;
+    while elapsed < 60 {
+        core::hint::spin_loop();
+        elapsed = syscall::time(1) - before;
+    }
+    check(elapsed < 800 && DEADLINE_NOTES.load(Ordering::Relaxed) == 0,
+        "extra runs after budget exhaustion without a missed-deadline note");
+    check(ctl(pid, b"expel"), "expel EDF extra-time reservation");
+    check(ctl(pid, b"cost 100ms") && ctl(pid, b"admit"), "admit EDF deadline-note reservation");
+    check(syscall::sleep_ms(300) == 0 && DEADLINE_NOTES.load(Ordering::Relaxed) == 1,
+        "deliver one deadline note on wake after an unfinished job");
+    check(syscall::sleep_ms(60) == 0 && DEADLINE_NOTES.load(Ordering::Relaxed) == 1,
+        "do not send duplicate deadline notes for the same release");
+    check(ctl(pid, b"expel") && syscall::notify(None) == 0, "clear EDF note-test state");
+}
+
+fn check_edf() {
+    let pid = syscall::getpid();
+    check(!ctl(pid, b"admit") && !ctl(pid, b"period 1ms"), "reject missing or sub-tick EDF parameters");
+    check(ctl(pid, b"period 0.2s") && ctl(pid, b"deadline 100ms") && ctl(pid, b"cost 20ms")
+        && ctl(pid, b"sporadic") && ctl(pid, b"deadlinenotes"), "configure EDF reservation");
+    let before = syscall::time(1);
+    check(ctl(pid, b"admit"), "admit EDF reservation");
+    check(syscall::sleep_ms(0) == 0 && syscall::time(1) - before >= 200, "yield until the next EDF release");
+    let child = syscall::fork();
+    check(child >= 0, "fork EDF admission competitor");
+    if child == 0 {
+        syscall::sleep_ms(10_000);
+        syscall::exit(0);
+    }
+    check(ctl(child, b"stop"), "stop EDF admission competitor");
+    check(ctl(child, b"period 200ms") && ctl(child, b"deadline 100ms") && ctl(child, b"cost 90ms")
+        && ctl(child, b"extra") && !ctl(child, b"admit"), "reject oversubscribed EDF reservations");
+    check(ctl(pid, b"expel") && ctl(child, b"admit"), "release EDF admission capacity");
+    check(ctl(child, b"kill") && syscall::wait(child as i32) != 0, "reap EDF admission competitor");
+    let before = syscall::time(1);
+    check(ctl(pid, b"admit"), "readmit EDF process for budget test");
+    let mut elapsed = 0;
+    while elapsed < 60 {
+        core::hint::spin_loop();
+        elapsed = syscall::time(1) - before;
+    }
+    check(elapsed >= 200, "exhausted EDF budget cannot run before the next release");
+    check(ctl(pid, b"expel"), "leave EDF scheduler after budget test");
+
+    let mut pipe = [-1; 2];
+    check(syscall::pipe(&mut pipe) == 0, "pipe for EDF dispatch order");
+    check(ctl(pid, b"period 500ms") && ctl(pid, b"deadline 250ms") && ctl(pid, b"cost 180ms")
+        && ctl(pid, b"admit"), "reserve earlier deadline for EDF test coordinator");
+    let mut children = [0; 2];
+    for (index, slot) in children.iter_mut().enumerate() {
+        let child = syscall::fork();
+        check(child >= 0, "fork EDF dispatch competitor");
+        if child == 0 {
+            syscall::write_all(pipe[1] as i64, &[b'a' + index as u8]);
+            syscall::exit(0);
+        }
+        *slot = child;
+        let deadline: &[u8] = if index == 0 { b"deadline 450ms" } else { b"deadline 350ms" };
+        check(ctl(child, b"stop") && ctl(child, b"period 500ms") && ctl(child, deadline)
+            && ctl(child, b"cost 20ms") && ctl(child, b"admit"), "admit EDF dispatch competitor");
+    }
+    check(ctl(children[0], b"start") && ctl(children[1], b"start"), "release both EDF competitors");
+    check(ctl(pid, b"expel"), "release EDF test coordinator reservation");
+    syscall::close(pipe[1] as i64);
+    let mut order = [0; 2];
+    for byte in &mut order {
+        check(syscall::read(pipe[0] as i64, byte, 1) == 1, "read EDF dispatch order");
+    }
+    syscall::close(pipe[0] as i64);
+    check(order == *b"ba", "dispatch earliest deadline first");
+    for child in children {
+        check(syscall::wait(child as i32) == 0, "reap EDF dispatch competitor");
+    }
+}
+
 fn check_private_exec() {
     let current = syscall::getpid();
     check(ctl(current, b"private"), "make process private");
@@ -626,12 +1059,13 @@ fn check_mount_io() {
     let reader = cmd::open_read("/tmp/mnt9p/listing");
     check(reader >= 0, "open remote directory for interrupted read");
     check(syscall::read(reader, output.as_mut_ptr(), 2) < 0, "directory read cannot split a record");
-    syscall::alarm(200);
     let count = syscall::read(reader, output.as_mut_ptr(), output.len());
     check(count > 0 && cmd::stat_name(&output[..count as usize]) == Some(b"first"),
-        "interrupted directory read reports completed entries");
+        "directory read reports completed entries without waiting for another batch");
     check(output[2..4] == [b'M', 0] && output[48..count as usize] == *b"\x05\0alice\x05\0staff\x06\0editor",
         "directory record preserves remote owner fields");
+    syscall::alarm(200);
+    check(syscall::read(reader, output.as_mut_ptr(), output.len()) == EINTR, "cancel outstanding directory read");
     let count = syscall::read(reader, output.as_mut_ptr(), output.len());
     check(count > 0 && cmd::stat_name(&output[..count as usize]) == Some(b"second"),
         "continue directory read without repeating entries");
@@ -644,6 +1078,310 @@ fn check_mount_io() {
     check(syscall::notify(None) == 0, "unregister 9P alarm handler");
     syscall::write_all(1, b"mount-io-ok\n");
     syscall::exit(0);
+}
+
+fn check_mount_parallel(disconnect: bool) -> ! {
+    let paths = if disconnect {
+        ["/tmp/drop9p/drop-one", "/tmp/drop9p/drop-two"]
+    } else {
+        ["/tmp/mnt9p/parallel-one", "/tmp/mnt9p/parallel-two"]
+    };
+    let run_pair = |paths: [&str; 2], cancel: bool, directory: bool| {
+        let files = paths.map(cmd::open_read);
+        check(files.iter().all(|fd| *fd >= 0), "open both multiplex test files");
+        let mut children = [0; 2];
+        for (index, child) in children.iter_mut().enumerate() {
+            *child = syscall::fork();
+            check(*child >= 0, "fork multiplex reader");
+            if *child == 0 {
+                if cancel && index == 0 {
+                    check(syscall::notify(Some(note_handler)) == 0, "register multiplex alarm handler");
+                    syscall::alarm(600);
+                }
+                let mut bytes = [0; 128];
+                let count = syscall::read(files[index], bytes.as_mut_ptr(), bytes.len());
+                if disconnect {
+                    check(count == IO_ERROR,
+                        "disconnected 9P wakes an outstanding reader with an I/O error");
+                } else if cancel && index == 0 {
+                    check(count == EINTR, "only the interrupted 9P request returns EINTR");
+                } else if directory {
+                    check(count > 0 && cmd::stat_name(&bytes[..count as usize]) == Some(&[b'1' + index as u8]),
+                        "route 9P directory reply to its requesting process");
+                } else {
+                    check(count == 1 && bytes[0] == b'1' + index as u8, "route 9P reply to its requesting process");
+                }
+                syscall::exit(0);
+            }
+        }
+        for child in children {
+            check(syscall::wait(child as i32) == 0, "reap successful multiplex reader");
+        }
+        for fd in files {
+            syscall::close(fd);
+        }
+    };
+    run_pair(paths, false, false);
+    if !disconnect {
+        run_pair(["/tmp/mnt9p/dir-one", "/tmp/mnt9p/dir-two"], false, true);
+        run_pair(["/tmp/mnt9p/cancel-one", "/tmp/mnt9p/cancel-two"], true, false);
+        check_mount_shared_offset();
+        check_mount_parallel_writes();
+        check_mount_metadata();
+        check_mount_path_metadata();
+        check_mount_list();
+        check_mount_clunk();
+        check_mount_open();
+        check_mount_killed_request();
+    }
+    syscall::write_all(1, if disconnect { b"mount-disconnect-ok\n" } else { b"mount-parallel-ok\n" });
+    syscall::exit(0)
+}
+
+fn check_mount_metadata() {
+    let [reader, writer, canceled] = ["/tmp/mnt9p/metadata-one", "/tmp/mnt9p/metadata-two", "/tmp/mnt9p/stat-cancel"]
+        .map(cmd::open_read);
+    check(reader >= 0 && writer >= 0 && canceled >= 0, "open metadata test files");
+    let child = syscall::fork();
+    check(child >= 0, "fork 9P metadata reader");
+    if child == 0 {
+        let mut output = [0; 128];
+        let count = syscall::fstat(reader, &mut output);
+        check(count > 0 && cmd::stat_name(&output[..count as usize]) == Some(b"metadata-one"),
+            "route the delayed fstat response to its requesting process");
+        syscall::exit(0);
+    }
+    let mut changes = [0xff; 49];
+    changes[..2].copy_from_slice(&47u16.to_le_bytes());
+    changes[21..25].copy_from_slice(&0o640u32.to_le_bytes());
+    changes[41..].fill(0);
+    check(syscall::fwstat(writer, &changes) == changes.len() as i64,
+        "receive fwstat while another process has an fstat pending");
+    check(syscall::wait(child as i32) == 0, "reap 9P metadata reader");
+
+    let mut output = [0; 128];
+    let count = syscall::fstat(writer, &mut output);
+    check(count > 25 && u32::from_le_bytes(output[21..25].try_into().unwrap()) == 0o640,
+        "read back the updated mode through fstat");
+    check(syscall::notify(Some(note_handler)) == 0, "register metadata alarm handler");
+    output.fill(0xa5);
+    syscall::alarm(200);
+    check(syscall::fstat(canceled, &mut output) == EINTR && output == [0xa5; 128],
+        "cancel a delayed fstat without touching its output buffer");
+    let count = syscall::fstat(canceled, &mut output);
+    check(count > 0 && cmd::stat_name(&output[..count as usize]) == Some(b"stat-cancel"),
+        "retry fstat on the same descriptor after cancellation");
+    check(syscall::notify(None) == 0, "unregister metadata alarm handler");
+    for fd in [reader, writer, canceled] {
+        syscall::close(fd);
+    }
+}
+
+fn check_mount_path_metadata() {
+    let reader = b"/tmp/mnt9p/path-one\0";
+    let writer = b"/tmp/mnt9p/path-two\0";
+    let canceled = b"/tmp/mnt9p/path-cancel\0";
+    let child = syscall::fork();
+    check(child >= 0, "fork 9P path metadata reader");
+    let mut output = [0; 128];
+    if child == 0 {
+        let count = syscall::stat(reader.as_ptr(), output.as_mut_ptr(), output.len());
+        check(count > 0 && cmd::stat_name(&output[..count as usize]) == Some(b"path-one"),
+            "route delayed path stat to its requesting process");
+        syscall::exit(0);
+    }
+    let mut changes = [0xff; 49];
+    changes[..2].copy_from_slice(&47u16.to_le_bytes());
+    changes[21..25].copy_from_slice(&0o620u32.to_le_bytes());
+    changes[41..].fill(0);
+    check(syscall::wstat(writer.as_ptr(), &changes) == changes.len() as i64,
+        "complete path wstat while another process has a path stat pending");
+    check(syscall::wait(child as i32) == 0, "reap 9P path metadata reader");
+    let count = syscall::stat(writer.as_ptr(), output.as_mut_ptr(), output.len());
+    check(count > 25 && u32::from_le_bytes(output[21..25].try_into().unwrap()) == 0o620,
+        "read back the updated mode through path stat");
+    check(syscall::notify(Some(note_handler)) == 0, "register path metadata alarm handler");
+    output.fill(0xa5);
+    syscall::alarm(200);
+    check(syscall::stat(canceled.as_ptr(), output.as_mut_ptr(), output.len()) == EINTR && output == [0xa5; 128],
+        "cancel a delayed path stat without touching its output buffer");
+    let count = syscall::stat(canceled.as_ptr(), output.as_mut_ptr(), output.len());
+    check(count > 0 && cmd::stat_name(&output[..count as usize]) == Some(b"path-cancel"),
+        "retry path stat after cancellation");
+    check(syscall::notify(None) == 0, "unregister path metadata alarm handler");
+}
+
+fn check_mount_clunk() {
+    for kill_closer in [false, true] {
+        let [ready, reader] = ["/tmp/mnt9p/clunk-ready", "/tmp/mnt9p/clunk-read"].map(cmd::open_read);
+        check(ready >= 0 && reader >= 0, "open clunk barrier files");
+        let child = syscall::fork();
+        check(child >= 0, "fork 9P closer");
+        let mut byte = 0;
+        if child == 0 {
+            let closing = cmd::open_read("/tmp/mnt9p/clunk-hold");
+            check(closing >= 0, "open fid only in its closing process");
+            let duplicate = syscall::dup2(closing, 80);
+            check(duplicate == 80 && syscall::close(closing) == 0, "close one of two descriptors");
+            check(syscall::read(duplicate, &mut byte, 1) == 0, "duplicate still owns the fid");
+            check(syscall::close(duplicate) == 0 && !kill_closer, "last close returns after Rclunk");
+            syscall::exit(0);
+        }
+        check(syscall::read(ready, &mut byte, 1) == 1 && byte == b'c', "observe outstanding Tclunk");
+        let status = open_proc(child, b"/status", syscall::OREAD);
+        let mut record = [0; 176];
+        check(status >= 0 && syscall::read(status, record.as_mut_ptr(), record.len()) == 176
+            && &record[56..60] == b"Wait", "last close must still be waiting for Rclunk");
+        syscall::close(status);
+        if kill_closer {
+            check(ctl(child, b"kill") && syscall::wait(child as i32) != 0, "kill the blocked 9P closer");
+        }
+        check(syscall::read(reader, &mut byte, 1) == 1 && byte == b'r',
+            "read with a clunk still outstanding on the same connection");
+        if !kill_closer {
+            check(syscall::wait(child as i32) == 0, "reap 9P closer after Rclunk");
+        }
+        syscall::close(ready);
+        syscall::close(reader);
+    }
+}
+
+fn check_mount_list() {
+    let child = syscall::fork();
+    check(child >= 0, "fork 9P LIST reader");
+    let mut names = [0xa5; 128];
+    if child == 0 {
+        let count = syscall::list(b"/tmp/mnt9p/list-one\0".as_ptr(), names.as_mut_ptr(), names.len());
+        check(count == 11 && &names[..11] == b"one\nsecond\n", "read separate LIST batches in order");
+        syscall::exit(0);
+    }
+    let count = syscall::list(b"/tmp/mnt9p/list-two\0".as_ptr(), names.as_mut_ptr(), names.len());
+    check(count == 11 && &names[..11] == b"two\nsecond\n", "receive LIST while another LIST is pending");
+    check(syscall::wait(child as i32) == 0, "reap 9P LIST reader");
+    let delayed = b"/tmp/mnt9p/list-cancel\0";
+    check(syscall::notify(Some(note_handler)) == 0, "register LIST alarm handler");
+    names.fill(0xa5);
+    syscall::alarm(200);
+    let count = syscall::list(delayed.as_ptr(), names.as_mut_ptr(), names.len());
+    check(count == 6 && &names[..6] == b"first\n" && names[6..] == [0xa5; 122],
+        "interrupt LIST after one batch without overwriting the rest of the buffer");
+    let count = syscall::list(delayed.as_ptr(), names.as_mut_ptr(), names.len());
+    check(count == 13 && &names[..13] == b"first\nsecond\n", "reopen LIST after interruption");
+    check(syscall::notify(None) == 0, "unregister LIST alarm handler");
+}
+
+fn check_mount_open() {
+    let child = syscall::fork();
+    check(child >= 0, "fork second 9P opener");
+    let (path, expected) = if child == 0 { ("/tmp/mnt9p/open-one", b'1') } else { ("/tmp/mnt9p/open-two", b'2') };
+    let fd = cmd::open_read(path);
+    let mut byte = 0;
+    check(fd >= 0 && syscall::read(fd, &mut byte, 1) == 1 && byte == expected,
+        "route reordered Ropen to the right process and descriptor");
+    syscall::close(fd);
+    if child == 0 {
+        syscall::exit(0);
+    }
+    check(syscall::wait(child as i32) == 0, "reap second 9P opener");
+
+    let canceled = b"/tmp/mnt9p/open-cancel\0";
+    check(syscall::notify(Some(note_handler)) == 0, "register open alarm handler");
+    syscall::alarm(200);
+    check(syscall::open(canceled.as_ptr(), syscall::OREAD) == EINTR, "interrupt outstanding Topen");
+    let fd = syscall::open(canceled.as_ptr(), syscall::OREAD);
+    check(fd >= 0 && syscall::read(fd, &mut byte, 1) == 1 && byte == b'o', "reopen after canceled Topen");
+    syscall::close(fd);
+    check(syscall::notify(None) == 0, "unregister open alarm handler");
+
+    let [ready, done] = ["/tmp/mnt9p/open-kill-ready", "/tmp/mnt9p/open-kill-done"].map(cmd::open_read);
+    check(ready >= 0 && done >= 0, "open Topen cancellation barriers");
+    let child = syscall::fork();
+    check(child >= 0, "fork Topen cancellation victim");
+    if child == 0 {
+        cmd::open_read("/tmp/mnt9p/open-kill");
+        check(false, "killed 9P opener must not return to user mode");
+        syscall::exit(1);
+    }
+    check(syscall::read(ready, &mut byte, 1) == 1 && byte == b'r', "wait for the victim's Topen");
+    check(ctl(child, b"kill") && syscall::wait(child as i32) != 0, "kill the blocked 9P opener");
+    check(syscall::read(done, &mut byte, 1) == 1 && byte == b'd', "keep the mount usable before Rflush");
+    syscall::close(ready);
+    syscall::close(done);
+}
+
+fn check_mount_killed_request() {
+    let [victim, ready, done] = ["/tmp/mnt9p/killed", "/tmp/mnt9p/kill-ready", "/tmp/mnt9p/kill-done"]
+        .map(cmd::open_read);
+    check(victim >= 0 && ready >= 0 && done >= 0, "open 9P cancellation barrier files");
+    let child = syscall::fork();
+    check(child >= 0, "fork 9P cancellation victim");
+    let mut byte = 0;
+    if child == 0 {
+        syscall::read(victim, &mut byte, 1);
+        check(false, "killed 9P reader must not return to user mode");
+        syscall::exit(1);
+    }
+    check(syscall::read(ready, &mut byte, 1) == 1 && byte == b'r', "wait for the victim's 9P request");
+    check(ctl(child, b"kill") && syscall::wait(child as i32) != 0, "kill and reap blocked 9P reader");
+    check(syscall::read(done, &mut byte, 1) == 1 && byte == b'd', "keep the mount usable after a blocked process dies");
+    for fd in [victim, ready, done] {
+        syscall::close(fd);
+    }
+}
+
+fn check_mount_shared_offset() {
+    let fd = cmd::open_read("/tmp/mnt9p/shared-offset");
+    check(fd >= 0, "open shared 9P description");
+    let duplicate = syscall::dup2(fd, 80);
+    check(duplicate == 80, "duplicate shared 9P description");
+    let mut children = [0; 2];
+    for (child, reader) in children.iter_mut().zip([fd, duplicate]) {
+        *child = syscall::fork();
+        check(*child >= 0, "fork shared 9P reader");
+        if *child == 0 {
+            let mut byte = 0;
+            check(syscall::read(reader, &mut byte, 1) == 1 && matches!(byte, b'1' | b'2'),
+                "read one byte from the shared offset");
+            syscall::exit(0);
+        }
+    }
+    for child in children {
+        check(syscall::wait(child as i32) == 0, "reap shared 9P reader");
+    }
+    let mut byte = 0;
+    check(syscall::read(fd, &mut byte, 1) == 0, "shared 9P description reaches EOF");
+    syscall::close(duplicate);
+    syscall::close(fd);
+}
+
+fn check_mount_parallel_writes() {
+    let paths = ["/tmp/mnt9p/write-one", "/tmp/mnt9p/write-two"];
+    let files = paths.map(cmd::create_write);
+    let messages: [&[u8]; 2] = [b"1", b"22"];
+    check(files.iter().all(|fd| *fd >= 0), "create both multiplex write files");
+    let mut children = [0; 2];
+    for (index, child) in children.iter_mut().enumerate() {
+        *child = syscall::fork();
+        check(*child >= 0, "fork multiplex writer");
+        if *child == 0 {
+            let message = messages[index];
+            check(syscall::write(files[index], message.as_ptr(), message.len()) == message.len() as i64,
+                "route 9P write reply to its requesting process");
+            syscall::exit(0);
+        }
+    }
+    for child in children {
+        check(syscall::wait(child as i32) == 0, "reap multiplex writer");
+    }
+    for ((path, writer), message) in paths.into_iter().zip(files).zip(messages) {
+        syscall::close(writer);
+        let reader = cmd::open_read(path);
+        check(reader >= 0, "reopen multiplex write file");
+        let mut bytes = [0; 4];
+        check(syscall::read(reader, bytes.as_mut_ptr(), bytes.len()) == message.len() as i64
+            && &bytes[..message.len()] == message, "read back multiplex write payload");
+        syscall::close(reader);
+    }
 }
 
 fn check_mount_union() -> ! {
@@ -724,7 +1462,14 @@ pub extern "C" fn cmd_main(argc: u64, argv: u64) -> ! {
             syscall::exit(0);
         }
         Some("mount-io") => check_mount_io(),
+        Some("mount-parallel") => check_mount_parallel(false),
+        Some("mount-disconnect") => check_mount_parallel(true),
         Some("mount-union") => check_mount_union(),
+        Some("crash-snapshot") => {
+            check_broken_child(unmapped_load, b"sys: trap: fault read addr=", true);
+            cmd::outln("crash snapshot verified");
+            syscall::exit(0);
+        }
         _ => {}
     }
     check_descriptors(0);
@@ -734,9 +1479,12 @@ pub extern "C" fn cmd_main(argc: u64, argv: u64) -> ! {
     check_await();
     check_proc_wait();
     check_registers();
+    check_fpregs();
+    check_text_execution();
     check_local_directories();
     check_saved_note();
     check_fault_notes();
+    check_bad_syscall_buffers();
     check_async_notes();
     check_note_groups();
     check_waitstop_note();
@@ -745,6 +1493,8 @@ pub extern "C" fn cmd_main(argc: u64, argv: u64) -> ! {
     check_trace();
     check_process_memory();
     check_scheduling_controls();
+    check_edf();
+    check_edf_notes_and_extra();
     check_orphan();
     check_srv_close_on_exit();
     check_detached_children();
