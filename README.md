@@ -78,9 +78,9 @@ The serial log is written to `build/<arch>/smoke-serial.log`. The four framebuff
 
 `boot-smoke` also exercises `rc` expansion, functions, here-documents, redirection, pipeline scope, exit strings and executable `#!` scripts. Its process checks cover `/proc/<pid>/ctl` debugger stops, reads of the executable image, writes to stopped processes' private text, floating-point register inheritance and isolation, `hang`, `NSAVE` and `NRSTR`, `alarm`, and note-group delivery after the group leader exits. It checks shared exit records, orphan and `RFNOWAIT` cleanup, descriptor groups, and `ORCLOSE` cleanup of `/srv`. The single-CPU EDF tests cover admission, budget exhaustion, release, deadline ordering, `extra` and `deadlinenotes` at 10 ms resolution.
 
-`mount-smoke` publishes connected channels through `/srv`, closes the original descriptors, and mounts a 9P2000 test server. It covers mount isolation, session reuse, `Tauth`, remote file operations, small `iounit` transfers, union directory stat records and fid cleanup. The TCP transport multiplexes opens on exclusive fids, regular-file I/O, direct directory reads and `LIST`, and path and descriptor metadata. The last explicit close on an exclusive TCP fid waits for `Rclunk` without blocking other processes; closing a duplicate does not clunk. If the closing process receives a note or exits, the in-flight clunk drains in the background. The test server reverses open and I/O replies, delays `Rclunk` until another process reads, and verifies that a killed opener's fid is not clunked before `Rflush`. It also tests shared offsets, canceled requests, partial reads, and disconnect with two outstanding readers. Path walks, opens that must clone shared fids, union directory I/O, and other control operations still wait synchronously. Non-TCP transports retain the serial path. See `build/<arch>/mount-serial.log`.
+`mount-smoke` publishes connected channels through `/srv`, closes the original descriptors, and mounts a 9P2000 test server. TCP multiplexes path walks for `open`, `create`, `remove`, `stat`, `wstat`, `list`, `chdir`, `bind` and `unmount`. It also multiplexes shared-fid clones for open, regular-file I/O, direct and union directory reads, `LIST` and descriptor metadata. The test server reorders `Rwalk`, `Ropen` and I/O replies, holds a union directory read until another process issues an independent request, delays `Rclunk` and checks fid cleanup after `Rflush`. Tests cover shared offsets, interrupted requests, partial reads and disconnect with outstanding readers. Session setup, mount negotiation, executable loading, and the legacy path-based permission calls still use synchronous device calls. Non-TCP transports use serial I/O. See `build/<arch>/mount-serial.log`.
 
-`make ARCH=<arch> rc-diff RC_REFERENCE=/path/to/plan9port/bin/rc` compares output and success/failure for 96 cases against plan9port `rc` in its classic compatibility mode (`-Y`). Cases cover subscript and expansion order, word adjacency, control-flow syntax, globbing, quoting, and redirection. The suite does not compare platform-specific status strings or prove exhaustive conformance. `/proc/<pid>/regs` and `fpregs` expose architecture-specific layouts from this port. Like the original PC port's `setkernur`, `kregs` returns a register record populated with diagnostic PC and SP, not a full register capture; the binary layout is specific to this port. `/proc/<pid>/segment` uses Plan 9's segment names, flags and hexadecimal address columns.
+`make ARCH=<arch> rc-diff RC_REFERENCE=/path/to/plan9port/bin/rc` compares stdout and success/failure for 138 cases against plan9port `rc -Y`. Cases cover subscript and expansion order, word adjacency, control-flow syntax, globbing, quoting, redirection and explicit backquote separators, including empty and Unicode separators.
 
 Noninteractive `rc` executes complete commands as it reads them, preserving multiline constructs and here-documents without buffering the entire script. Script input files use `OCEXEC`; the smoke test checks that successful `exec` closes marked channels, including duplicates, without closing ordinary channels or affecting a parent's copied descriptor group. A failed `exec` leaves marked descriptors open.
 
@@ -88,10 +88,42 @@ Noninteractive `rc` executes complete commands as it reads them, preserving mult
 
 - `make ARCH=<arch> native-9p-smoke PLAN9PORT=/path/to/plan9port` uses real factotum, Fossil and Venti. It saves a real `Broken` process snapshot to mounted Fossil, creates a read-only filesystem snapshot, syncs, makes further unsynced changes, and kills Fossil. After restart it checks the synced data, compares both copies of the crash snapshot byte for byte, and checks new writes. It then deletes the Fossil image, restores the archive to a new image from a restarted, read-only Venti server, and verifies the restored process snapshot. The test makes no claim about the lifetime of changes not explicitly synced. By default it uses p9sk1's same-identity ticket fallback, with no independent authsrv.
 - Set `PLAN9_TICKET_PORT` on that target to run the independent-authentication test instead. On a disposable Bell Labs Plan 9 VM, start `auth/keyfs -p`, use `auth/changeuser -p` to install `root` and `fossilhost` with different test passwords, then start `aux/listen1 -t tcp!*!567 /bin/auth/authsrv -d`. Forward guest TCP port 567 to a loopback-only host port. Provide the two test passwords to `make` through `PLAN9_TEST_CLIENT_PASSWORD` and `PLAN9_TEST_SERVER_PASSWORD`. The test uses separate factotum namespaces, requires the offline mount to fail, verifies that the independent server returns tickets for both identities, and reads back a file through the authenticated mount.
-- `make ARCH=<arch> panic-smoke` builds a separate image that executes an illegal instruction in kernel mode and checks the trap diagnostic, kernel backtrace, terminal halt and CPU-server reboot. The regular `boot-smoke` causes a real user-mode page fault, verifies its note and `Broken` state, inspects the retained registers, and checks exit accounting and `ctl kill` cleanup while the parent continues running.
-- `snap -o /tmp/crash.snap <pid>` captures a `Broken` or debugger-stopped process. The snapshot follows the Plan 9 container format with status, segments, registers, the ELF executable and readable process memory; the smoke test reads the result back and verifies original crash-stack bytes. An independent host check used Bell Labs' `readsnap` to parse captures from all four architectures and verify the ELF machine and original crash marker. This verifies the container, not the debugger ABI or native `acid`/`snapfs` operation. Use a new path: named output is created with mode `0600` and an existing file is not overwritten. Without `-o`, the snapshot goes to standard output. Do not resume or kill the target during capture, and treat output from a failed capture as incomplete.
+- `make ARCH=<arch> panic-smoke` checks the trap diagnostic, backtrace, halt, CPU-server reboot and the physical memory ELF written to an attached dump disk. `boot-smoke` induces a real user-mode page fault and checks the retained process, note, register state and `ctl kill` cleanup.
+- `snap -o /tmp/crash.snap <pid>` captures a `Broken` or debugger-stopped process. The Plan 9 container holds status, segments, registers, the executable and readable process memory. Keep the target stopped until capture completes. Named output requires a new path and uses mode `0600`. Omit `-o` to write to stdout. The `/proc` register layouts are architecture-specific. `kregs` exposes diagnostic PC and SP.
 
-Panic diagnostics go to the console; there is no automatic whole-machine memory dump. The boot image's root filesystem is RAM-backed. To preserve a process snapshot across a reboot, write it to a separately mounted persistent filesystem and sync that filesystem. The external Fossil/Venti test does not establish persistence of the boot root or recovery from physical power loss.
+#### Inspect an x86_64 Process Snapshot
+
+Copy the guest snapshot to the host and run the converter with two new output paths.
+
+```sh
+python3 scripts/snap_to_acid.py crash.snap crash.text crash.core
+PLAN9=/path/to/plan9port PATH=/path/to/plan9port/bin:$PATH acid crash.core crash.text
+```
+
+The converter supplies the executable and an AMD64 ELF core with general-purpose registers and captured memory. Use `*PC` and `*SP` for guest addresses and `fnbound(*PC - 0x40000000)` for the function bounds in the original ELF. `make ARCH=x86_64 acid-smoke PLAN9PORT=/path/to/plan9port` transfers a real guest crash and runs the unmodified plan9port debugger against it. This workflow supports offline x86_64 process snapshots.
+
+For offline inspection with native 9front AMD64 `acid`, also generate the module and copy `crash.core` and `crash.acid` to 9front.
+
+```sh
+python3 scripts/snap_to_acid.py --native-module crash.acid crash.snap crash.text crash.core
+acid -m amd64 -l crash.acid crash.core
+```
+
+The module exposes the captured `p9pc`, `p9sp` and other general-purpose registers, plus `p9read64(addr)` for captured process memory. Native inspection uses numeric addresses. The plan9port workflow also resolves function bounds. Add `NATIVE_ACID_ISO=/path/to/9front.iso` to `acid-smoke` to verify native inspection in a second VM with the same crash snapshot. This option requires `xorriso` and `mtools` and was verified with the uncompressed 9front 11952 AMD64 ISO. The test uses a temporary copy of the ISO.
+
+#### Local Root and Panic Disks
+
+Use separate NVMe images for root checkpoints and panic dumps. The example reserves 64 MiB for root checkpoints and 1 GiB for dumps from the default 512 MiB QEMU guest.
+
+```sh
+python3 scripts/disk_image.py create root root.img 64
+python3 scripts/disk_image.py create dump dump.img 1024
+make ARCH=x86_64 run-console QEMU_STORAGE='-drive if=none,id=p9root,file=root.img,format=raw -device nvme,drive=p9root,serial=plan9-root -drive if=none,id=p9dump,file=dump.img,format=raw -device nvme,drive=p9dump,serial=plan9-dump'
+```
+
+The root runs in RAM. To make its current contents durable, write `rootsync` to the root disk's `/dev/sd/sdN/ctl` as root. The kernel flushes the new checkpoint to NVMe and boots from the newest valid generation, with fallback to the previous checkpoint or boot archive. `make ARCH=<arch> rootdisk-smoke` checks recovery after forced QEMU termination and fallback after deliberate checkpoint corruption. This test exercises the virtual NVMe device and host-backed image.
+
+The kernel arms a blank dump disk at boot when capacity suffices. A kernel panic saves firmware-described RAM as physical-address ELF load segments before halt or reboot. A `Plan9rs` ELF note records the panic diagnostic and backtrace. Use `python3 scripts/disk_image.py extract dump.img panic.core` on the host after stopping QEMU. A completed dump is preserved across reboots. Use a fresh dump image for the next capture. The core includes guest memory contents and should be handled as sensitive data.
 
 ## Networking
 
