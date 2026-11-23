@@ -26,6 +26,8 @@ pub const SYS_PWRITE: usize = 12;
 pub const SYS_REMOVE: usize = 13;
 pub const SYS_STAT: usize = 18;
 pub const SYS_FSTAT: usize = 19;
+pub const SYS_WSTAT: usize = 20;
+pub const SYS_FWSTAT: usize = 21;
 pub const SYS_NOTIFY: usize = 14;
 pub const SYS_NOTED: usize = 15;
 pub const SYS_MOUNT: usize = 22;
@@ -67,6 +69,7 @@ pub const OWRITE: u32 = 1;
 pub const ORDWR: u32 = 2;
 pub const OEXEC: u32 = 3;
 pub const OCEXEC: u32 = 0x20;
+pub const OEXCL: u32 = 0x1000;
 
 /// Plan 9 create-permission bit: create a directory instead of a file.
 pub const DMDIR: u32 = 0x8000_0000;
@@ -517,6 +520,14 @@ pub fn stat(path: *const u8, buf: *mut u8, cap: usize) -> i64 {
 
 pub fn fstat(fd: i64, output: &mut [u8]) -> i64 {
     unsafe { syscall3(SYS_FSTAT, fd as u64, output.as_mut_ptr() as u64, output.len() as u64) }
+}
+
+pub fn wstat(path: *const u8, record: &[u8]) -> i64 {
+    unsafe { syscall3(SYS_WSTAT, path as u64, record.as_ptr() as u64, record.len() as u64) }
+}
+
+pub fn fwstat(fd: i64, record: &[u8]) -> i64 {
+    unsafe { syscall3(SYS_FWSTAT, fd as u64, record.as_ptr() as u64, record.len() as u64) }
 }
 
 pub fn brk(addr: usize) -> i64 {

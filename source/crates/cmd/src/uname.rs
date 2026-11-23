@@ -3,13 +3,13 @@
 /// Architecture of the running kernel; the command is compiled per
 /// target, so this resolves at build time.
 #[cfg(target_arch = "aarch64")]
-const KERNEL_ARCH: &str = "aarch64";
+pub const KERNEL_ARCH: &str = "aarch64";
 #[cfg(target_arch = "riscv64")]
-const KERNEL_ARCH: &str = "riscv64";
+pub const KERNEL_ARCH: &str = "riscv64";
 #[cfg(target_arch = "loongarch64")]
-const KERNEL_ARCH: &str = "loongarch64";
+pub const KERNEL_ARCH: &str = "loongarch64";
 #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64")))]
-const KERNEL_ARCH: &str = "x86_64";
+pub const KERNEL_ARCH: &str = "x86_64";
 
 pub fn main(argc: usize, argv: *const *const u8) -> i32 {
     let mut all = argc == 1;
