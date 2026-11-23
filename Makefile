@@ -40,7 +40,7 @@ ISO_FILE     = $(BUILD_DIR)/plan9.iso
 # Cargo commands should run from source/ where the workspace is.
 CARGO_CMD = cd $(SOURCE_DIR) && $(CARGO)
 
-.PHONY: all build-tool kernel init esp rootfs iso check-all clean run run-console run-serial boot-smoke net-smoke mount-smoke native-9p-smoke panic-smoke rc-diff help
+.PHONY: all build-tool kernel init esp rootfs iso check-all clean run run-console run-serial boot-smoke net-smoke mount-smoke native-9p-smoke panic-smoke rootdisk-smoke rc-diff acid-smoke help
 
 # =============================================================================
 # Build targets (delegate to build-tool)
@@ -95,19 +95,21 @@ QEMU_MACHINE_aarch64 = -M virt,highmem-mmio=off -cpu cortex-a72 -device ramfb $(
 QEMU_MACHINE_riscv64 = -M virt -device VGA $(QEMU_UEFI_KEYBOARD) -device virtio-keyboard-device
 QEMU_MACHINE_loongarch64 = -M virt -cpu la464 -device VGA $(QEMU_UEFI_KEYBOARD) -device virtio-keyboard-pci
 QEMU_NIC ?= e1000
-QEMU_CMD = qemu-system-$(ARCH) $(QEMU_MACHINE_$(ARCH)) -m $(MEM) $(UEFI_ARGS) \
+QEMU_CMD = qemu-system-$(ARCH) $(QEMU_MACHINE_$(ARCH)) -m $(MEM) $(UEFI_ARGS) $(QEMU_STORAGE) \
 	-netdev user,id=net0$(QEMU_NET_OPTIONS) -device $(QEMU_NIC),netdev=net0 $(QEMU_EXTRA_NETWORK) \
 	-cdrom "$(ISO_FILE)" -monitor none
 
 run: QEMU_OUTPUT = -display gtk
 run-console: QEMU_OUTPUT = -display none -serial stdio
 run-serial: QEMU_OUTPUT = -display none -serial file:"$(BUILD_DIR)/serial.log"
-boot-smoke net-smoke mount-smoke native-9p-smoke rc-diff: QEMU_OUTPUT = -display none -serial stdio
+boot-smoke net-smoke mount-smoke native-9p-smoke rootdisk-smoke rc-diff acid-smoke: QEMU_OUTPUT = -display none -serial stdio
 boot-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" "$(ARCH)" "$(BUILD_DIR)/smoke-serial.log" --
 net-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --network "$(ARCH)" "$(BUILD_DIR)/net-serial.log" --
 mount-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --mount "$(ARCH)" "$(BUILD_DIR)/mount-serial.log" --
 native-9p-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --plan9port "$(PLAN9PORT)" $(if $(PLAN9_TICKET_PORT),--ticket-port "$(PLAN9_TICKET_PORT)") "$(ARCH)" "$(BUILD_DIR)/native-9p-serial.log" --
 rc-diff: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --rc-reference "$(RC_REFERENCE)" "$(ARCH)" "$(BUILD_DIR)/rc-diff-serial.log" --
+rootdisk-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --rootdisk "$(ARCH)" "$(BUILD_DIR)/rootdisk-serial.log" --
+acid-smoke: QEMU_RUNNER = python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --acid "$(PLAN9PORT)/bin/acid" $(if $(NATIVE_ACID_ISO),--native-acid-iso "$(NATIVE_ACID_ISO)") "$(ARCH)" "$(BUILD_DIR)/acid-serial.log" --
 
 panic-smoke: BUILD_DIR := $(PROJECT_ROOT)/build/$(ARCH)/panic-smoke
 panic-smoke: QEMU_OUTPUT = -display none -serial stdio
@@ -116,8 +118,9 @@ panic-smoke: build-tool
 	cd "$(SOURCE_DIR)" && PLAN9_PANIC_SMOKE=1 $(CARGO) run -p build-tool -- --arch $(ARCH) --build-dir "$(BUILD_DIR)" iso
 	python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --panic "$(ARCH)" "$(BUILD_DIR)/halt-serial.log" -- $(QEMU_CMD) $(QEMU_OUTPUT)
 	python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --panic --cpu-service "$(ARCH)" "$(BUILD_DIR)/reboot-serial.log" -- $(QEMU_CMD) $(QEMU_OUTPUT)
+	python3 "$(PROJECT_ROOT)/scripts/boot-smoke.py" --dump "$(ARCH)" "$(BUILD_DIR)/dump-serial.log" -- $(QEMU_CMD) $(QEMU_OUTPUT)
 
-run run-console run-serial boot-smoke net-smoke mount-smoke native-9p-smoke rc-diff: iso
+run run-console run-serial boot-smoke net-smoke mount-smoke native-9p-smoke rootdisk-smoke rc-diff acid-smoke: iso
 	@test -f "$(UEFI_FW)" || { echo "No UEFI firmware for $(ARCH); set UEFI_FW_$(ARCH)." >&2; exit 1; }
 	@if [ "$(ARCH)" = "riscv64" ] || [ -n "$(UEFI_VARS)" ]; then \
 		test -f "$(UEFI_VARS)" || { echo "No UEFI variables image for $(ARCH); set UEFI_VARS_$(ARCH)." >&2; exit 1; }; \
@@ -152,7 +155,10 @@ help:
 	@echo "  native-9p-smoke - Test factotum, Fossil and Venti with PLAN9PORT=/path/to/plan9port"
 	@echo "                    Set PLAN9_TICKET_PORT to test an independent Plan 9 authsrv instead"
 	@echo "  panic-smoke  - Test panic diagnostics, halt and restart in QEMU"
+	@echo "  rootdisk-smoke - Test local NVMe root checkpoint and recovery in QEMU"
 	@echo "  rc-diff      - Compare shell behavior with RC_REFERENCE=/path/to/plan9port/bin/rc"
+	@echo "  acid-smoke   - Inspect an x86_64 crash with PLAN9PORT=/path/to/plan9port"
+	@echo "                 Add NATIVE_ACID_ISO=/path/to/9front.iso for native acid"
 	@echo ""
 	@echo "Variables:"
 	@echo "  ARCH=x86_64|aarch64|riscv64|loongarch64"

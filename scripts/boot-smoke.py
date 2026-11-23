@@ -11,6 +11,7 @@ import pty
 from queue import Empty, Queue
 import re
 import selectors
+import shutil
 import signal
 import socket
 import struct
@@ -22,6 +23,8 @@ import time
 import tty
 from concurrent.futures import ThreadPoolExecutor
 
+from disk_image import MACHINES, PAGE, create_image, dump_info
+from snap_to_acid import convert_snapshot
 
 PROMPT = re.compile(rb"(?:root|glenda)@plan9:[^\r\n]*> ")
 COMMANDS = b"""
@@ -182,7 +185,7 @@ def check_boot(arch, shell, qmp, output_dir):
     check_rc_and_processes(shell)
 
 
-def check_panic(shell, qmp, arch, cpu_service):
+def check_panic(shell, qmp, arch, cpu_service, dump=False):
     shell.read_until(re.compile(MENU_MARKER), 90, "UEFI GOP menu")
     if cpu_service:
         qmp.key("down")
@@ -196,6 +199,8 @@ def check_panic(shell, qmp, arch, cpu_service):
     }[arch]
     shell.read_until(re.compile(rb"PANIC: [^\n]*\n\s*" + message), 45, "illegal kernel instruction panic")
     shell.read_until(re.compile(rb"Kernel backtrace .*\n\s*#0 0x[0-9a-f]+"), 5, "kernel backtrace")
+    if dump:
+        shell.read_until(re.compile(rb"Saved kernel memory dump\.|Kernel memory dump failed\."), 180, "panic dump result")
     if cpu_service:
         shell.read_until(re.compile(rb"CPU server: attempting reboot"), 5, "panic reboot decision")
         shell.read_until(re.compile(MENU_MARKER), 90, "UEFI menu after reset")
@@ -280,6 +285,10 @@ RC_DIFF_CASES = {
     "nested lists": "echo (() ((one)) (two (three four)) ())",
     "white space subject matching": "~ (a b) 'a b' && echo match",
     "empty switch": "switch(x) {}; echo unexpected",
+    "switch rejects newline before opening brace": "switch x\n{ case x; echo unexpected }",
+    "switch accepts separators before the first case": "switch x { ; case x; echo matched }",
+    "switch rejects a lone case with no commands": "switch x { case x; } && echo unexpected",
+    "switch accepts a final case with no commands": "switch x { case y; echo unexpected; case x } && echo matched",
     "case without patterns": "switch(()) { case; echo unexpected; case ''; echo matched }",
     "case fallthrough is disabled": "switch(x) { case x; echo match; case *; echo unexpected }",
     "character class edge cases": "~ ']' []] && echo bracket; ~ - [-a] && echo leading; ~ b [z-a] && echo descending; ~ a [a-] && echo trailing; true",
@@ -305,11 +314,56 @@ RC_DIFF_CASES = {
     "command substitution requires explicit suffix concatenation": "echo `{echo word}suffix; echo `{echo word}^suffix",
     "subscript requires explicit suffix concatenation": "x=(one two); echo $x(1)suffix; echo $x(1)^suffix",
     "process substitution starts a new word after a literal": "fn fields { echo $#* }; fields x<{true}",
+    "recursive functions restore positional parameters": "fn visit { echo start $1; if(! ~ $#* 1) visit $*(2-); echo end $1 }; visit a b c",
+    "functions declared together and removed": "fn alpha beta { echo body $* }; alpha one; beta two; fn alpha beta; !! alpha >[2]/dev/null",
+    "nested assignment and function scope": "value=outside; fn show { echo $value $* }; value=inside show one two; show three",
+    "empty command group in boolean list": "true; {} && echo empty; ! {} || echo negated",
+    "switch subject with several words": "switch(a b) { case 'a b'; echo joined; case a b; echo separate; case *; echo wildcard }",
+    "for loop consumes its original word list": "items=(a b c); for (item in $items) { echo $item; items=z }; echo $items",
+    "while condition controls exit": "x=(a b c); while(! ~ $#x 0) { echo $x(1); x=$x(2-) }; echo done",
+    "nested if not binds in a command group": "if(~ a a) { if(~ b c) echo unexpected; if not echo inner }; if not echo unexpected",
+    "subscript ranges and repeated indices": "x=(a b c d); echo $x(-2 4- 3 3 7 4-2)",
+    "subscript and concatenation in a quoted list": "x=(red green blue); echo pre^$x(3 1)^post; echo $\"x(2-)",
+    "keyword and metacharacter adjacency": "echo 'if'^not 'case'^')' 'a''b' a^'|'",
+    "quoted wildcard after explicit concatenation": "~ 'prefix*tail' pre^fix^'*'^t* && echo matched",
+    "glob matches across several directories": "mkdir first second; >first/z; >second/a; echo */[az]; rm first/z second/a; rm first second",
+    "comments on continued syntax": "echo one # ignore this\necho two |\ncat # ignore this too\n",
+    "literal blank lines inside a quoted word": "echo 'first\n\nthird'",
+    "here document preserves a literal tab": "cat <<'END'\n\tindented\nEND\n",
+    "here document redirected into a command group": "{ cat; echo after } <<EOF\nhello\nEOF\n",
+    "here document inside a multiline group": "{ cat <<EOF\n echo after\n}\nhello\nEOF\n",
+    "here document before a pipeline continuation": "cat <<EOF |\ncat\nhello\nEOF\n",
+    "here document inside an if condition": "if(cat <<EOF)\necho yes\nhello\nEOF\n",
+    "here document inside a command substitution": "echo `{cat <<EOF\n}\nhello\nEOF\n",
+    "here documents share a complete command boundary": "{ cat <<ONE\ncat <<TWO\n}\nfirst\nONE\nsecond\nTWO\n",
+    "descriptor swap survives a pipeline": "{ echo out; echo err >[1=2] } >[3=1] >[1=2] >[2=3] | cat",
+    "pipeline combines with conditional and group": "{ echo first; echo second } | cat | cat && echo after",
+    "background process and wait with redirection": "{ echo earlier } >bg & wait; cat bg; rm bg",
+    "substitution uses a multi-character ifs list": "ifs=(: ,); x=`{echo 'one:two,three'}; echo $#x; echo $x(2)",
+    "explicit backquote separator overrides ifs": "ifs=,; x=`: {printf '%s' 'one:two,three'}; echo $#x $x",
+    "explicit Unicode separator in UTF-8 output": "sep='界'; x=`$sep {printf '%s' 'one界two界界three'}; echo $#x $x",
+    "explicit empty separator retains whitespace": "x=`'' {printf '%s' 'a b'}; echo $#x; printf '[%s]\\n' $x",
+    "empty backquote output produces an empty list": "x=`: {true}; echo $#x",
+    "literal metacharacter as a separator": "x=`'^' {printf '%s' 'a^b'}; echo $#x $x",
+    "two process substitutions are independent": "cat <{echo first} <{echo second}",
+    "direct command execution uses expanded argv": "args=(echo hello world); $args",
+    "empty function body preserves status": "fn nothing {}; true; nothing && echo preserved",
+    "unclosed function definition is a syntax error": "fn unfinished { echo unexpected",
+    "unclosed subscript is a syntax error": "x=(a b); echo $x(1",
+    "dangling pipeline is a syntax error": "echo unexpected |",
+    "non-numeric descriptor is a syntax error": "echo unexpected >[abc=1]",
 }
 
 
 def rc_quote(value):
     return b"'" + value.replace(b"'", b"''") + b"'"
+
+
+def write_rc_line(line, mode, path):
+    chunks = line.split(b"\t")
+    template = b"\\t".join([b"%s"] * len(chunks)) + b"\\n"
+    arguments = b" ".join(rc_quote(chunk) for chunk in chunks)
+    return b"printf " + rc_quote(template) + b" " + arguments + b" " + mode + path
 
 
 def run_rc_reference(reference, script, directory, environment, name, timeout=10):
@@ -342,9 +396,9 @@ def check_rc_reference(shell, reference):
             lines = script.read_bytes().splitlines()
             for index, line in enumerate(lines[:-1]):
                 mode = b">" if index == 0 else b">>"
-                shell.command(b"printf '%s\\n' " + rc_quote(line) + b" " + mode + script_path)
+                shell.command(write_rc_line(line, mode, script_path))
             mode = b">>" if len(lines) > 1 else b">"
-            wrapped = (b"printf '%s\\n' " + rc_quote(lines[-1]) + b" " + mode + script_path + b" && "
+            wrapped = (write_rc_line(lines[-1], mode, script_path) + b" && "
                        b"@ { cd /tmp/rc-differential && rc test.rc >[2]/dev/null } "
                        b"&& echo __RC_DIFF_OK__ || echo __RC_DIFF_FAILED__")
             guest = shell.command(wrapped).partition(b"\n")[2].splitlines()
@@ -577,7 +631,10 @@ def serve_9p(listener, factotum=False, disconnect=False):
         b"path-one": b"1", b"path-two": b"22", b"path-cancel": b"cancel",
         b"clunk-hold": b"", b"clunk-ready": b"c", b"clunk-read": b"r",
         b"open-one": b"1", b"open-two": b"2", b"open-cancel": b"o",
+        b"walk-cancel": b"w", b"union-arm": b"a", b"union-release": b"r",
         b"open-kill": b"", b"open-kill-ready": b"r", b"open-kill-done": b"d",
+        b"clone-cancel": b"c", b"remove-cancel": b"", b"remove-kill": b"",
+        b"remove-kill-ready": b"r",
         b"list-one": b"one", b"list-two": b"two", b"list-cancel": b"first",
     }
     if disconnect:
@@ -609,6 +666,13 @@ def serve_9p(listener, factotum=False, disconnect=False):
     opened = set()
     open_pair = {}
     reversed_opens = False
+    walk_pair = {}
+    reversed_walks = False
+    canceled_fid = None
+    union_armed = False
+    union_read = None
+    union_release = None
+    union_overlapped = False
     open_flush_tag = None
     open_kill_released = False
     clunk_tag = None
@@ -666,6 +730,22 @@ def serve_9p(listener, factotum=False, disconnect=False):
                     else:
                         fids[newfid] = name
                         payload = struct.pack("<H", count) + (qid(name) if count else b"")
+                        if count and name in (b"open-one", b"open-two"):
+                            walk_pair[name] = (tag, payload)
+                            if len(walk_pair) == 2:
+                                for pending_tag, data in reversed(walk_pair.values()):
+                                    connection.sendall(struct.pack("<IBH", len(data) + 7, 111, pending_tag) + data)
+                                walk_pair.clear()
+                                reversed_walks = True
+                            continue
+                        if count and name == b"walk-cancel" and name not in flushed:
+                            canceled_fid = newfid
+                            canceled = (tag, name, b"")
+                            continue
+                        if not count and name == b"clone-cancel" and name not in flushed:
+                            canceled_fid = newfid
+                            canceled = (tag, name, b"")
+                            continue
                 elif kind == 112:
                     fid = struct.unpack_from("<I", body)[0]
                     name = fids[fid]
@@ -675,6 +755,10 @@ def serve_9p(listener, factotum=False, disconnect=False):
                             connection.sendall(struct.pack("<IBHIc", 12, 117, ready, 1, b"r"))
                         continue
                     opened.add(fid)
+                    if body[4] & 0x10:
+                        if not name:
+                            raise RuntimeError("client tried to truncate the mount root")
+                        files[name].clear()
                     payload = qid(name) + struct.pack("<I", 64 if name == b"chunked" else 0)
                     if name in (b"open-one", b"open-two"):
                         if name in open_pair or tag in (entry[0] for entry in open_pair.values()):
@@ -689,6 +773,9 @@ def serve_9p(listener, factotum=False, disconnect=False):
                 elif kind == 114:
                     fid, length = struct.unpack_from("<IH", body)
                     name = body[6:6 + length]
+                    if name == b"create-cancel" and name not in flushed:
+                        canceled = (tag, name, b"")
+                        continue
                     files[name] = bytearray()
                     fids[fid] = name
                     payload = qid(name) + struct.pack("<I", 64 if name == b"chunked" else 0)
@@ -698,6 +785,22 @@ def serve_9p(listener, factotum=False, disconnect=False):
                     if name == b"chunked" and count > 64:
                         raise RuntimeError(f"request exceeds iounit: {count}")
                     if kind == 116:
+                        if name == b"union-arm":
+                            union_armed = True
+                        if union_armed and name in (b"", b"union-release"):
+                            if not name:
+                                data = b"".join(stat(key, value) for key, value in files.items())[offset:offset + count]
+                                union_read = (tag, data)
+                            else:
+                                union_release = tag
+                            if union_read is not None and union_release is not None:
+                                pending_tag, data = union_read
+                                connection.sendall(struct.pack("<IBHIc", 12, 117, union_release, 1, b"r"))
+                                connection.sendall(struct.pack("<IBHI", len(data) + 11, 117, pending_tag, len(data)) + data)
+                                union_read = union_release = None
+                                union_armed = False
+                                union_overlapped = True
+                            continue
                         if name in (b"list-one", b"list-two") and offset == 0:
                             if name in held or tag in held.values():
                                 raise RuntimeError("invalid overlapping LIST reads")
@@ -748,6 +851,9 @@ def serve_9p(listener, factotum=False, disconnect=False):
                             continue
                         if name == b"kill-done" and b"killed" not in flushed:
                             raise RuntimeError("killing a blocked process did not flush its 9P request")
+                        if name == b"remove-kill-ready" and (canceled is None or canceled[1] != b"remove-kill"):
+                            held[name] = tag
+                            continue
                         if name == b"open-kill-ready" and (canceled is None or canceled[1] != b"open-kill"):
                             held[name] = tag
                             continue
@@ -832,7 +938,23 @@ def serve_9p(listener, factotum=False, disconnect=False):
                         payload = struct.pack("<I", count)
                 elif kind in (120, 122):
                     fid = struct.unpack_from("<I", body)[0]
+                    name = fids[fid]
+                    if kind == 122 and name == b"remove-cancel" and name not in flushed:
+                        canceled_fid = fid
+                        canceled = (tag, name, b"")
+                        continue
+                    if kind == 122 and name == b"remove-kill":
+                        del fids[fid]
+                        error = string(b"permission denied")
+                        canceled = (tag, name, struct.pack("<IBH", 7 + len(error), 107, tag) + error)
+                        if (ready := held.pop(b"remove-kill-ready", None)) is not None:
+                            connection.sendall(struct.pack("<IBHIc", 12, 117, ready, 1, b"r"))
+                        continue
                     name = fids.pop(fid)
+                    if fid == canceled_fid:
+                        if name not in flushed:
+                            raise RuntimeError("clunked a walk's destination before Rflush")
+                        canceled_fid = None
                     was_opened = fid in opened
                     opened.discard(fid)
                     if name == b"open-kill" and not open_kill_released:
@@ -882,11 +1004,13 @@ def serve_9p(listener, factotum=False, disconnect=False):
     if (disconnect or fids or not required.issubset(requests) or not factotum
             and (not reversed_requests or not reversed_directories or not reversed_lists or held or not reversed_writes or writes
                  or not reversed_opens or open_pair or open_flush_tag is not None
+                 or not reversed_walks or walk_pair or canceled_fid is not None or not union_overlapped
                  or reversed_metadata != metadata.keys() or any(metadata.values()) or completed_clunks != 2
                  or shared_offset != 2 or modes.get(b"metadata-two") != 0o640 or modes.get(b"path-two") != 0o620
                  or modes.get(b"new") != 0o600
                  or flushed != {b"flush", b"flush-race", b"listing", b"cancel-one", b"killed", b"stat-cancel",
-                                b"path-cancel", b"list-cancel", b"open-cancel", b"open-kill"})):
+                                b"path-cancel", b"list-cancel", b"open-cancel", b"open-kill", b"walk-cancel",
+                                b"clone-cancel", b"create-cancel", b"remove-cancel", b"remove-kill"})):
         raise RuntimeError(f"incomplete 9P exchange, live fids {fids}, requests {requests}")
 
 
@@ -910,6 +1034,125 @@ def listen_local(listener):
     return listener.getsockname()[1]
 
 
+def check_acid_registers(output, pc, sp):
+    match = re.search(rb"P9REG[ \t]+(0x[0-9a-f]+)[ \t]+(0x[0-9a-f]+)[ \t]+(0x[0-9a-f]+)", output, re.IGNORECASE)
+    if not match or tuple(int(value, 16) for value in match.groups()) != (pc, sp, 0x37C11FC3B5E2A069):
+        raise RuntimeError(f"acid could not recover the guest PC, SP and crash-stack marker: {output!r}")
+
+
+def prepare_native_acid_iso(source, destination):
+    replacements = {
+        "/cfg/plan9.ini": b"cdboot=yes\nconsole=0\nvgasize=text\nbootfile=/amd64/9pc64\n",
+        "/usr/glenda/lib/profile": (
+            b"dossrv -r -f /dev/sdC0/data\n"
+            b"mount /srv/dos /n/dos\n"
+            b"acid -m amd64 -l /n/dos/crash.acid /n/dos/crash.core </n/dos/acid.in\n"
+            b"echo P9NATIVE-END\n"
+        ),
+    }
+    args = ["xorriso", "-indev", str(source)]
+    for name in replacements:
+        args += ["-find", name, "-exec", "report_lba", "--"]
+    result = subprocess.run(args, capture_output=True, timeout=20, text=True)
+    if result.returncode:
+        raise RuntimeError(f"cannot read 9front ISO layout: {result.stderr.strip()}")
+    layout = result.stdout
+    image_size = source.stat().st_size
+    shutil.copyfile(source, destination)
+    with destination.open("r+b") as image:
+        for name, contents in replacements.items():
+            pattern = rf"^File data lba:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'{re.escape(name)}'$"
+            extents = re.findall(pattern, layout, re.MULTILINE)
+            if len(extents) != 1:
+                raise ValueError(f"expected one ISO extent for {name} in {source}")
+            extent, block, blocks, size = map(int, extents[0])
+            if extent != 0 or len(contents) > size or size > blocks * 2048 or block * 2048 + size > image_size:
+                raise ValueError(f"cannot replace {name} in {source}")
+            image.seek(block * 2048)
+            image.write(contents.ljust(size, b"\n"))
+
+
+def check_native_acid(source, core, module, pc, sp, marker_address, log_path):
+    directory = core.parent
+    iso = directory / "9front.iso"
+    disk = directory / "payload.img"
+    commands = directory / "acid.in"
+    prepare_native_acid_iso(source, iso)
+    commands.write_text(f'print("P9REG ", p9pc, " ", p9sp, " ", p9read64({marker_address:#x}), "\\n");\n')
+    with disk.open("xb") as payload:
+        payload.truncate(8 << 20)
+    subprocess.run(["mformat", "-i", disk, "::"], check=True, timeout=20)
+    subprocess.run(["mcopy", "-i", disk, core, "::crash.core"], check=True, timeout=20)
+    subprocess.run(["mcopy", "-i", disk, module, commands, "::"], check=True, timeout=20)
+    qemu = ["qemu-system-x86_64", "-cpu", "max", "-m", "512", "-boot", "d", "-cdrom", str(iso),
+            "-drive", f"file={disk},format=raw,snapshot=on", "-display", "none", "-monitor", "none",
+            "-serial", "stdio", "-nic", "none"]
+    try:
+        with log_path.open("wb", buffering=0) as log, selectors.DefaultSelector() as selector, \
+                subprocess.Popen(qemu, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT) as process:
+            try:
+                serial = SerialShell(process, selector, log)
+                serial.read_until(re.compile(rb"bootargs is [^\r\n]+\] "), 90, "9front boot prompt")
+                serial.send(b"")
+                serial.read_until(re.compile(rb"user\[glenda\]: "), 60, "9front login prompt")
+                serial.send(b"")
+                output = serial.read_until(re.compile(rb"P9NATIVE-END\r?\n"), 90, "9front acid result")
+                check_acid_registers(output, pc, sp)
+            finally:
+                process.kill()
+    except (OSError, RuntimeError) as error:
+        raise RuntimeError(f"9front acid failed: {error}; see {log_path}") from error
+
+
+def check_acid(shell, acid, native_iso, native_log):
+    acid = Path(acid).resolve(strict=True)
+    result = shell.command(b"/bin/aux/procsmoke crash-snapshot", 90)
+    match = re.search(rb"^crash registers (\d+) (\d+) (\d+)$", result, re.MULTILINE)
+    if not match or b"crash snapshot verified" not in result.splitlines():
+        raise RuntimeError(f"guest did not capture a crashed process: {result!r}")
+    pc, sp, marker_address = map(int, match.groups())
+
+    def receive_snapshot(listener, snapshot):
+        with listener.accept()[0] as connection, snapshot.open("xb") as output:
+            connection.settimeout(20)
+            size = 0
+            while chunk := connection.recv(65536):
+                size += len(chunk)
+                if size > 16 << 20:
+                    raise RuntimeError("unexpectedly large crash snapshot")
+                output.write(chunk)
+
+    with tempfile.TemporaryDirectory(prefix="plan9-acid-") as directory:
+        snapshot, text, core = (Path(directory) / name for name in ("crash.snap", "text", "core"))
+        with socket.socket() as listener, ThreadPoolExecutor(max_workers=1) as workers:
+            port = str(listen_local(listener)).encode()
+            receiving = workers.submit(receive_snapshot, listener, snapshot)
+            expect_line(shell, b"{ id=`{cat <[0=8]}; echo 'connect 10.0.2.2!" + port + b"' >[1=8] && "
+                        b"cat /tmp/procsmoke.snap >/net/tcp/$id/data } <>[8]/net/tcp/clone && echo snapshot-sent",
+                        b"snapshot-sent", 60)
+            receiving.result(timeout=25)
+        module = Path(directory) / "crash.acid" if native_iso else None
+        convert_snapshot(snapshot, text, core, module)
+        command = (f'print("P9REG ", fmt(*PC, \'Y\'), " ", fmt(*SP, \'Y\'), " ", *fmt({marker_address:#x}, \'Y\'), "\\n");\n'
+                   'print("P9FN ", fnbound(*PC - 0x40000000), "\\n");\n')
+        environment = dict(os.environ, PLAN9=str(acid.parent.parent), PATH=f"{acid.parent}{os.pathsep}{os.defpath}")
+        result = subprocess.run([acid, core, text], input=command.encode(), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, env=environment, timeout=20)
+        if result.returncode:
+            raise RuntimeError(f"plan9port acid exited with {result.returncode}: {result.stdout!r}")
+        check_acid_registers(result.stdout, pc, sp)
+        bounds = re.search(rb"P9FN \{(0x[0-9a-f]+), (0x[0-9a-f]+)\}", result.stdout, re.IGNORECASE)
+        if not bounds:
+            raise RuntimeError(f"acid could not resolve the guest crash function: {result.stdout!r}")
+        start, end = (int(value, 16) + 0x40000000 for value in bounds.groups())
+        if not start <= pc < end or end - start > 64:
+            raise RuntimeError(f"acid resolved incorrect crash function bounds: {result.stdout!r}")
+        if native_iso:
+            check_native_acid(native_iso, core, module, pc, sp, marker_address, native_log)
+            print("x86_64: 9front acid reads crash registers and stack memory")
+
+
 def check_9p_mount(shell):
     def expect(command, expected, timeout=25):
         expect_line(shell, command, expected, timeout)
@@ -928,13 +1171,18 @@ def check_9p_mount(shell):
         peer = workers.submit(serve_9p, listener)
         expect(b"mkdir /tmp/mnt9p; mount -k 'user=root' smoke9p /tmp/mnt9p test-tree && ls /tmp/mnt9p", b"/tmp/mnt9p/remote")
         expect(b"cat /tmp/mnt9p/remote", b"hello-9p")
-        expect(b"echo /tmp/mnt9p/rem*", b"/tmp/mnt9p/remote")
+        expect(b"@ { cd /tmp/mnt9p && cat remote }", b"hello-9p")
+        expect(b"touch /tmp/remotebind; bind /tmp/mnt9p/remote /tmp/remotebind && cat /tmp/remotebind", b"hello-9p")
+        expect(b"unmount /tmp/remotebind && echo remote-bind-removed", b"remote-bind-removed")
+        expect(b"echo /tmp/mnt9p/remot*", b"/tmp/mnt9p/remote")
         expect(b"/bin/aux/procsmoke mount-io", b"mount-io-ok")
+        expect(b"touch /tmp/clone-cancel; /bin/aux/procsmoke mount-mutations", b"mount-mutations-ok")
         expect(b"/bin/aux/procsmoke mount-parallel", b"mount-parallel-ok")
         expect(b"mkdir /tmp/local9p; touch /tmp/local9p/local; bind -b /tmp/local9p /tmp/mnt9p && "
                b"/bin/aux/procsmoke mount-union", b"mount-union-ok")
         expect(b"unmount /tmp/local9p /tmp/mnt9p && echo union-unmounted", b"union-unmounted")
         expect(b"echo from-client > /tmp/mnt9p/new; cat /tmp/mnt9p/new", b"from-client")
+        expect(b"echo shorter > /tmp/mnt9p/new; cat /tmp/mnt9p/new", b"shorter")
         expect(b"chmod 600 /tmp/mnt9p/new && rm /tmp/mnt9p/new && echo remote-wstat-remove", b"remote-wstat-remove")
         expect(b"{ unmount /srv/smoke9p /tmp/mnt9p; cat } < /tmp/mnt9p/remote", b"hello-9p")
         expect(b"rm /srv/smoke9p && echo service-removed", b"service-removed")
@@ -1795,19 +2043,66 @@ def check_esp_family(shell, peer, lock, esp_packets, family, target, guest):
     shell.command(b"rm /tmp/espkeys")
 
 
+def check_rootdisk(qemu, log, directory):
+    block = 4096
+    size = 64 * 1024 * 1024
+    image = Path(directory) / "root.img"
+    create_image(image, "root", size)
+    command = qemu + ["-drive", f"if=none,id=p9root,file={image},format=raw,cache=writeback",
+                      "-device", "nvme,drive=p9root,serial=plan9-root"]
+    for phase in range(3):
+        if phase == 2:
+            second_slot = 1 + (size // block - 1) // 2
+            with image.open("r+b") as disk:
+                disk.seek((second_slot + 1) * block)
+                original = disk.read(1)
+                disk.seek(-1, os.SEEK_CUR)
+                disk.write(bytes([original[0] ^ 0xff]))
+        with selectors.DefaultSelector() as selector, subprocess.Popen(command, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+            try:
+                shell = SerialShell(process, selector, log)
+                shell.read_prompt(90)
+                if phase == 0:
+                    units = [unit for unit in re.findall(rb"/dev/sd/sd\d+", shell.command(b"ls /dev/sd"))]
+                    if len(units) != 1:
+                        raise RuntimeError(f"expected one local NVMe device, found {units!r}")
+                    ctl = units[0] + b"/ctl"
+                    expect_line(shell, b"echo previous > /usr/root/durable && chmod 600 /usr/root/durable && echo rootsync > " +
+                                ctl + b" && echo synced", b"synced", 90)
+                    expect_line(shell, b"echo current > /usr/root/durable && echo rootsync > " + ctl + b" && echo synced",
+                                b"synced", 90)
+                    expect_line(shell, b"echo unsynced > /usr/root/durable && echo volatile > /usr/root/volatile && echo dirty", b"dirty")
+                else:
+                    expect_line(shell, b"cat /usr/root/durable", b"current" if phase == 1 else b"previous")
+                    expect_line(shell, b"ls -l /usr/root/durable", b"-600 " + (b"8" if phase == 1 else b"9") + b" /usr/root/durable")
+                    expect_line(shell, b"! test -e /usr/root/volatile && echo recovered", b"recovered")
+            finally:
+                process.kill()
+                process.wait()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--network", action="store_true")
     parser.add_argument("--mount", action="store_true")
     parser.add_argument("--panic", action="store_true")
+    parser.add_argument("--dump", action="store_true")
     parser.add_argument("--cpu-service", action="store_true")
     parser.add_argument("--rc-reference")
+    parser.add_argument("--acid")
+    parser.add_argument("--native-acid-iso", type=Path)
+    parser.add_argument("--rootdisk", action="store_true")
     parser.add_argument("--plan9port")
     parser.add_argument("--ticket-port", type=int)
     parser.add_argument("arch")
     parser.add_argument("log")
     parser.add_argument("qemu", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.acid and args.arch != "x86_64":
+        parser.error("--acid requires the x86_64 guest")
+    if args.native_acid_iso and not args.acid:
+        parser.error("--native-acid-iso requires --acid")
     if args.ticket_port is not None and (not args.plan9port or not 1 <= args.ticket_port <= 65535):
         parser.error("--ticket-port requires --plan9port and a valid loopback port")
     qemu = args.qemu[1:] if args.qemu[:1] == ["--"] else args.qemu
@@ -1819,18 +2114,49 @@ def main():
                 open(args.log, "wb", buffering=0) as log, selectors.DefaultSelector() as selector, \
                 socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock, \
                 ThreadPoolExecutor(max_workers=1) as workers:
-            qmp_path = Path(tmp) / "qmp"
-            peer, guest = socket.socketpair()
-            with peer, guest:
-                run_qemu(args, qemu, qmp_path, peer, guest, workers, log, selector, sock)
-    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            if args.rootdisk:
+                check_rootdisk(qemu, log, tmp)
+            else:
+                qmp_path = Path(tmp) / "qmp"
+                if args.dump:
+                    dump_image = Path(tmp) / "dump.img"
+                    create_image(dump_image, "dump", 2 * int(qemu[qemu.index("-m") + 1]) << 20)
+                    qemu += ["-drive", f"if=none,id=p9dump,file={dump_image},format=raw,cache=writeback",
+                             "-device", "nvme,drive=p9dump,serial=plan9-dump"]
+                peer, guest = socket.socketpair()
+                with peer, guest:
+                    run_qemu(args, qemu, qmp_path, peer, guest, workers, log, selector, sock)
+                if args.dump:
+                    with dump_image.open("rb") as disk:
+                        machine, _, segments, diagnostic = dump_info(disk)
+                        if machine != MACHINES[args.arch] or sum(length for _, length, _ in segments) < 64 << 20:
+                            raise RuntimeError("incomplete physical memory map in panic dump")
+                        if not diagnostic or not diagnostic.startswith(b"PANIC: ") \
+                                or not re.search(rb"Kernel backtrace \(return PCs, sp=0x[0-9a-f]+\)", diagnostic):
+                            raise RuntimeError("panic diagnostic missing from ELF note")
+                        marker = b"Plan9RustUEFI\0"
+                        found = False
+                        for _, length, offset in segments:
+                            disk.seek(PAGE + offset)
+                            tail = b""
+                            while length and not found:
+                                chunk = disk.read(min(length, 1024 * 1024))
+                                found = marker in tail + chunk
+                                tail = chunk[-len(marker):]
+                                length -= len(chunk)
+                        if not found:
+                            raise RuntimeError("boot loader marker missing from physical memory dump")
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         print(f"{args.arch}: {error}; see {args.log}", file=sys.stderr)
         return 1
     checks = ("DHCP, IPv4/IPv6 ICMP, TCP/UDP echo and listeners, UDP headers, DNS/CS, GRE, RUDP, ESP, ARP, ipmux, capture, dual-stack forwarding and traceroute" if args.network else
               "9P mount, authentication, fid lifetime, reply multiplexing, cancellation and disconnect" if args.mount else
+              "panic diagnostics and saved physical memory dump" if args.dump else
               "formatted panic, kernel backtrace and reboot" if args.panic and args.cpu_service else
               "formatted panic, kernel backtrace and halt" if args.panic else
               "rc differential tests" if args.rc_reference else
+              "plan9port acid reads crash registers, stack memory and function bounds" if args.acid else
+              "local root sync, abrupt shutdown recovery and corrupt checkpoint fallback" if args.rootdisk else
               "native authsrv tickets with distinct client and server keys" if args.ticket_port else
               "plan9port factotum, Fossil crash recovery and Venti archive restore" if args.plan9port else
               "boot and shell, device/process listings, rc login profiles and environment groups")
@@ -1867,11 +2193,15 @@ def run_qemu(args, qemu, qmp_path, peer, guest, workers, log, selector, sock):
                     shell.read_prompt(90)
                     wait_for_dhcp(shell)
                     check_9p_mount(shell)
-                elif args.panic:
-                    check_panic(shell, qmp, args.arch, args.cpu_service)
+                elif args.panic or args.dump:
+                    check_panic(shell, qmp, args.arch, args.cpu_service, args.dump)
                 elif args.rc_reference:
                     shell.read_prompt(90)
                     check_rc_reference(shell, args.rc_reference)
+                elif args.acid:
+                    shell.read_prompt(90)
+                    wait_for_dhcp(shell)
+                    check_acid(shell, args.acid, args.native_acid_iso, Path(args.log).with_name("native-acid-serial.log"))
                 elif args.plan9port:
                     shell.read_prompt(90)
                     wait_for_dhcp(shell)

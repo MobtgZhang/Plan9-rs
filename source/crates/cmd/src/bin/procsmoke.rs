@@ -179,8 +179,12 @@ fn check_broken_child(fault: fn(), message: &[u8], capture: bool) {
     check(count > 0 && record[..count as usize].windows(6).any(|part| part == b"Broken"),
         "unhandled fault enters Broken");
     let fd = open_proc(pid, b"/regs", syscall::OREAD);
-    check(fd >= 0 && syscall::read(fd, record.as_mut_ptr(), record.len()) > 0, "read fault registers");
+    let mut registers = [0; REGISTER_SIZE];
+    check(fd >= 0 && syscall::read(fd, registers.as_mut_ptr(), registers.len()) == REGISTER_SIZE as i64,
+        "read fault registers");
     syscall::close(fd);
+    let register = |index| u64::from_le_bytes(registers[index * 8..][..8].try_into().unwrap());
+    let (pc, sp) = (register(NOTE_PC), register(REGISTER_SP));
     let fd = open_proc(pid, b"/kregs", syscall::OREAD);
     let mut kernel = [0; REGISTER_SIZE];
     check(fd >= 0 && syscall::read(fd, kernel.as_mut_ptr(), kernel.len()) == REGISTER_SIZE as i64,
@@ -190,7 +194,15 @@ fn check_broken_child(fault: fn(), message: &[u8], capture: bool) {
     check(syscall::read(fd, record.as_mut_ptr(), 1) == 0, "kernel register frame ends at EOF");
     syscall::close(fd);
     if capture {
-        check_snapshot(pid, &marker as *const u64 as u64);
+        let marker_address = &marker as *const u64 as u64;
+        check_snapshot(pid, marker_address);
+        cmd::out_str("crash registers ");
+        let mut digits = [0; 20];
+        for value in [pc, sp] {
+            cmd::out_str(cmd::utoa(value, &mut digits));
+            cmd::out_str(" ");
+        }
+        cmd::outln(cmd::utoa(marker_address, &mut digits));
     }
     check(!ctl(pid, b"start"), "cannot resume a Broken process");
     check(ctl(pid, b"kill") && !ctl(pid, b"waitstop"), "reclaim faulting process");
@@ -1080,6 +1092,50 @@ fn check_mount_io() {
     syscall::exit(0);
 }
 
+fn check_mount_mutations() -> ! {
+    let source = c"/tmp/mnt9p/clone-cancel".as_ptr().cast();
+    let target = c"/tmp/clone-cancel".as_ptr().cast();
+    check(syscall::bind(source, target, 0) == 0, "bind a shared remote fid");
+    check(syscall::notify(Some(note_handler)) == 0, "register fid operation alarm handler");
+    syscall::alarm(200);
+    check(syscall::open(target, syscall::OREAD) == EINTR, "interrupt zero-name Twalk");
+    let reader = syscall::open(target, syscall::OREAD);
+    let mut byte = 0;
+    check(reader >= 0 && syscall::read(reader, &mut byte, 1) == 1 && byte == b'c',
+        "reopen the shared fid after an interrupted clone");
+    syscall::close(reader);
+    check(syscall::unmount(core::ptr::null(), target) == 0, "unmount shared remote fid");
+
+    let created = c"/tmp/mnt9p/create-cancel".as_ptr().cast();
+    syscall::alarm(200);
+    check(syscall::create3(created, syscall::OWRITE, 0o600) == EINTR, "interrupt Tcreate");
+    let writer = syscall::create3(created, syscall::OWRITE, 0o600);
+    check(writer >= 0, "create file after an interrupted Tcreate");
+    syscall::close(writer);
+    check(syscall::remove(created) == 0, "remove newly created file");
+
+    let removed = c"/tmp/mnt9p/remove-cancel".as_ptr().cast();
+    syscall::alarm(200);
+    check(syscall::remove(removed) == EINTR, "interrupt Tremove");
+    check(syscall::remove(removed) == 0, "remove file after an interrupted Tremove");
+    check(syscall::notify(None) == 0, "unregister fid operation alarm handler");
+
+    let ready = cmd::open_read("/tmp/mnt9p/remove-kill-ready");
+    check(ready >= 0, "open Tremove cancellation barrier");
+    let child = syscall::fork();
+    check(child >= 0, "fork Tremove cancellation victim");
+    if child == 0 {
+        syscall::remove(c"/tmp/mnt9p/remove-kill".as_ptr().cast());
+        check(false, "killed 9P remover must not return to user mode");
+        syscall::exit(1);
+    }
+    check(syscall::read(ready, &mut byte, 1) == 1 && byte == b'r', "wait for the victim's Tremove");
+    check(ctl(child, b"kill") && syscall::wait(child as i32) != 0, "kill the blocked 9P remover");
+    syscall::close(ready);
+    syscall::write_all(1, b"mount-mutations-ok\n");
+    syscall::exit(0);
+}
+
 fn check_mount_parallel(disconnect: bool) -> ! {
     let paths = if disconnect {
         ["/tmp/drop9p/drop-one", "/tmp/drop9p/drop-two"]
@@ -1291,6 +1347,12 @@ fn check_mount_open() {
     let fd = syscall::open(canceled.as_ptr(), syscall::OREAD);
     check(fd >= 0 && syscall::read(fd, &mut byte, 1) == 1 && byte == b'o', "reopen after canceled Topen");
     syscall::close(fd);
+    let walk = b"/tmp/mnt9p/walk-cancel\0";
+    syscall::alarm(200);
+    check(syscall::open(walk.as_ptr(), syscall::OREAD) == EINTR, "interrupt outstanding Twalk");
+    let fd = syscall::open(walk.as_ptr(), syscall::OREAD);
+    check(fd >= 0 && syscall::read(fd, &mut byte, 1) == 1 && byte == b'w', "open after canceled Twalk");
+    syscall::close(fd);
     check(syscall::notify(None) == 0, "unregister open alarm handler");
 
     let [ready, done] = ["/tmp/mnt9p/open-kill-ready", "/tmp/mnt9p/open-kill-done"].map(cmd::open_read);
@@ -1397,8 +1459,20 @@ fn check_mount_union() -> ! {
     check(syscall::read(union, output.as_mut_ptr(), 2) < 0, "union cannot split a stat record");
     let count = syscall::read(union, output.as_mut_ptr(), output.len());
     check(count > 0 && cmd::stat_name(&output[..count as usize]) == Some(b"local"), "read first union member");
-    let count = syscall::read(union, output.as_mut_ptr(), output.len());
-    check(count > 0 && has_dir_entry(&output[..count as usize], b'M', b"remote"), "read remote union member");
+    let [arm, release] = ["/tmp/mnt9p/union-arm", "/tmp/mnt9p/union-release"].map(cmd::open_read);
+    let mut byte = 0;
+    check(arm >= 0 && release >= 0 && syscall::read(arm, &mut byte, 1) == 1 && byte == b'a', "arm delayed union read");
+    syscall::close(arm);
+    let child = syscall::fork();
+    check(child >= 0, "fork union reader");
+    if child == 0 {
+        let count = syscall::read(union, output.as_mut_ptr(), output.len());
+        check(count > 0 && has_dir_entry(&output[..count as usize], b'M', b"remote"), "read remote union member");
+        syscall::exit(0);
+    }
+    check(syscall::read(release, &mut byte, 1) == 1 && byte == b'r', "read with a union member outstanding");
+    check(syscall::wait(child as i32) == 0, "reap union reader");
+    syscall::close(release);
     check(syscall::seek(union, 0, 0) == 0, "rewind union");
     let count = syscall::read(union, output.as_mut_ptr(), output.len());
     check(count > 0 && cmd::stat_name(&output[..count as usize]) == Some(b"local"), "reread first union member");
@@ -1462,6 +1536,7 @@ pub extern "C" fn cmd_main(argc: u64, argv: u64) -> ! {
             syscall::exit(0);
         }
         Some("mount-io") => check_mount_io(),
+        Some("mount-mutations") => check_mount_mutations(),
         Some("mount-parallel") => check_mount_parallel(false),
         Some("mount-disconnect") => check_mount_parallel(true),
         Some("mount-union") => check_mount_union(),
